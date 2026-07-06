@@ -231,9 +231,12 @@ impl ProofCommand {
                     });
                 }
 
-                // Cross-proof validation: both proof systems must commit to the same batch.
+                // Cross-proof validation: both proof systems must commit to the
+                // same batch. ZiSK v0.18 public values are
+                // programVK(32) || guest publics(192) || vadcop VK(32), with the
+                // full batch commitment as the first guest-publics word.
                 let zisk_commitment =
-                    B256::from_slice(&multi_proof.zisk_public_values[..32]);
+                    B256::from_slice(&multi_proof.zisk_public_values[32..64]);
                 let era_commitment = Self::get_batch_public_input(
                     previous_batch_info,
                     &stored_batch_infos[0],

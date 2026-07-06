@@ -46,14 +46,18 @@ pub fn verify_zisk_snark_public_values(
     stored_batch_info: &StoredBatchInfo,
     public_values: &[u8],
 ) -> Result<(), String> {
-    if public_values.len() < 32 {
+    // ZiSK v0.18 public-values layout (256 bytes, the digest preimage of the
+    // proof's single public signal): programVK (32) || guest publics (192) ||
+    // vadcop-final VK (32). The first guest-publics word is the full 32-byte
+    // batch commitment.
+    if public_values.len() < 64 {
         return Err(format!(
-            "public values too short: {} bytes, need at least 32",
+            "public values too short: {} bytes, need at least 64",
             public_values.len()
         ));
     }
 
-    let zisk_commitment = B256::from_slice(&public_values[..32]);
+    let zisk_commitment = B256::from_slice(&public_values[32..64]);
     let expected = compute_batch_commitment(
         previous_state_commitment,
         &stored_batch_info.state_commitment,
