@@ -301,7 +301,7 @@ impl ProofCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batcher_model::MultiProofSnarkProof;
+    use zksync_os_batch_types::batcher_model::MultiProofSnarkProof;
 
     #[test]
     fn test_multi_proof_serde_roundtrip() {
@@ -348,7 +348,7 @@ mod tests {
         assert!(fake.proof().is_none());
 
         // Real proof still works
-        let real = SnarkProof::Real(crate::batcher_model::RealSnarkProof::V2 {
+        let real = SnarkProof::Real(zksync_os_batch_types::batcher_model::RealSnarkProof::V2 {
             proof: vec![0xAA; 32],
             proving_execution_version: 6,
         });

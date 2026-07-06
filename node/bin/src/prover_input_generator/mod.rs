@@ -20,7 +20,7 @@ use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
 use zksync_os_storage_api::{ReadStateHistory, ReplayRecord, TreeBlock};
-use zksync_os_types::{ProvingVersion, PubdataMode, ZksyncOsEncode};
+use zksync_os_types::{BlockOutput, ProvingVersion, PubdataMode, ZksyncOsEncode};
 
 mod tree_adapter;
 
@@ -224,6 +224,7 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_prover_input(
     replay_record: &ReplayRecord,
     state_handle: impl ReadStateHistory + Clone,

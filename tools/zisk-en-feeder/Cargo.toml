@@ -24,7 +24,7 @@ zksync_os_storage_api.workspace = true
 zksync_os_merkle_tree.workspace = true
 
 # External (shared with zisk-batch-test)
-zksync-os-zisk-lib = { path = "../../../zksync-os-zisk/lib" }
+zksync-os-zisk-lib.workspace = true
 
 # Raw RocksDB so we can open the EN's database in secondary mode.
 rocksdb = "0.24"

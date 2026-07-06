@@ -15,14 +15,11 @@ use crate::prover_api::zisk_proof_constants::{ZISK_PUBLIC_VALUES_BYTES, ZISK_SNA
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use zksync_os_l1_sender::batcher_metrics::BatchExecutionStage;
-use zksync_os_l1_sender::batcher_model::{
+use zksync_os_batcher_metrics::BatchExecutionStage;
+use zksync_os_batch_types::batcher_model::{
     FriProof, MultiProofSnarkProof, SignedBatchEnvelope, SnarkProof,
 };
 use zksync_os_l1_sender::commands::prove::ProofCommand;
-use zksync_os_observability::{
-    ComponentStateHandle, ComponentStateReporter, GenericComponentState,
-};
 use tokio::sync::mpsc::Sender;
 
 /// Maximum number of pending + assigned ZiSK jobs.
@@ -76,8 +73,6 @@ pub struct ZiskJobManager {
     assignment_timeout: Duration,
     /// Channel to send completed multi-proofs downstream.
     prove_sender: Sender<ProofCommand>,
-    /// Metrics.
-    latency_tracker: ComponentStateHandle<GenericComponentState>,
 }
 
 impl ZiskJobManager {
@@ -85,10 +80,6 @@ impl ZiskJobManager {
         prove_sender: Sender<ProofCommand>,
         assignment_timeout: Duration,
     ) -> Self {
-        let latency_tracker = ComponentStateReporter::global().handle_for(
-            "zisk_job_manager",
-            GenericComponentState::ProcessingOrWaitingRecv,
-        );
         Self {
             state: Mutex::new(ZiskJobState {
                 pending: HashMap::new(),
@@ -96,7 +87,6 @@ impl ZiskJobManager {
             }),
             assignment_timeout,
             prove_sender,
-            latency_tracker,
         }
     }
 
@@ -215,7 +205,7 @@ impl ZiskJobManager {
                 .batch
                 .batch_info
                 .clone()
-                .into_stored(&first_batch.batch.protocol_version);
+                .into_stored();
             let prev = &first_batch.batch.previous_stored_batch_info;
             if let Err(msg) = crate::prover_api::zisk_proof_verifier::verify_zisk_snark_public_values(
                 &prev.state_commitment,
@@ -247,16 +237,11 @@ impl ZiskJobManager {
         let batches = job_data
             .batches
             .into_iter()
-            .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
+            .map(|b: SignedBatchEnvelope<FriProof>| b.with_stage(BatchExecutionStage::SnarkProvedReal))
             .collect();
 
         let proof_command = ProofCommand::new(batches, snark_proof);
-
-        self.latency_tracker
-            .enter_state(GenericComponentState::WaitingSend);
         if let Err(err) = self.prove_sender.send(proof_command).await {
-            self.latency_tracker
-                .enter_state(GenericComponentState::ProcessingOrWaitingRecv);
             // Downstream closed — recover the job data from the failed ProofCommand.
             // The ProofCommand owns the data; extract and return to pending.
             let failed_command = err.0;
@@ -276,8 +261,6 @@ impl ZiskJobManager {
             }
             return Err(ZiskSubmitError::DownstreamClosed);
         }
-        self.latency_tracker
-            .enter_state(GenericComponentState::ProcessingOrWaitingRecv);
 
         Ok(())
     }

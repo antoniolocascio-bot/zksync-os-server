@@ -39,6 +39,12 @@ pub struct ZiskDataCache {
     max_age: Duration,
 }
 
+impl Default for ZiskDataCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ZiskDataCache {
     pub fn new() -> Self {
         Self {
@@ -93,6 +99,10 @@ impl ZiskDataCache {
     }
 
     /// Number of entries currently cached (including potentially expired ones).
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
+    }
+
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
     }

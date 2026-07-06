@@ -4479,7 +4479,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4955,7 +4955,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7365,7 +7365,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.5",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -9244,7 +9244,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11694,7 +11694,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11762,7 +11762,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13141,7 +13141,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -14636,7 +14636,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -15573,11 +15573,28 @@ dependencies = [
 [[package]]
 name = "zksync-os-revm"
 version = "0.1.0"
-source = "git+https://github.com/matter-labs/zksync-os-revm?tag=v0.1.0#b8ecfb814326afd527a43c84abc96e007a28df05"
+source = "git+https://github.com/antoniolocascio-bot/zksync-os-revm?branch=dev#44196556a8df31ce0a2ce2e4539a17e942dac0a6"
 dependencies = [
  "auto_impl",
  "revm 38.0.0",
  "serde",
+]
+
+[[package]]
+name = "zksync-os-zisk-lib"
+version = "0.1.0"
+source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#3c4ca22f2457e2da69f371dbb94ee77f0c8e20f6"
+dependencies = [
+ "alloy-consensus 1.7.3",
+ "alloy-eips 1.7.3",
+ "alloy-primitives",
+ "bincode 1.3.3",
+ "blake2",
+ "k256",
+ "revm 38.0.0",
+ "serde",
+ "tiny-keccak",
+ "zksync-os-revm",
 ]
 
 [[package]]
@@ -15823,10 +15840,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "backon",
+ "base64 0.22.1",
  "basic_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
+ "bincode 1.3.3",
  "blake2",
  "flate2",
  "futures",
+ "hex",
  "httpmock",
  "regex",
  "reqwest 0.12.28",
@@ -15841,6 +15861,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "zksync-os-zisk-lib",
  "zksync_os_alloy_ext",
  "zksync_os_api",
  "zksync_os_contract_interface",
@@ -15902,6 +15923,7 @@ dependencies = [
  "async-trait",
  "futures",
  "itertools 0.14.0",
+ "serde_json",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -15981,7 +16003,9 @@ version = "0.20.9"
 dependencies = [
  "alloy",
  "anyhow",
+ "basic_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
  "clap",
+ "forward_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
  "insta",
  "leb128",
  "once_cell",
@@ -15995,6 +16019,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.22",
  "vise",
+ "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
  "zksync_os_merkle_tree_api",
  "zksync_os_rocksdb",
 ]
@@ -16446,6 +16471,7 @@ dependencies = [
  "tracing",
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
+ "zksync-os-revm",
  "zksync_os_base_token_adjuster",
  "zksync_os_contract_interface",
  "zksync_os_genesis",
@@ -16472,6 +16498,7 @@ dependencies = [
  "base64 0.22.1",
  "basic_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.10-interface-v0.1.3)",
  "basic_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
+ "bincode 1.3.3",
  "bincode 2.0.1",
  "blake2",
  "clap",
@@ -16488,6 +16515,7 @@ dependencies = [
  "reth-net-nat",
  "reth-network-peers",
  "reth-tasks",
+ "revm 38.0.0",
  "rustls",
  "serde",
  "serde_json",
@@ -16506,6 +16534,8 @@ dependencies = [
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.10-interface-v0.1.3)",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.3.1-interface-v0.1.3)",
+ "zksync-os-revm",
+ "zksync-os-zisk-lib",
  "zksync_os_backpressure",
  "zksync_os_base_token_adjuster",
  "zksync_os_batch_types",
@@ -16699,6 +16729,30 @@ dependencies = [
  "tracing-subscriber 0.3.22",
  "zksync_os_merkle_tree_api",
  "zksync_os_rpc_api",
+]
+
+[[package]]
+name = "zksync_os_zisk_en_feeder"
+version = "0.20.9"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "bincode 2.0.1",
+ "clap",
+ "hex",
+ "reqwest 0.12.28",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "zksync-os-zisk-lib",
+ "zksync_os_interface",
+ "zksync_os_merkle_tree",
+ "zksync_os_server",
+ "zksync_os_storage_api",
+ "zksync_os_types",
 ]
 
 [[package]]

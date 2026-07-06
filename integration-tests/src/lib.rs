@@ -326,6 +326,13 @@ pub struct SupportingNode {
 }
 
 impl Tester {
+    /// Prover API base URL of this node, if the prover API server is bound.
+    pub fn prover_api_url(&self) -> Option<String> {
+        self.bound_ports
+            .prover_api
+            .map(|p| format!("http://localhost:{p}"))
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }

@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use alloy::consensus::BlobTransactionSidecar;
 use zksync_os_batch_types::PendingBatchInfo;
 use zksync_os_batch_types::batcher_model::{
     BatchEnvelope, BatchForSigning, BatchMetadata, ProverInput,
@@ -86,10 +87,11 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
                 if !seen.insert(diff.address) { continue; }
                 let addr_bytes: [u8; 20] = diff.address.into();
                 let flat_key = zksync_os_zisk_lib::merkle::derive_account_properties_key(&addr_bytes);
-                if let Some(hash_value) = ReadStorage::read(&mut state_after, alloy::primitives::B256::from(flat_key.0)) {
-                    if let Some(preimage) = state_after.get_preimage(hash_value) {
-                        preimages.push((diff.address, preimage));
-                    }
+                if let Some(hash_value) =
+                    ReadStorage::read(&mut state_after, alloy::primitives::B256::from(flat_key.0))
+                    && let Some(preimage) = state_after.get_preimage(hash_value)
+                {
+                    preimages.push((diff.address, preimage));
                 }
             }
         }
@@ -103,6 +105,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         multichain_root,
         sl_chain_id,
         &batch_info,
+        &blob_sidecar,
         batch_tree_start,
         batch_tree_end,
         account_preimages_after,
@@ -170,6 +173,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     Ok(batch_envelope)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_batch_prover_input(
     blocks: &[(
         BlockOutput,
@@ -181,7 +185,8 @@ fn compute_batch_prover_input(
     pubdata_mode: PubdataMode,
     multichain_root: alloy::primitives::B256,
     sl_chain_id: u64,
-    batch_info: &BatchInfo,
+    batch_info: &PendingBatchInfo,
+    blob_sidecar: &Option<BlobTransactionSidecar>,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
@@ -233,6 +238,7 @@ fn compute_batch_prover_input(
             multichain_root,
             sl_chain_id,
             batch_info,
+            blob_sidecar,
             batch_tree_start,
             batch_tree_end,
             account_preimages_after,
@@ -245,9 +251,10 @@ fn compute_batch_prover_input(
 }
 
 /// Assemble per-block ZiSK data into a single batch-level BatchInput.
+#[allow(clippy::too_many_arguments)]
 fn assemble_zisk_batch(
     blocks: &[(
-        zksync_os_interface::types::BlockOutput,
+        zksync_os_types::BlockOutput,
         zksync_os_storage_api::ReplayRecord,
         zksync_os_merkle_tree::TreeBatchOutput,
         ProverInput,
@@ -255,7 +262,8 @@ fn assemble_zisk_batch(
     pubdata_mode: PubdataMode,
     multichain_root: alloy::primitives::B256,
     sl_chain_id: u64,
-    batch_info: &BatchInfo,
+    batch_info: &PendingBatchInfo,
+    blob_sidecar: &Option<BlobTransactionSidecar>,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
@@ -330,6 +338,7 @@ fn assemble_zisk_batch(
     ) {
         zksync_os_revm::ZkSpecId::AtlasV1 => 0u8,
         zksync_os_revm::ZkSpecId::AtlasV2 => 1u8,
+        zksync_os_revm::ZkSpecId::AtlasV3 => 2u8,
     };
 
     let batch_input = BatchInput {
@@ -348,7 +357,7 @@ fn assemble_zisk_batch(
             pubdata,
             multichain_root,
             sl_chain_id,
-            blob_versioned_hashes: batch_info.blob_sidecar
+            blob_versioned_hashes: blob_sidecar
                 .as_ref()
                 .map(|sidecar| {
                     sidecar.commitments.iter().map(|commitment| {
@@ -357,7 +366,13 @@ fn assemble_zisk_batch(
                 })
                 .unwrap_or_default(),
             tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
-            account_preimages_after: account_preimages_after,
+            account_preimages_after,
+            // ChainConfig params feeding the chain_config_hash of the public
+            // input. Current chains run with FRI verification disabled and the
+            // default 2^24 gas cap; wire from chain config once the server
+            // tracks it.
+            fri_proof_verification_enabled: false,
+            max_tx_gas_limit: 1 << 24,
         },
         blocks: block_data_vec
             .iter()
@@ -387,7 +402,7 @@ fn assemble_zisk_batch(
     if let Ok(dump_dir) = std::env::var("ZISK_DUMP_DIR") {
         let path = std::path::Path::new(&dump_dir);
         let _ = std::fs::create_dir_all(path);
-        let batch_num = batch_info.batch_number;
+        let batch_num = batch_info.commit_info.batch_number;
         let file_path = path.join(format!("batch_{batch_num}_zisk.bin"));
         // Write in ZiSK stdin format: [len:u64_LE][bincode][padding_to_8]
         let len = serialized.len() as u64;
@@ -396,7 +411,7 @@ fn assemble_zisk_batch(
         buf.extend_from_slice(&serialized);
         let total = 8 + serialized.len();
         let padding = (8 - (total % 8)) % 8;
-        buf.extend(std::iter::repeat(0u8).take(padding));
+        buf.extend(std::iter::repeat_n(0u8, padding));
         match std::fs::write(&file_path, &buf) {
             Ok(()) => tracing::info!(
                 "ZiSK BatchInput dumped: {} ({} bytes, ZiSK stdin format)",
@@ -433,7 +448,7 @@ fn assemble_zisk_batch(
 /// computation (from batch_tree_end). No trusted `expected_root_after` needed.
 fn build_batch_tree_update(
     blocks: &[(
-        zksync_os_interface::types::BlockOutput,
+        zksync_os_types::BlockOutput,
         zksync_os_storage_api::ReplayRecord,
         zksync_os_merkle_tree::TreeBatchOutput,
         ProverInput,

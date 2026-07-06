@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use zk_ee::utils::Bytes32;
 use zk_os_forward_system::run::ReadStorageTree;
 use zksync_os_interface::traits::{PreimageSource, ReadStorage};
-use zksync_os_interface::types::BlockOutput;
+use zksync_os_types::BlockOutput;
 use zksync_os_merkle_tree::{MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_revm::transaction::abstraction::ZKsyncTxBuilder;
 use zksync_os_revm::{DefaultZk, ZKsyncTx, ZkBuilder, ZkContext, ZkSpecId};
@@ -28,13 +28,33 @@ use zksync_os_zisk_lib::merkle::{
     self as zisk_merkle, BatchTreeUpdate, NeighborProofEntry, SlotProofEntry, StorageProof,
     TreeLeaf, WriteOp, TREE_DEPTH,
 };
-use zksync_os_zisk_lib::types::{self, *};
+use zksync_os_zisk_lib::types::*;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// Per-block ZiSK data carried through the pipeline.
+/// Account preimages and per-slot storage proofs extracted from the tree.
+type AccountProofs = (Vec<(Address, Vec<u8>)>, Vec<(B256, StorageProof)>);
+
+/// Read keys, read accounts, storage reads and resolved preimages discovered
+/// by the pre-execution pass.
+type PreExecutionReads = (
+    HashSet<B256>,
+    HashSet<Address>,
+    Vec<(Address, U256, U256)>,
+    Vec<(B256, Vec<u8>)>,
+);
+
+/// Accounts, keccak-keyed bytecodes, and blake2s-keyed full preimages
+/// discovered while loading state for the pre-execution pass.
+type LoadedAccountsAndBytecodes = (
+    HashMap<Address, AccountInfo>,
+    HashMap<B256, Bytecode>,
+    Vec<(B256, Vec<u8>)>,
+);
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ZiskBlockData {
     pub block_input: BlockInput,
@@ -140,8 +160,10 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                 let hash = B256::from_slice(&data[offset..offset + 32]);
                 if hash.is_zero() || scanned.contains(&hash) || bytecodes_map.contains_key(&hash) { continue; }
                 scanned.insert(hash);
-                if let Some(preimage) = state_for_scan.get_preimage(hash) {
-                    if !preimage.is_empty() && preimage.len() > 100 {
+                if let Some(preimage) = state_for_scan.get_preimage(hash)
+                    && preimage.len() > 100
+                {
+                    {
                         tracing::info!(
                             hash = %hash, preimage_len = preimage.len(),
                             "resolved bytecode from upgrade tx calldata scan"
@@ -192,9 +214,9 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             tracing::info!(count = pre_exec_preimages.len(), "pre-execution resolved preimages from DB");
         }
         for (hash, preimage) in pre_exec_preimages {
-            if !bytecodes_map.contains_key(&hash) {
-                bytecodes_map.insert(hash, Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
-            }
+            bytecodes_map
+                .entry(hash)
+                .or_insert_with(|| Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
             bytecodes_extra.push((hash, preimage));
         }
 
@@ -236,50 +258,55 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                         nonce: props.nonce, balance: props.balance, code_hash: effective,
                         code: None, account_id: None,
                     });
-                    if !preimage_hash.is_zero() && !observable_hash.is_zero() {
-                        if let Some(padded_code) = state_view_reload.get_preimage(preimage_hash) {
-                            let raw_len = props.unpadded_code_len as usize;
-                            let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
-                                &padded_code[..raw_len]
-                            } else {
-                                &padded_code[..]
-                            };
-                            if !bytecodes_map.contains_key(&observable_hash) {
-                                bytecodes_out.push((observable_hash, raw_code.to_vec()));
-                                bytecodes_map.insert(observable_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
-                            }
-                            resolved = true;
+                    if !preimage_hash.is_zero()
+                        && !observable_hash.is_zero()
+                        && let Some(padded_code) = state_view_reload.get_preimage(preimage_hash)
+                    {
+                        let raw_len = props.unpadded_code_len as usize;
+                        let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
+                            &padded_code[..raw_len]
+                        } else {
+                            &padded_code[..]
+                        };
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            bytecodes_map.entry(observable_hash)
+                        {
+                            bytecodes_out.push((observable_hash, raw_code.to_vec()));
+                            entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
                         }
+                        resolved = true;
                     }
                 }
                 // If pre-execution state had observable_hash=0, try post-execution state
-                if !resolved {
-                    if let Some(ref mut state_after) = state_after_reload {
-                        if let Some(props) = state_after.get_account(addr) {
-                            let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
-                            let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
-                            if !obs_hash.is_zero() && !pre_hash.is_zero() {
-                                if let Some(full_preimage) = state_after.get_preimage(pre_hash) {
-                                    let raw_len = props.unpadded_code_len as usize;
-                                    let raw_code = if raw_len > 0 && raw_len <= full_preimage.len() {
-                                        &full_preimage[..raw_len]
-                                    } else {
-                                        &full_preimage[..]
-                                    };
-                                    if !bytecodes_map.contains_key(&obs_hash) {
-                                        bytecodes_out.push((obs_hash, raw_code.to_vec()));
-                                        bytecodes_map.insert(obs_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
-                                    }
-                                    accounts_map.insert(addr, AccountInfo {
-                                        nonce: props.nonce, balance: props.balance, code_hash: obs_hash,
-                                        code: None, account_id: None,
-                                    });
-                                    // Store full preimage (code+artifacts) under blake2s hash
-                                    // for deployer precompile.
-                                    bytecodes_extra.push((pre_hash, full_preimage));
-                                }
-                            }
+                if !resolved
+                    && let Some(ref mut state_after) = state_after_reload
+                    && let Some(props) = state_after.get_account(addr)
+                {
+                    let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+                    let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
+                    if !obs_hash.is_zero()
+                        && !pre_hash.is_zero()
+                        && let Some(full_preimage) = state_after.get_preimage(pre_hash)
+                    {
+                        let raw_len = props.unpadded_code_len as usize;
+                        let raw_code = if raw_len > 0 && raw_len <= full_preimage.len() {
+                            &full_preimage[..raw_len]
+                        } else {
+                            &full_preimage[..]
+                        };
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            bytecodes_map.entry(obs_hash)
+                        {
+                            bytecodes_out.push((obs_hash, raw_code.to_vec()));
+                            entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
                         }
+                        accounts_map.insert(addr, AccountInfo {
+                            nonce: props.nonce, balance: props.balance, code_hash: obs_hash,
+                            code: None, account_id: None,
+                        });
+                        // Store full preimage (code+artifacts) under blake2s hash
+                        // for deployer precompile.
+                        bytecodes_extra.push((pre_hash, full_preimage));
                     }
                 }
             }
@@ -312,7 +339,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let mut state_view = read_state.state_view_at(block_number - 1)?;
     let mut state_view_post = Some(read_state.state_view_at(block_number)?);
     let storage_read_keys = all_storage_read_keys;
-    let storage_reads = all_storage_reads;
+    let _storage_reads = all_storage_reads;
 
     // Phase 2: extract merkle proofs for all accessed keys
     let (account_preimages, mut storage_proofs) =
@@ -320,7 +347,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     let mut proven_flat_keys: HashSet<B256> = storage_proofs.iter().map(|(k, _)| *k).collect();
 
-    let storage_out = extract_storage_write_proofs(
+    let _storage_out = extract_storage_write_proofs(
         &block_output.storage_writes, &storage_prestate, &mut tree, &mut proven_flat_keys, &mut storage_proofs,
     );
 
@@ -442,7 +469,7 @@ fn load_accounts_and_bytecodes<S: ViewState>(
     state_view: &mut S,
     block_output: &BlockOutput,
     replay_record: &ReplayRecord,
-) -> (HashMap<Address, AccountInfo>, HashMap<B256, Bytecode>, Vec<(B256, Vec<u8>)>) {
+) -> LoadedAccountsAndBytecodes {
     let mut accounts = HashMap::new();
     let mut bytecodes_map = HashMap::new();
     let mut bytecodes_out = Vec::new();
@@ -550,8 +577,9 @@ fn load_storage_prestate(
 
 /// Returns (storage_read_flat_keys, extra_account_addresses, storage_reads).
 /// storage_reads: (address, slot, value) for all storage accessed during pre-execution.
+#[allow(clippy::too_many_arguments)]
 fn pre_execute_for_reads(
-    ctx: &zksync_os_interface::types::BlockContext,
+    ctx: &zksync_os_storage_api::BlockContext,
     spec_id: ZkSpecId,
     basefee: u64,
     prev_randao: B256,
@@ -561,7 +589,7 @@ fn pre_execute_for_reads(
     storage_prestate: &HashMap<(Address, U256), U256>,
     bytecodes: &HashMap<B256, Bytecode>,
     state_view: impl ViewState,
-) -> (HashSet<B256>, HashSet<Address>, Vec<(Address, U256, U256)>, Vec<(B256, Vec<u8>)>) {
+) -> PreExecutionReads {
     let read_keys: RefCell<HashSet<B256>> = RefCell::new(HashSet::new());
     let read_accounts: RefCell<HashSet<Address>> = RefCell::new(HashSet::new());
     let read_storage: RefCell<Vec<(Address, U256, U256)>> = RefCell::new(Vec::new());
@@ -597,7 +625,7 @@ fn extract_account_proofs<S1: ViewState, S2: ViewState>(
     tree: &mut MerkleTreeVersion<RocksDBWrapper>,
     state_view: &mut S1,
     state_view_post: &mut Option<S2>,
-) -> (Vec<(Address, Vec<u8>)>, Vec<(B256, StorageProof)>) {
+) -> AccountProofs {
     let mut preimages = Vec::new();
     let mut proofs = Vec::new();
 
@@ -992,7 +1020,7 @@ fn extract_proof(tree: &mut MerkleTreeVersion<RocksDBWrapper>, flat_key: B256) -
 }
 
 fn extract_block_hashes(
-    hashes: &zksync_os_interface::types::BlockHashes,
+    hashes: &zksync_os_storage_api::BlockHashes,
     block_number: u64,
 ) -> Vec<(u64, B256)> {
     hashes.0.iter().enumerate().filter_map(|(i, hash)| {
@@ -1114,7 +1142,7 @@ struct TrackingDB<'a, S> {
     storage_prestate: &'a HashMap<(Address, U256), U256>,
     state_view: RefCell<S>,
     bytecodes: &'a HashMap<B256, Bytecode>,
-    block_hashes: &'a zksync_os_interface::types::BlockHashes,
+    block_hashes: &'a zksync_os_storage_api::BlockHashes,
     block_number: u64,
     read_keys: &'a RefCell<HashSet<B256>>,
     read_accounts: &'a RefCell<HashSet<Address>>,
@@ -1182,14 +1210,13 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
         }
         // Fallback: try preimage DB via state_view (like the server's OverriddenStateView).
         if code_hash != KECCAK_EMPTY && code_hash != B256::ZERO {
-            if let Some(preimage) = self.state_view.borrow_mut().get_preimage(code_hash) {
-                if !preimage.is_empty() {
-                    eprintln!("TrackingDB::code_by_hash_ref RESOLVED {code_hash} → {} bytes", preimage.len());
-                    self.resolved_preimages.borrow_mut().push((code_hash, preimage.clone()));
-                    return Ok(Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
-                }
+            if let Some(preimage) = self.state_view.borrow_mut().get_preimage(code_hash)
+                && !preimage.is_empty()
+            {
+                self.resolved_preimages.borrow_mut().push((code_hash, preimage.clone()));
+                return Ok(Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
             }
-            eprintln!("TrackingDB::code_by_hash_ref MISS {code_hash}");
+            tracing::debug!(%code_hash, "TrackingDB code_by_hash miss");
         }
         Ok(Bytecode::default())
     }
@@ -1225,6 +1252,7 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pre_execution<DB: DatabaseRef>(
     chain_id: u64, spec_id: ZkSpecId, block_number: u64, timestamp: u64,
     coinbase: Address, basefee: u64, gas_limit: u64, prev_randao: B256,
@@ -1293,7 +1321,7 @@ fn run_pre_execution<DB: DatabaseRef>(
                 if matches!(tx_input.auth, TxAuth::Upgrade { .. }) {
                     tracing::info!(
                         success = result.is_success(),
-                        gas_used = result.gas_used(),
+                        gas_used = result.tx_gas_used(),
                         "pre-execution upgrade tx result"
                     );
                 }
@@ -1313,6 +1341,7 @@ fn run_pre_execution<DB: DatabaseRef>(
 /// is in the ERC1967 storage slot. That implementation doesn't exist yet at
 /// block_number-1 (it's force-deployed in the current block). We must pre-create
 /// it from the post-execution state so REVM can execute the upgrade tx.
+#[allow(clippy::too_many_arguments)]
 fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
     block_output: &BlockOutput,
     block_number: u64,
@@ -1361,20 +1390,21 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                     continue;
                 }
                 let effective = obs_hash;
-                if !pre_hash.is_zero() {
-                    if let Some(padded_code_with_artifacts) = state_after.get_preimage(pre_hash) {
+                if !pre_hash.is_zero()
+                    && let Some(padded_code_with_artifacts) = state_after.get_preimage(pre_hash)
+                {
+                    {
                         let raw_len = props.unpadded_code_len as usize;
                         let raw_code = if raw_len > 0 && raw_len <= padded_code_with_artifacts.len() {
                             &padded_code_with_artifacts[..raw_len]
                         } else {
                             &padded_code_with_artifacts[..]
                         };
-                        if !bytecodes_map.contains_key(&effective) {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            bytecodes_map.entry(effective)
+                        {
                             bytecodes_out.push((effective, raw_code.to_vec()));
-                            bytecodes_map.insert(
-                                effective,
-                                Bytecode::new_raw(Bytes::copy_from_slice(raw_code)),
-                            );
+                            entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
                         }
                         // Store the FULL preimage (code + artifacts) under the blake2s hash.
                         // The deployer precompile looks up by this hash.
@@ -1405,17 +1435,17 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
         let mut state_for_deployer = read_state.state_view_at(block_number)?;
         let mut deployer_resolved = 0;
         for (hash, marker) in &block_output.published_preimages {
-            if marker.len() == 1 && marker[0] == 0xDE {
-                // This is a deployer bytecode hash marker
-                if let Some(preimage) = state_for_deployer.get_preimage(*hash) {
-                    if !preimage.is_empty() {
-                        if !bytecodes_map.contains_key(hash) {
-                            bytecodes_map.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
-                        }
-                        extra_bytecodes.push((*hash, preimage));
-                        deployer_resolved += 1;
-                    }
-                }
+            // 0xDE marker: deployer bytecode hash whose preimage must be resolved.
+            if marker.len() == 1
+                && marker[0] == 0xDE
+                && let Some(preimage) = state_for_deployer.get_preimage(*hash)
+                && !preimage.is_empty()
+            {
+                bytecodes_map
+                    .entry(*hash)
+                    .or_insert_with(|| Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
+                extra_bytecodes.push((*hash, preimage));
+                deployer_resolved += 1;
             }
         }
         if deployer_resolved > 0 {
@@ -1479,12 +1509,15 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                 }
                 if bytecode_hash.is_zero() || !seen_bytecode_hashes.insert(bytecode_hash) { continue; }
                 if bytecodes_map.contains_key(&bytecode_hash) { continue; }
-                if let Some(code_preimage) = state_for_bytecodes.get_preimage(bytecode_hash) {
-                    if !code_preimage.is_empty() {
-                        bytecodes_map.insert(bytecode_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code_preimage)));
-                        extra_bytecodes.push((bytecode_hash, code_preimage));
-                        resolved_count += 1;
-                    }
+                if let Some(code_preimage) = state_for_bytecodes.get_preimage(bytecode_hash)
+                    && !code_preimage.is_empty()
+                {
+                    bytecodes_map.insert(
+                        bytecode_hash,
+                        Bytecode::new_raw(Bytes::copy_from_slice(&code_preimage)),
+                    );
+                    extra_bytecodes.push((bytecode_hash, code_preimage));
+                    resolved_count += 1;
                 }
             }
         }
@@ -1536,18 +1569,21 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
             nonce: props.nonce, balance: props.balance, code_hash: effective,
             code: None, account_id: None,
         });
-        if !pre_hash.is_zero() {
-            if let Some(padded_code) = state_after.get_preimage(pre_hash) {
+        if !pre_hash.is_zero()
+            && let Some(padded_code) = state_after.get_preimage(pre_hash)
+        {
+            {
                 let raw_len = props.unpadded_code_len as usize;
                 let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
                     &padded_code[..raw_len]
                 } else {
                     &padded_code[..]
                 };
-                if !bytecodes_map.contains_key(&effective) {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    bytecodes_map.entry(effective)
+                {
                     bytecodes_out.push((effective, raw_code.to_vec()));
-                    bytecodes_map.insert(
-                        effective,
+                    entry.insert(
                         Bytecode::new_raw(Bytes::copy_from_slice(raw_code)),
                     );
                 }

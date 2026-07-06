@@ -3,6 +3,7 @@ use crate::batcher::seal_criteria::BatchInfoAccumulator;
 use crate::config::BatcherConfig;
 use crate::prover_block::ProverBlock;
 use alloy::consensus::BlobTransactionSidecar;
+use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use std::pin::Pin;
@@ -51,6 +52,8 @@ pub struct Batcher<ReadState> {
     pub sidecar_sender: mpsc::Sender<BlobTransactionSidecar>,
     pub committed_batch_provider: CommittedBatchProvider,
     pub read_state: ReadState,
+    /// Merkle tree handle for batch-boundary tree views (ZiSK batch tree update).
+    pub merkle_tree: MerkleTree<RocksDBWrapper>,
 }
 
 #[async_trait]
@@ -162,18 +165,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> PipelineComponent
                 };
                 recreated = false;
                 batch_envelope
-                };
-                recreated = true;
-                batch_envelope
-            } else {
-                let Some(batch_envelope) = self
-                    .create_batch(&mut input, &latency_tracker, &prev_batch_info)
-                    .await?
-                else {
-                    return Ok(());
-                };
-                recreated = false;
-                batch_envelope
             };
 
             let time_since_last_batch =
@@ -234,9 +225,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
 
         let batch_number = prev_batch_info.batch_number + 1;
         let mut blocks = vec![];
-        // Save first/last block tree views for batch-level ZiSK tree update
-        let mut batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
-        let mut batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
         let mut accumulator = BatchInfoAccumulator::new(
             self.batcher_config.tx_per_batch_limit,
             self.pubdata_limit_bytes,
@@ -310,13 +298,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                                 deadline = Some(Box::pin(tokio::time::sleep_until(instant)));
                             }
 
-                            // Save first block's tree start (batch-level tree root before)
-                            if batch_tree_start.is_none() {
-                                batch_tree_start = Some(tree.block_start.clone());
-                            }
-                            // Always update batch_tree_end to the latest block's end
-                            batch_tree_end = Some(tree.block_end.clone());
-
                             // ---------- accumulate batch data ----------
                             accumulator.add(&block_output, &replay_record);
 
@@ -341,6 +322,17 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
         accumulator.report_accumulated_resources_to_metrics();
 
         let protocol_version = &blocks.first().as_ref().unwrap().1.protocol_version;
+
+        // Batch-boundary tree views for the ZiSK batch-level tree update:
+        // before the first block and after the last block of the batch.
+        let batch_tree_start = blocks.first().map(|(_, rr, _, _)| MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: rr.block_context.block_number - 1,
+        });
+        let batch_tree_end = blocks.last().map(|(_, rr, _, _)| MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: rr.block_context.block_number,
+        });
 
         /* ---------- seal the batch ---------- */
         let batch_envelope = batch_builder::seal_batch(
@@ -377,8 +369,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
         );
 
         let mut blocks = vec![];
-        let mut batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
-        let mut batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
 
         let expected_block_count = existing_batch.block_count();
         // Collect all blocks in this batch
@@ -395,11 +385,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 return Ok(None);
             };
             state_reporter.enter_state(GenericComponentState::Active);
-
-            if batch_tree_start.is_none() {
-                batch_tree_start = Some(tree.block_start.clone());
-            }
-            batch_tree_end = Some(tree.block_end.clone());
 
             tracing::debug!(
                 batch_number,
@@ -423,6 +408,17 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             existing_batch.last_block_number(),
             "Block number mismatch in last block of a rebuilt batch"
         );
+
+        // Batch-boundary tree views for the ZiSK batch-level tree update:
+        // before the first block and after the last block of the batch.
+        let batch_tree_start = blocks.first().map(|(_, rr, _, _)| MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: rr.block_context.block_number - 1,
+        });
+        let batch_tree_end = blocks.last().map(|(_, rr, _, _)| MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: rr.block_context.block_number,
+        });
 
         // Rebuild the batch from blocks
         let rebuilt_batch = batch_builder::seal_batch(

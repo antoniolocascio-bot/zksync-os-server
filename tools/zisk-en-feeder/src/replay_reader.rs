@@ -1,13 +1,13 @@
 //! Secondary-mode reader for the EN's block-replay WAL.
 //!
-//! Mirrors `tools/zisk-batch-test/src/replay_reader.rs` but uses RocksDB's
+//! Reads the block-replay WAL via RocksDB's
 //! secondary instance mode so we can read while the EN continues to write.
 //! The two readers diverge only in how the DB is opened; the record layout
 //! is identical because the WAL format is owned by `zksync-os-server`.
 
 use std::path::Path;
 
-use zksync_os_interface::types::BlockContext;
+use zksync_os_storage_api::BlockContext;
 use zksync_os_types::ZkTransaction;
 
 const CF_CONTEXT: &str = "Context";
@@ -22,6 +22,9 @@ const CF_NAMES: &[&str] = &[
     "CanonicalHash", "NodeVersion",
 ];
 
+// Consumed field-by-field by the feeder's input builder; the binary itself
+// only threads the struct through.
+#[allow(dead_code)]
 pub struct ReplayData {
     pub block_context: BlockContext,
     pub transactions: Vec<ZkTransaction>,
@@ -64,13 +67,13 @@ impl SecondaryReplayReader {
     pub fn read_record(&self, block_number: u64) -> anyhow::Result<ReplayData> {
         let key = block_number.to_be_bytes();
         let ctx_cf = self.db.cf_handle(CF_CONTEXT).expect("missing Context CF");
-        let ctx_bytes = self.db.get_cf(&ctx_cf, &key)?
+        let ctx_bytes = self.db.get_cf(&ctx_cf, key)?
             .ok_or_else(|| anyhow::anyhow!("no context for block {block_number}"))?;
         let (block_context, _): (BlockContext, _) =
             bincode::serde::decode_from_slice(&ctx_bytes, bincode::config::standard())?;
 
         let txs_cf = self.db.cf_handle(CF_TXS).expect("missing Txs CF");
-        let txs_bytes = self.db.get_cf(&txs_cf, &key)?
+        let txs_bytes = self.db.get_cf(&txs_cf, key)?
             .ok_or_else(|| anyhow::anyhow!("no txs for block {block_number}"))?;
         let (transactions, _): (Vec<ZkTransaction>, _) =
             bincode::decode_from_slice(&txs_bytes, bincode::config::standard())?;
