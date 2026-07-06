@@ -456,7 +456,7 @@ pub async fn run<State: ReadStateHistory + WriteState + StateInitializer + Clone
         config.general_config.force_starting_block_number,
         ?node_startup_state,
         starting_block,
-        blocks_to_replay = node_startup_state.block_replay_storage_last_block + 1 - starting_block,
+        blocks_to_replay = (node_startup_state.block_replay_storage_last_block + 1).saturating_sub(starting_block),
         "Node state on startup"
     );
 
@@ -1247,19 +1247,40 @@ async fn run_main_node_pipeline(
         .await
         .expect("Failed to initialize ProofStorage");
 
+    // Create shared ZiSK data cache when second_proof_system is enabled.
+    // Passed to both FriProvingPipelineStep (stores data) and SnarkJobManager (reads data).
+    let zisk_data_cache = if config.prover_input_generator_config.second_proof_system {
+        tracing::info!("ZiSK proof generation enabled");
+        Some(Arc::new(crate::prover_api::zisk_data_cache::ZiskDataCache::new()))
+    } else {
+        None
+    };
+
     let (fri_proving_step, fri_job_manager) = FriProvingPipelineStep::new(
         proof_storage.clone(),
         node_state_on_startup.l1_state.last_proved_batch,
         config.prover_api_config.fri_job_timeout,
         config.prover_api_config.max_assigned_batch_range,
+        zisk_data_cache.clone(),
     );
 
-    let (snark_proving_step, snark_job_manager) = SnarkProvingPipelineStep::new(
-        config.prover_api_config.max_fris_per_snark,
-        node_state_on_startup.l1_state.last_proved_batch,
-        config.prover_api_config.snark_job_timeout,
-        config.prover_api_config.max_assigned_batch_range,
-    );
+    let (snark_proving_step, snark_job_manager, zisk_job_manager) = if zisk_data_cache.is_some() {
+        SnarkProvingPipelineStep::new_with_zisk_cache(
+            config.prover_api_config.max_fris_per_snark,
+            node_state_on_startup.l1_state.last_proved_batch,
+            config.prover_api_config.snark_job_timeout,
+            config.prover_api_config.max_assigned_batch_range,
+            zisk_data_cache,
+            config.prover_input_generator_config.multi_proof_verifier,
+        )
+    } else {
+        SnarkProvingPipelineStep::new(
+            config.prover_api_config.max_fris_per_snark,
+            node_state_on_startup.l1_state.last_proved_batch,
+            config.prover_api_config.snark_job_timeout,
+            config.prover_api_config.max_assigned_batch_range,
+        )
+    };
 
     let prover_api_port = if config.prover_api_config.enabled {
         let prover_listener = prebound_prover_api_listener
@@ -1272,6 +1293,7 @@ async fn run_main_node_pipeline(
             prover_server::run(
                 fri_job_manager.clone(),
                 snark_job_manager.clone(),
+                zisk_job_manager.clone(),
                 proof_storage.clone(),
                 prover_listener,
                 shutdown,
@@ -1287,8 +1309,9 @@ async fn run_main_node_pipeline(
     }
 
     if config.prover_api_config.fake_snark_provers.enabled {
-        run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager);
+        run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager.clone());
     }
+
 
     if !config.prover_input_generator_config.enable_input_generation {
         assert!(
@@ -1333,6 +1356,7 @@ async fn run_main_node_pipeline(
             merkle_tree: tree,
             runtime: runtime.clone(),
             disabled: !config.prover_input_generator_config.enable_input_generation,
+            enable_second_proof_system: config.prover_input_generator_config.second_proof_system,
         })
         .pipe(Batcher {
             startup_config: BatcherStartupConfig {
@@ -1486,8 +1510,64 @@ async fn run_en_pipeline(
                     )
                 }),
         )
-        .pipe(TreeManager { tree: tree.clone() })
-        .pipe_if(
+        .pipe(TreeManager { tree: tree.clone() });
+
+    let snapshot_rx = if config.batcher_config.en_dump_only {
+        // EN dump-only mode: run ProverInputGenerator + Batcher, drain into
+        // NoOpSink. No FRI proving, no L1 settlement. `ZISK_DUMP_DIR` inside
+        // the Batcher writes bincode BatchInput to disk for offline testing.
+        // Dawn commits pubdata to L1 via blobs. For any other L1-settled
+        // chain, override via the `l1_sender_pubdata_mode` env var. The batch
+        // commitment hashes over the DA mode, so this must match the chain.
+        let pubdata_mode = config
+            .l1_sender_config
+            .pubdata_mode
+            .unwrap_or(PubdataMode::Blobs);
+        let (sidecar_tx, mut sidecar_rx) =
+            tokio::sync::mpsc::channel::<BlobTransactionSidecar>(8);
+        runtime.spawn_critical_task("en_dump_sidecar_drain", async move {
+            while sidecar_rx.recv().await.is_some() {
+                // In dump-only mode we never submit blob txs to L1, so drop
+                // whatever the Batcher produces to keep the channel unblocked.
+            }
+        });
+        let pipeline = pipeline
+            .pipe(ProverInputGenerator {
+                enable_logging: config.prover_input_generator_config.logging_enabled,
+                maximum_in_flight_blocks: config
+                    .prover_input_generator_config
+                    .maximum_in_flight_blocks,
+                read_state: state.clone(),
+                pubdata_mode,
+                merkle_tree: tree,
+                runtime: runtime.clone(),
+                disabled: !config.prover_input_generator_config.enable_input_generation,
+                enable_second_proof_system: config
+                    .prover_input_generator_config
+                    .second_proof_system,
+            })
+            .pipe(Batcher {
+                startup_config: BatcherStartupConfig {
+                    last_committed_batch: node_state_on_startup.l1_state.last_committed_batch,
+                    last_executed_batch: node_state_on_startup.l1_state.last_executed_batch,
+                    last_persisted_block: node_state_on_startup.block_replay_storage_last_block,
+                },
+                chain_id,
+                sl_chain_id: node_state_on_startup.l1_state.sl_chain_id,
+                chain_address_sl: node_state_on_startup.l1_state.diamond_proxy_address_sl(),
+                pubdata_limit_bytes: config.sequencer_config.block_pubdata_limit_bytes,
+                batcher_config: config.batcher_config.clone(),
+                pubdata_mode,
+                sidecar_sender: sidecar_tx,
+                committed_batch_provider: committed_batch_provider.clone(),
+                read_state: state.clone(),
+            })
+            .pipe(NoOpSink::new());
+        let components = pipeline.components();
+        pipeline.spawn();
+        PipelineTracker::spawn(runtime, components)
+    } else {
+        let pipeline = pipeline.pipe_if(
             config.batch_verification_config.client_enabled,
             BatchVerificationResponder::new(
                 chain_id,
@@ -1501,10 +1581,10 @@ async fn run_en_pipeline(
             ),
             NoOpSink::new(),
         );
-
-    let components = pipeline.components();
-    pipeline.spawn();
-    let snapshot_rx = PipelineTracker::spawn(runtime, components);
+        let components = pipeline.components();
+        pipeline.spawn();
+        PipelineTracker::spawn(runtime, components)
+    };
 
     if config.general_config.run_priority_tree {
         let priority_tree_manager = PriorityTreeManager::new(

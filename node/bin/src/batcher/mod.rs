@@ -122,43 +122,59 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> PipelineComponent
             state_reporter.enter_state(GenericComponentState::Active);
 
             let recreated;
-            let batch_envelope =
-                if prev_batch_info.batch_number < self.startup_config.last_committed_batch {
-                    let committed_batch = self
-                        .committed_batch_provider
-                        .wait_for_batch(prev_batch_info.batch_number + 1)
-                        .await;
-                    // Validate that the existing batch's first block matches the next block in the stream
-                    anyhow::ensure!(
-                        committed_batch.first_block_number() == next_block_number,
-                        "Existing batch first block ({}) does not match next block in stream ({})",
-                        committed_batch.first_block_number(),
-                        next_block_number
-                    );
+            // en_dump_only mode: never freely create batches; only recreate
+            // ones the main node has already committed to L1
+            // (wait_for_batch blocks until the batch lands there).
+            let batch_envelope = if self.batcher_config.en_dump_only
+                || prev_batch_info.batch_number < self.startup_config.last_committed_batch
+            {
+                let committed_batch = self
+                    .committed_batch_provider
+                    .wait_for_batch(prev_batch_info.batch_number + 1)
+                    .await;
+                // Validate that the existing batch's first block matches the next block in the stream
+                anyhow::ensure!(
+                    committed_batch.first_block_number() == next_block_number,
+                    "Existing batch first block ({}) does not match next block in stream ({})",
+                    committed_batch.first_block_number(),
+                    next_block_number
+                );
 
-                    let Some(batch_envelope) = self
-                        .recreate_existing_batch(
-                            &mut input,
-                            &prev_batch_info,
-                            committed_batch,
-                            &state_reporter,
-                        )
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    recreated = true;
-                    batch_envelope
-                } else {
-                    let Some(batch_envelope) = self
-                        .create_batch(&mut input, &prev_batch_info, &state_reporter)
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    recreated = false;
-                    batch_envelope
+                let Some(batch_envelope) = self
+                    .recreate_existing_batch(
+                        &mut input,
+                        &prev_batch_info,
+                        committed_batch,
+                        &state_reporter,
+                    )
+                    .await?
+                else {
+                    return Ok(());
                 };
+                recreated = true;
+                batch_envelope
+            } else {
+                let Some(batch_envelope) = self
+                    .create_batch(&mut input, &prev_batch_info, &state_reporter)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                recreated = false;
+                batch_envelope
+                };
+                recreated = true;
+                batch_envelope
+            } else {
+                let Some(batch_envelope) = self
+                    .create_batch(&mut input, &latency_tracker, &prev_batch_info)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                recreated = false;
+                batch_envelope
+            };
 
             let time_since_last_batch =
                 last_created_batch_at.map(|last_created_batch_at| last_created_batch_at.elapsed());
@@ -218,6 +234,9 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
 
         let batch_number = prev_batch_info.batch_number + 1;
         let mut blocks = vec![];
+        // Save first/last block tree views for batch-level ZiSK tree update
+        let mut batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
+        let mut batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
         let mut accumulator = BatchInfoAccumulator::new(
             self.batcher_config.tx_per_batch_limit,
             self.pubdata_limit_bytes,
@@ -291,6 +310,13 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                                 deadline = Some(Box::pin(tokio::time::sleep_until(instant)));
                             }
 
+                            // Save first block's tree start (batch-level tree root before)
+                            if batch_tree_start.is_none() {
+                                batch_tree_start = Some(tree.block_start.clone());
+                            }
+                            // Always update batch_tree_end to the latest block's end
+                            batch_tree_end = Some(tree.block_end.clone());
+
                             // ---------- accumulate batch data ----------
                             accumulator.add(&block_output, &replay_record);
 
@@ -328,6 +354,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 .adapt_for_protocol_version(protocol_version),
             self.sl_chain_id,
             &self.read_state,
+            batch_tree_start,
+            batch_tree_end,
         )?;
         Ok(Some(batch_envelope))
     }
@@ -349,6 +377,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
         );
 
         let mut blocks = vec![];
+        let mut batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
+        let mut batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
 
         let expected_block_count = existing_batch.block_count();
         // Collect all blocks in this batch
@@ -365,6 +395,11 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 return Ok(None);
             };
             state_reporter.enter_state(GenericComponentState::Active);
+
+            if batch_tree_start.is_none() {
+                batch_tree_start = Some(tree.block_start.clone());
+            }
+            batch_tree_end = Some(tree.block_end.clone());
 
             tracing::debug!(
                 batch_number,
@@ -400,6 +435,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             self.pubdata_mode,
             self.sl_chain_id,
             &self.read_state,
+            batch_tree_start,
+            batch_tree_end,
         )?;
 
         // Verify that the rebuilt batch matches the stored batch by comparing hashes

@@ -32,15 +32,46 @@ impl SnarkProvingPipelineStep {
         last_proved_batch_number: u64,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
-    ) -> (Self, Arc<SnarkJobManager>) {
+    ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
+        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None, false)
+    }
+
+    pub fn new_with_zisk_cache(
+        max_fris_per_snark: usize,
+        last_proved_batch_number: u64,
+        assignment_timeout: Duration,
+        max_assigned_batch_range: usize,
+        zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
+        require_multi_proof: bool,
+    ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
-        let snark_job_manager = Arc::new(SnarkJobManager::new(
-            proof_commands_sender,
+        let mut sjm = SnarkJobManager::new(
+            proof_commands_sender.clone(),
             max_fris_per_snark,
             assignment_timeout,
             max_assigned_batch_range,
-        ));
+        );
+
+        let zisk_job_manager = if let Some(cache) = zisk_data_cache {
+            sjm.set_zisk_data_cache(cache);
+            let zjm = Arc::new(super::zisk_job_manager::ZiskJobManager::new(
+                proof_commands_sender,
+                assignment_timeout,
+            ));
+            sjm.set_zisk_job_manager(zjm.clone());
+            if require_multi_proof {
+                sjm.set_require_multi_proof(true);
+                tracing::info!("ZiSK job manager enabled (multi-proof REQUIRED)");
+            } else {
+                tracing::info!("ZiSK job manager enabled (multi-proof optional)");
+            }
+            Some(zjm)
+        } else {
+            None
+        };
+
+        let snark_job_manager = Arc::new(sjm);
 
         let result = Self {
             last_proved_batch_number,
@@ -48,7 +79,7 @@ impl SnarkProvingPipelineStep {
             proof_commands_receiver,
         };
 
-        (result, snark_job_manager)
+        (result, snark_job_manager, zisk_job_manager)
     }
 }
 

@@ -1238,8 +1238,76 @@ impl AnvilL1 {
     }
 }
 
+/// Launch the ZiSK GPU prover service with `--iterations 1`.
+///
+/// This must only be called after the Airbender GPU prover has exited so both
+/// provers never contend for the same GPU simultaneously. The ZiSK prover runs
+/// `cargo-zisk prove` (STARK aggregation, GPU) and `cargo-zisk prove-snark`
+/// (SNARK wrapping, GPU), then submits the proof to the server and exits.
+///
+/// Required environment variables:
+/// - `ZISK_PROVER_BIN` — path to `zksync-os-zisk-prover-service` binary
+/// - `ZISK_BINARY` — path to `cargo-zisk` GPU binary
+/// - `ZISK_ELF` — path to the ZiSK guest ELF
+/// - `ZISK_PK` — path to ZiSK STARK proving key directory
+/// - `ZISK_SK` — path to ZiSK SNARK proving key directory
+#[cfg(feature = "gpu-prover-tests")]
+async fn spawn_zisk_gpu_prover(sequencer_url: &str) {
+    let zisk_bin = std::env::var("ZISK_PROVER_BIN")
+        .unwrap_or_else(|_| "zksync-os-zisk-prover-service".to_string());
+    let cargo_zisk = std::env::var("ZISK_BINARY")
+        .unwrap_or_else(|_| "cargo-zisk".to_string());
+    let elf_path = std::env::var("ZISK_ELF").expect(
+        "ZISK_ELF must be set for gpu-prover-tests (path to ZiSK guest ELF)"
+    );
+    let proving_key = std::env::var("ZISK_PK").unwrap_or_else(|_| {
+        format!("{}/.zisk/provingKey", std::env::var("HOME").unwrap())
+    });
+    let proving_key_snark = std::env::var("ZISK_SK").unwrap_or_else(|_| {
+        format!("{}/.zisk/provingKeySnark", std::env::var("HOME").unwrap())
+    });
+
+    tracing::info!(
+        zisk_bin = %zisk_bin,
+        cargo_zisk = %cargo_zisk,
+        elf_path = %elf_path,
+        "Launching ZiSK GPU prover (--iterations 1)"
+    );
+
+    let mut child = tokio::process::Command::new(&zisk_bin)
+        .arg("--sequencer-url")
+        .arg(sequencer_url)
+        .arg("--zisk-binary")
+        .arg(&cargo_zisk)
+        .arg("--elf-path")
+        .arg(&elf_path)
+        .arg("--proving-key")
+        .arg(&proving_key)
+        .arg("--proving-key-snark")
+        .arg(&proving_key_snark)
+        .arg("--iterations")
+        .arg("1")
+        .spawn()
+        .expect("failed to spawn ZiSK prover service");
+
+    let code = child
+        .wait()
+        .await
+        .expect("failed to wait for ZiSK prover service");
+    if code.success() {
+        tracing::info!("ZiSK GPU prover service finished running");
+    } else {
+        panic!("ZiSK GPU prover service terminated with exit code {}", code);
+    }
+}
+
 #[cfg(feature = "prover-tests")]
 async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterations: usize) {
+    #[cfg(feature = "gpu-prover-tests")]
+    let zisk_sequencer_url = sequencer_urls
+        .first()
+        .expect("at least one sequencer URL for prover tests")
+        .clone();
     let protocol_version = tester.chain_layout.protocol_version();
     let app_bin_path = match protocol_version {
         PROTOCOL_VERSION => utils::materialize_multiblock_batch_bin(
@@ -1285,11 +1353,76 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
             .await
             .expect("failed to wait for prover service");
         if code.success() {
-            tracing::info!("prover service finished running");
+            tracing::info!("Airbender prover service finished running");
         } else {
-            panic!("prover service terminated with exit code {}", code);
+            panic!("Airbender prover service terminated with exit code {}", code);
         }
+
+        // GPU is now free. Launch the ZiSK GPU prover to generate the second
+        // proof. Both provers share a single GPU and must run sequentially.
+        #[cfg(feature = "gpu-prover-tests")]
+        spawn_zisk_gpu_prover(&zisk_sequencer_url).await;
     });
+}
+
+/// Launch the ZiSK GPU prover service with `--iterations 1`.
+///
+/// This must only be called after the Airbender GPU prover has exited so both
+/// provers never contend for the same GPU simultaneously. The ZiSK prover runs
+/// a single integrated `cargo-zisk prove --plonk` (STARK aggregation + PLONK
+/// SNARK wrap, GPU), then submits the proof to the server and exits.
+///
+/// Required environment variables:
+/// - `ZISK_PROVER_BIN` — path to `zksync-os-zisk-prover-service` binary
+/// - `ZISK_BINARY` — path to `cargo-zisk` GPU binary
+/// - `ZISK_ELF` — path to the ZiSK guest ELF
+/// - `ZISK_PK` — path to ZiSK STARK proving key directory
+/// - `ZISK_SK` — path to ZiSK PLONK proving key directory
+#[cfg(feature = "gpu-prover-tests")]
+async fn spawn_zisk_gpu_prover(sequencer_url: &str) {
+    let zisk_bin = std::env::var("ZISK_PROVER_BIN")
+        .unwrap_or_else(|_| "zksync-os-zisk-prover-service".to_string());
+    let cargo_zisk =
+        std::env::var("ZISK_BINARY").unwrap_or_else(|_| "cargo-zisk".to_string());
+    let elf_path = std::env::var("ZISK_ELF")
+        .expect("ZISK_ELF must be set for gpu-prover-tests (path to ZiSK guest ELF)");
+    let proving_key = std::env::var("ZISK_PK")
+        .unwrap_or_else(|_| format!("{}/.zisk/provingKey", std::env::var("HOME").unwrap()));
+    let proving_key_plonk = std::env::var("ZISK_SK")
+        .unwrap_or_else(|_| format!("{}/.zisk/provingKeySnark", std::env::var("HOME").unwrap()));
+
+    tracing::info!(
+        zisk_bin = %zisk_bin,
+        cargo_zisk = %cargo_zisk,
+        elf_path = %elf_path,
+        "Launching ZiSK GPU prover (--iterations 1)"
+    );
+
+    let mut child = tokio::process::Command::new(&zisk_bin)
+        .arg("--sequencer-url")
+        .arg(sequencer_url)
+        .arg("--zisk-binary")
+        .arg(&cargo_zisk)
+        .arg("--elf-path")
+        .arg(&elf_path)
+        .arg("--proving-key")
+        .arg(&proving_key)
+        .arg("--proving-key-plonk")
+        .arg(&proving_key_plonk)
+        .arg("--iterations")
+        .arg("1")
+        .spawn()
+        .expect("failed to spawn ZiSK prover service");
+
+    let code = child
+        .wait()
+        .await
+        .expect("failed to wait for ZiSK prover service");
+    if code.success() {
+        tracing::info!("ZiSK GPU prover service finished running");
+    } else {
+        panic!("ZiSK GPU prover service terminated with exit code {}", code);
+    }
 }
 
 #[cfg(feature = "prover-tests")]

@@ -17,7 +17,7 @@ use crate::prover_api::{
         AppState,
         v1::models::{
             BatchDataPayload, FailedProofResponse, FriProofPayload, NextSnarkProverJobPayload,
-            ProverQuery, SnarkProofPayload,
+            ProverQuery, SnarkProofPayload, ZiskBatchDataPayload,
         },
     },
 };
@@ -89,7 +89,9 @@ pub(super) async fn pick_fri_job(
     {
         Some((fri_job, input)) => {
             let bytes: Vec<u8> = match &input {
-                ProverInput::Real(words) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ProverInput::Real { witness, .. } => {
+                    witness.iter().flat_map(|v| v.to_le_bytes()).collect()
+                }
                 ProverInput::Fake => vec![],
             };
             let prover_input = general_purpose::STANDARD.encode(&bytes);
@@ -278,7 +280,9 @@ pub(super) async fn peek_fri_job(
     match state.fri_job_manager.peek_batch_data(batch_number).await {
         Some((vk_hash, prover_input)) => {
             let bytes: Vec<u8> = match &prover_input {
-                ProverInput::Real(words) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ProverInput::Real { witness, .. } => {
+                    witness.iter().flat_map(|v| v.to_le_bytes()).collect()
+                }
                 ProverInput::Fake => vec![],
             };
             Json(BatchDataPayload {
@@ -374,6 +378,87 @@ pub(super) async fn peek_snark_job(
 pub(super) async fn status(State(state): State<AppState>) -> Response {
     let status = state.fri_job_manager.status().await;
     Json(status).into_response()
+}
+
+/// Peek ZiSK batch data for a given batch number.
+/// Returns the bincode-serialized BatchInput for the ZiSK prover.
+pub(super) async fn peek_zisk_data(
+    Path(batch_number): Path<u64>,
+    State(state): State<AppState>,
+) -> Response {
+    match state.fri_job_manager.peek_batch_data(batch_number).await {
+        Some((vk_hash, prover_input)) => {
+            match prover_input.zisk_data() {
+                Some(zisk_bytes) => {
+                    Json(ZiskBatchDataPayload {
+                        batch_number,
+                        vk_hash: vk_hash.to_string(),
+                        zisk_data: general_purpose::STANDARD.encode(zisk_bytes),
+                    })
+                    .into_response()
+                }
+                None => {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Batch {batch_number} has no ZiSK data (second_proof_system not enabled?)"),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => {
+            // Also check proof storage for completed batches
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+/// Pick the next ZiSK SNARK job. Assigns a batch to the requesting prover.
+/// Mirrors `/FRI/pick` in semantics: assignment with timeout-based reassignment.
+pub(super) async fn pick_zisk_job(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(ref zjm) = state.zisk_job_manager else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "ZiSK proving not enabled").into_response();
+    };
+
+    match zjm.pick_next_job(&query.id).await {
+        Some(job) => {
+            Json(ZiskBatchDataPayload {
+                batch_number: job.batch_number,
+                vk_hash: job.vk_hash,
+                zisk_data: general_purpose::STANDARD.encode(&job.zisk_data),
+            })
+            .into_response()
+        }
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// Submit a ZiSK SNARK proof. Pairs with the cached Airbender SNARK
+/// to produce a MultiProof for L1 verification.
+pub(super) async fn submit_zisk_proof(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+    Json(payload): Json<super::models::ZiskProofPayload>,
+) -> Result<Response, (StatusCode, String)> {
+    let Some(ref zjm) = state.zisk_job_manager else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "ZiSK proving not enabled".into()));
+    };
+
+    let proof = general_purpose::STANDARD
+        .decode(&payload.proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid proof base64: {e}")))?;
+    let public_values = general_purpose::STANDARD
+        .decode(&payload.public_values)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid public_values base64: {e}")))?;
+
+    zjm.submit_proof(payload.batch_number, proof, public_values, &query.id)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Get detailed information about a failed FRI proof for debugging.

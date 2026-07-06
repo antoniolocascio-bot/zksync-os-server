@@ -180,22 +180,40 @@ impl<E, S> BatchEnvelope<E, S> {
 }
 
 /// Input data required to generate a ZK proof for a batch.
-///
-/// Used for tests and testnets where the expensive RiscV witness computation is unnecessary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ProverInput {
-    Real(Vec<u32>),
+    /// Airbender RiscV witness words (V6/V7).
+    /// Optionally carries ZiSK prover input alongside (when ZiSK generation is enabled).
+    Real {
+        witness: Vec<u32>,
+        /// Optional ZiSK data: bincode-serialized ZiskBlockData (per-block)
+        /// or BatchInput (per-batch). Present when ZiSK proof generation is enabled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zisk_data: Option<Vec<u8>>,
+    },
+    /// Fake proof for testing purposes.
     Fake,
 }
 
 impl ProverInput {
-    /// Returns the underlying witness words.
-    /// Panics if called on `Fake`.
+    /// Returns the underlying witness words (airbender format).
     pub fn unwrap_real(&self) -> &[u32] {
         match self {
-            ProverInput::Real(v) => v.as_slice(),
+            ProverInput::Real { witness, .. } => witness.as_slice(),
             ProverInput::Fake => panic!("ProverInput::Fake has no witness data"),
         }
+    }
+
+    /// Returns the optional ZiSK bincode bytes, if present.
+    pub fn zisk_data(&self) -> Option<&[u8]> {
+        match self {
+            ProverInput::Real { zisk_data: Some(v), .. } => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn is_fake(&self) -> bool {
+        matches!(self, ProverInput::Fake)
     }
 }
 
@@ -271,6 +289,39 @@ pub enum SnarkProof {
     // Fake proof for testing purposes
     Fake,
     Real(RealSnarkProof),
+    /// Multi-proof: Airbender SNARK + ZiSK SNARK verified together on-chain.
+    MultiProof(MultiProofSnarkProof),
+}
+
+/// Combined proof for the multi-proof system (Airbender + ZiSK).
+///
+/// Both proof systems must independently verify the same batch state transition.
+/// The `MultiProofVerifier` L1 contract rejects the proof if either fails.
+///
+/// Proof encoding on L1 (type 5):
+/// `[type|version, prevHash, N, airbender[N], zisk[24], pubvals[8]]`
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MultiProofSnarkProof {
+    /// Airbender SNARK proof bytes (Plonk format, multiple of 32 bytes).
+    pub era_proof: Vec<u8>,
+    /// ZiSK SNARK proof bytes (768 bytes = 24 BN254 points).
+    pub zisk_proof: Vec<u8>,
+    /// ZiSK public values (256 bytes = 8 uint256 slots).
+    /// First 32 bytes = batch commitment hash.
+    pub zisk_public_values: Vec<u8>,
+    /// Proving execution version for verifier routing.
+    pub proving_execution_version: u32,
+}
+
+impl std::fmt::Debug for MultiProofSnarkProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiProofSnarkProof")
+            .field("era_proof_len", &self.era_proof.len())
+            .field("zisk_proof_len", &self.zisk_proof.len())
+            .field("zisk_pv_len", &self.zisk_public_values.len())
+            .field("proving_execution_version", &self.proving_execution_version)
+            .finish()
+    }
 }
 
 // V1 can be dropped if there testnet-alpha will be regenerated from scratch.
@@ -291,6 +342,7 @@ impl SnarkProof {
                 proving_execution_version,
                 ..
             }) => Some(*proving_execution_version),
+            SnarkProof::MultiProof(two) => Some(two.proving_execution_version),
             _ => None,
         }
     }
@@ -298,6 +350,7 @@ impl SnarkProof {
     pub fn proof(&self) -> Option<&[u8]> {
         match self {
             SnarkProof::Real(real) => Some(real.proof()),
+            SnarkProof::MultiProof(two) => Some(&two.era_proof),
             SnarkProof::Fake => None,
         }
     }

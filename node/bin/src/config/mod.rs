@@ -1457,6 +1457,14 @@ pub struct BatcherConfig {
     /// when recovering from corrupted state.
     #[config(default_t = true)]
     pub assert_rebuilt_batch_hashes: bool,
+
+    /// When true, run ProverInputGenerator + Batcher on an External Node and
+    /// discard the output (no FRI proving, no L1 settlement). Used together
+    /// with `ZISK_DUMP_DIR` to snapshot a production chain's `BatchInput`
+    /// bincode for offline execution through `zksync-os-zisk-lib`.
+    /// Has no effect on the Main Node.
+    #[config(default_t = false)]
+    pub en_dump_only: bool,
 }
 
 /// Only used on the Main Node.
@@ -1478,6 +1486,20 @@ pub struct ProverInputGeneratorConfig {
     /// is unnecessary.
     #[config(default_t = true)]
     pub enable_input_generation: bool,
+
+    /// Enable ZiSK (RV64IMA) proof generation alongside Airbender.
+    /// When true, generates ZiSK prover input for every batch and the
+    /// `MultiProofCombiner` combines both proofs for L1 verification.
+    /// Requires `zisk_*` paths to be configured below.
+    #[config(default_t = false)]
+    pub second_proof_system: bool,
+
+    /// When true, deploy and use the MultiProofVerifier on L1 which requires
+    /// BOTH Airbender and ZiSK proofs for every state transition.
+    /// Implies `second_proof_system = true`.
+    #[config(default_t = false)]
+    pub multi_proof_verifier: bool,
+
 }
 
 /// Only used on the Main Node.

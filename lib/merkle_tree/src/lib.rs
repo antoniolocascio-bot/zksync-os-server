@@ -9,6 +9,7 @@ pub use zksync_os_merkle_tree_api::{
     TreeBatchOutput, TreeEntry, TreeOperation,
 };
 
+pub use self::with_version::{MerkleTreeVersion, fixed_bytes_to_bytes32};
 pub use self::{
     errors::DeserializeError,
     storage::{Database, MerkleTreeColumnFamily, PatchSet, Patched, RocksDBWrapper},
@@ -19,6 +20,7 @@ use crate::{
 };
 
 mod consistency;
+mod with_version;
 mod errors;
 mod hasher;
 mod metrics;

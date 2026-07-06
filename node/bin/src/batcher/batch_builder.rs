@@ -24,6 +24,8 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     pubdata_mode: PubdataMode,
     sl_chain_id: u64,
     read_state: &ReadState,
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<BatchForSigning<ProverInput>> {
     let block_number_from = blocks.first().unwrap().1.block_context.block_number;
     let block_number_to = blocks.last().unwrap().1.block_context.block_number;
@@ -72,7 +74,39 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     let proving_version =
         ProvingVersion::try_from(blocks.first().unwrap().1.protocol_version.clone())?;
     // execution version should be the same for all the blocks, it is ensured by the seal criteria
-    let batch_prover_input = compute_batch_prover_input(blocks, proving_version, pubdata_mode)?;
+    // Extract after-state account preimages for 0x8003 verification.
+    let account_preimages_after = {
+        use zksync_os_interface::traits::{PreimageSource, ReadStorage};
+        let last_block_number = blocks.last().unwrap().1.block_context.block_number;
+        let mut state_after = read_state.state_view_at(last_block_number)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut preimages = Vec::new();
+        for (block_output, _, _, _) in blocks {
+            for diff in &block_output.account_diffs {
+                if !seen.insert(diff.address) { continue; }
+                let addr_bytes: [u8; 20] = diff.address.into();
+                let flat_key = zksync_os_zisk_lib::merkle::derive_account_properties_key(&addr_bytes);
+                if let Some(hash_value) = ReadStorage::read(&mut state_after, alloy::primitives::B256::from(flat_key.0)) {
+                    if let Some(preimage) = state_after.get_preimage(hash_value) {
+                        preimages.push((diff.address, preimage));
+                    }
+                }
+            }
+        }
+        preimages
+    };
+
+    let batch_prover_input = compute_batch_prover_input(
+        blocks,
+        proving_version,
+        pubdata_mode,
+        multichain_root,
+        sl_chain_id,
+        &batch_info,
+        batch_tree_start,
+        batch_tree_end,
+        account_preimages_after,
+    )?;
 
     // Sanity check: all blocks in the batch should have the same protocol version
     for (_, replay_record, _, _) in blocks.iter().skip(1) {
@@ -145,56 +179,304 @@ fn compute_batch_prover_input(
     )],
     proving_version: ProvingVersion,
     pubdata_mode: PubdataMode,
+    multichain_root: alloy::primitives::B256,
+    sl_chain_id: u64,
+    batch_info: &BatchInfo,
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    account_preimages_after: Vec<(Address, Vec<u8>)>,
 ) -> anyhow::Result<ProverInput> {
     use zk_os_forward_system::run::generate_batch_proof_input;
     use zk_os_forward_system_prev::run::generate_batch_proof_input as generate_batch_proof_input_prev;
 
-    if blocks
-        .iter()
-        .any(|(_, _, _, pi)| matches!(pi, ProverInput::Fake))
-    {
+    if blocks.iter().any(|(_, _, _, pi)| pi.is_fake()) {
         return Ok(ProverInput::Fake);
     }
 
-    Ok(match proving_version {
-        ProvingVersion::V1
-        | ProvingVersion::V2
-        | ProvingVersion::V3
-        | ProvingVersion::V4
-        | ProvingVersion::V5 => {
+    // Generate airbender batch witness (primary proof system)
+    let da_scheme_u8 = pubdata_mode.da_commitment_scheme() as u8;
+    let block_witnesses: Vec<&[u32]> = blocks
+        .iter()
+        .map(|(_, _, _, pi)| pi.unwrap_real())
+        .collect();
+    let block_pubdata: Vec<&[u8]> = blocks
+        .iter()
+        .map(|(bo, _, _, _)| bo.pubdata.as_slice())
+        .collect();
+
+    let witness = match proving_version {
+        ProvingVersion::V1 | ProvingVersion::V2 | ProvingVersion::V3
+        | ProvingVersion::V4 | ProvingVersion::V5 => {
             panic!("sealing batch with prover version v1-v5 is not supported");
         }
         ProvingVersion::V6 => {
             // TODO: in the long-term we should generate proof input per batch
-            ProverInput::Real(generate_batch_proof_input_prev(
-                blocks
-                    .iter()
-                    .map(|(_, _, _, prover_input)| prover_input.unwrap_real())
-                    .collect(),
-                (pubdata_mode.da_commitment_scheme() as u8)
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?,
-                blocks
-                    .iter()
-                    .map(|(block_output, _, _, _)| block_output.pubdata.as_slice())
-                    .collect(),
-            ))
+            let da = da_scheme_u8
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?;
+            generate_batch_proof_input_prev(block_witnesses, da, block_pubdata)
         }
-        ProvingVersion::V7 => {
+        ProvingVersion::V7 | ProvingVersion::ZiskV1 => {
             // TODO: in the long-term we should generate proof input per batch
-            ProverInput::Real(generate_batch_proof_input(
-                blocks
-                    .iter()
-                    .map(|(_, _, _, prover_input)| prover_input.unwrap_real())
-                    .collect(),
-                (pubdata_mode.da_commitment_scheme() as u8)
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?,
-                blocks
-                    .iter()
-                    .map(|(block_output, _, _, _)| block_output.pubdata.as_slice())
-                    .collect(),
-            ))
+            let da = da_scheme_u8
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?;
+            generate_batch_proof_input(block_witnesses, da, block_pubdata)
         }
-    })
+    };
+
+    // If any block carries ZiSK data, assemble the batch-level ZiSK BatchInput.
+    let zisk_data = if blocks.iter().any(|(_, _, _, pi)| pi.zisk_data().is_some()) {
+        Some(assemble_zisk_batch(
+            blocks,
+            pubdata_mode,
+            multichain_root,
+            sl_chain_id,
+            batch_info,
+            batch_tree_start,
+            batch_tree_end,
+            account_preimages_after,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(ProverInput::Real { witness, zisk_data })
+}
+
+/// Assemble per-block ZiSK data into a single batch-level BatchInput.
+fn assemble_zisk_batch(
+    blocks: &[(
+        zksync_os_interface::types::BlockOutput,
+        zksync_os_storage_api::ReplayRecord,
+        zksync_os_merkle_tree::TreeBatchOutput,
+        ProverInput,
+    )],
+    pubdata_mode: PubdataMode,
+    multichain_root: alloy::primitives::B256,
+    sl_chain_id: u64,
+    batch_info: &BatchInfo,
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    account_preimages_after: Vec<(Address, Vec<u8>)>,
+) -> anyhow::Result<Vec<u8>> {
+    use blake2::{Blake2s256, Digest};
+    use crate::prover_input_generator::zisk_input_builder::ZiskBlockData;
+    use zksync_os_zisk_lib::types::*;
+
+    let mut block_data_vec = Vec::with_capacity(blocks.len());
+    for (_, _, _, pi) in blocks {
+        let bytes = pi.zisk_data()
+            .ok_or_else(|| anyhow::anyhow!("ZiSK data missing from ProverInput"))?;
+        let data: ZiskBlockData = bincode1::deserialize(bytes)
+            .map_err(|e| anyhow::anyhow!("failed to deserialize ZiSK BlockData: {e}"))?;
+        block_data_vec.push(data);
+    }
+
+    let first = &block_data_vec[0];
+    let first_replay = &blocks.first().unwrap().1;
+    let first_ctx = &first_replay.block_context;
+    let da_scheme = pubdata_mode.da_commitment_scheme() as u8;
+
+    let pubdata: Vec<u8> = blocks
+        .iter()
+        .flat_map(|(bo, _, _, _)| bo.pubdata.iter().copied())
+        .collect();
+
+    // Compute block_hashes_blake for the state BEFORE the first block in this batch.
+    // This must match the state commitment preimage used by the server/L1:
+    //   Blake2s(previous_255_block_hashes || current_block_hash)
+    // where "previous_255" are hashes of the 255 blocks before the "current" block,
+    // and "current_block_hash" is the hash of the block that produced this state.
+    //
+    // The block_context.block_hashes array has block_hashes[N] = hash of block (current - N - 1).
+    // For the "before" state at block B, the "current block" that produced this state is block B-1.
+    // The genesis state uses: Blake2s(255 * [0; 32] || genesis_header_hash).
+    //
+    // We need to reconstruct the same ordering: the first 255 entries are the hashes
+    // BEFORE the previous block (indices 1..255 of block_hashes), and the last entry
+    // is block_hashes[0] (the previous block's hash, which IS the "current" for the state).
+    //
+    // However, block_hashes_for_first_block() puts genesis at index 255, not index 0.
+    // So for block 1, block_hashes[0] = 0 and block_hashes[255] = genesis_hash.
+    // The state commitment uses: Blake2s(0, 0, ..., 0, genesis_hash) with genesis_hash LAST.
+    // We need to match that: hash all 256 entries in order [0, 1, 2, ..., 255].
+    let block_hashes_blake_before = {
+        let mut hasher = Blake2s256::new();
+        for hash in &first_ctx.block_hashes.0 {
+            hasher.update(hash.to_be_bytes::<32>());
+        }
+        alloy::primitives::B256::from_slice(&hasher.finalize())
+    };
+
+    // Use the LAST block's context for previous_block_hashes — this feeds into
+    // block_hashes_blake_after in the executor, which must match the server's
+    // state commitment that uses last_block_context.block_hashes.0[1..].
+    let last_replay = &blocks.last().unwrap().1;
+    let last_ctx = &last_replay.block_context;
+    let previous_block_hashes: Vec<alloy::primitives::B256> = last_ctx
+        .block_hashes
+        .0[1..]
+        .iter()
+        .map(|h| alloy::primitives::B256::from(h.to_be_bytes::<32>()))
+        .collect();
+
+    let upgrade_tx_hash = batch_info
+        .upgrade_tx_hash
+        .unwrap_or(alloy::primitives::B256::ZERO);
+
+    let spec_id = match crate::prover_input_generator::zisk_input_builder::spec_id_from_execution_version(
+        first_ctx.execution_version,
+    ) {
+        zksync_os_revm::ZkSpecId::AtlasV1 => 0u8,
+        zksync_os_revm::ZkSpecId::AtlasV2 => 1u8,
+    };
+
+    let batch_input = BatchInput {
+        chain_id: first_ctx.chain_id,
+        spec_id,
+        protocol_version_minor: first_replay.protocol_version.minor as u32,
+        batch_meta: BatchMeta {
+            tree_root_before: first.tree_root_before,
+            leaf_count_before: first.leaf_count_before,
+            block_number_before: first.block_number_before,
+            last_block_timestamp_before: first.previous_block_timestamp,
+            block_hashes_blake_before,
+            previous_block_hashes,
+            upgrade_tx_hash,
+            da_commitment_scheme: da_scheme,
+            pubdata,
+            multichain_root,
+            sl_chain_id,
+            blob_versioned_hashes: batch_info.blob_sidecar
+                .as_ref()
+                .map(|sidecar| {
+                    sidecar.commitments.iter().map(|commitment| {
+                        alloy::eips::eip4844::kzg_to_versioned_hash(commitment.as_slice())
+                    }).collect()
+                })
+                .unwrap_or_default(),
+            tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
+            account_preimages_after: account_preimages_after,
+        },
+        blocks: block_data_vec
+            .iter()
+            .map(|d| {
+                let mut bi = d.block_input.clone();
+                bi.expected_tree_root = d.tree_root_before;
+                bi
+            })
+            .collect(),
+        bytecodes: {
+            let mut seen = std::collections::HashSet::new();
+            let mut all_bytecodes = Vec::new();
+            for d in &block_data_vec {
+                for (hash, code) in &d.bytecodes {
+                    if seen.insert(*hash) {
+                        all_bytecodes.push((*hash, code.clone()));
+                    }
+                }
+            }
+            all_bytecodes
+        },
+    };
+
+    let serialized = bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput");
+
+    // If ZISK_DUMP_DIR is set, write the BatchInput to disk for external proving.
+    if let Ok(dump_dir) = std::env::var("ZISK_DUMP_DIR") {
+        let path = std::path::Path::new(&dump_dir);
+        let _ = std::fs::create_dir_all(path);
+        let batch_num = batch_info.batch_number;
+        let file_path = path.join(format!("batch_{batch_num}_zisk.bin"));
+        // Write in ZiSK stdin format: [len:u64_LE][bincode][padding_to_8]
+        let len = serialized.len() as u64;
+        let mut buf = Vec::with_capacity(8 + serialized.len() + 8);
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&serialized);
+        let total = 8 + serialized.len();
+        let padding = (8 - (total % 8)) % 8;
+        buf.extend(std::iter::repeat(0u8).take(padding));
+        match std::fs::write(&file_path, &buf) {
+            Ok(()) => tracing::info!(
+                "ZiSK BatchInput dumped: {} ({} bytes, ZiSK stdin format)",
+                file_path.display(),
+                buf.len()
+            ),
+            Err(e) => tracing::warn!("Failed to dump ZiSK data: {e}"),
+        }
+
+        // Run native executor and dump the commitment for verification
+        match zksync_os_zisk_lib::executor::execute_and_commit_from_bincode(&serialized) {
+            Ok((_output, commitment)) => {
+                let commitment_path = path.join(format!("batch_{batch_num}_commitment.hex"));
+                let _ = std::fs::write(&commitment_path, format!("{commitment}"));
+                tracing::info!(
+                    batch_num,
+                    commitment = %commitment,
+                    "ZiSK native commitment computed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(batch_num, error = %e, "ZiSK native execution failed");
+            }
+        }
+    }
+
+    Ok(serialized)
+}
+
+/// Build a batch-level tree update directly from the batch-start and batch-end tree views.
+///
+/// This is sound: it queries the actual tree state to produce merkle proofs for
+/// both the old root verification (from batch_tree_start) and the new root
+/// computation (from batch_tree_end). No trusted `expected_root_after` needed.
+fn build_batch_tree_update(
+    blocks: &[(
+        zksync_os_interface::types::BlockOutput,
+        zksync_os_storage_api::ReplayRecord,
+        zksync_os_merkle_tree::TreeBatchOutput,
+        ProverInput,
+    )],
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+) -> anyhow::Result<Option<zksync_os_zisk_lib::merkle::BatchTreeUpdate>> {
+    // Collect all storage writes across all blocks, deduplicate (last-writer-wins per key)
+    let mut combined_writes: Vec<zksync_os_interface::types::StorageWrite> = Vec::new();
+    let mut seen_keys: std::collections::HashMap<alloy::primitives::B256, usize> =
+        std::collections::HashMap::new();
+    for (block_output, _, _, _) in blocks {
+        for write in &block_output.storage_writes {
+            let key = alloy::primitives::B256::from(write.key);
+            if let Some(&pos) = seen_keys.get(&key) {
+                combined_writes[pos] = write.clone();
+            } else {
+                seen_keys.insert(key, combined_writes.len());
+                combined_writes.push(write.clone());
+            }
+        }
+    }
+
+    if combined_writes.is_empty() {
+        return Ok(None);
+    }
+
+    let (mut tree_start, mut tree_end) = match (batch_tree_start, batch_tree_end) {
+        (Some(s), Some(e)) => (s, e),
+        _ => {
+            tracing::warn!("batch tree views not available, falling back to None tree_update");
+            return Ok(None);
+        }
+    };
+
+    let leaf_count = tree_start.root_info()?.1;
+
+    Ok(Some(
+        crate::prover_input_generator::zisk_input_builder::build_tree_update(
+            &mut tree_start,
+            &mut tree_end,
+            &combined_writes,
+            leaf_count,
+        ),
+    ))
 }

@@ -368,12 +368,14 @@ pub async fn execute_block_in_vm<V: ViewState>(
     let unique_reads_count = output_with_reads.read_keys().len();
     let output = output_with_reads.inner_mut();
 
+
     // Since we've overridden the state, we need to insert any forced preimages into the output as well.
     // Note: the fact that we're doing it here, would also affect the block output hash,
     // so we'll be able to check consistency upon re-execution.
     output
         .published_preimages
         .extend(command.force_preimages.iter().map(|(k, v)| (*k, v.clone())));
+
 
     // Remove failed transactions from output.tx_results.
     // Note: Rejected transactions don't affect the VM state or output,

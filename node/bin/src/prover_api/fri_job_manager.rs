@@ -20,6 +20,7 @@ use crate::prover_api::prover_job_map::ProverJobMap;
 use alloy::primitives::Bytes;
 use jsonrpsee::core::Serialize;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -75,7 +76,13 @@ pub struct JobState {
     pub current_attempt: usize,
 }
 
-#[derive(Debug)]
+// Manual Debug impl because ProofStorage and other fields don't derive Debug.
+impl std::fmt::Debug for FriJobManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FriJobManager").finish_non_exhaustive()
+    }
+}
+
 pub struct FriJobManager {
     // == state ==
     jobs: ProverJobMap<ProverInput>,
@@ -83,6 +90,8 @@ pub struct FriJobManager {
     batches_with_proof_sender: mpsc::Sender<SignedBatchEnvelope<FriProof>>,
     // == storage ==
     proof_storage: ProofStorage,
+    /// External cache for ZiSK batch data (optional, set when second_proof_system is enabled).
+    zisk_data_cache: Option<Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>>,
 }
 
 impl FriJobManager {
@@ -101,12 +110,24 @@ impl FriJobManager {
             jobs,
             batches_with_proof_sender,
             proof_storage,
+            zisk_data_cache: None,
         }
+    }
+
+    /// Set the ZiSK data cache (call before adding jobs when second_proof_system is enabled).
+    pub fn set_zisk_data_cache(&mut self, cache: Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>) {
+        self.zisk_data_cache = Some(cache);
     }
 
     /// Adds a pending job to the queue.
     /// Awaits if the queue is full (ProverJobMap.max_assigned_batch_range).
+    /// If the ProverInput carries ZiSK data and a cache is configured, stores it.
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<ProverInput>) {
+        if let (Some(cache), Some(zisk_bytes)) = (&self.zisk_data_cache, batch_envelope.data.zisk_data()) {
+            let batch_number = batch_envelope.batch_number();
+            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "caching ZiSK data for multi-proof");
+            cache.insert(batch_number, zisk_bytes.to_vec()).await;
+        }
         self.jobs.add_job(batch_envelope).await
     }
 
@@ -244,6 +265,14 @@ impl FriJobManager {
                     batch_metadata.previous_stored_batch_info.state_commitment,
                     batch_metadata.batch_info.clone().into_stored(),
                     program_proof,
+                )
+            }
+            ProvingVersion::ZiskV1 => {
+                use crate::prover_api::zisk_proof_verifier;
+                zisk_proof_verifier::verify_zisk_proof(
+                    batch_metadata.previous_stored_batch_info.state_commitment,
+                    batch_metadata.batch_info.clone().into_stored(),
+                    proof_bytes,
                 )
             }
         };
