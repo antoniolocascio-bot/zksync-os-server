@@ -11,6 +11,14 @@ use zksync_os_types::{BlockOutput, ProvingVersion, PubdataMode, SystemTxType, Zk
 
 /// Takes a vector of blocks and produces a batch envelope.
 #[allow(clippy::too_many_arguments)]
+/// Chain-config parameters committed into the ZiSK batch public input
+/// (`chain_config_hash` preimage, together with the chain id).
+#[derive(Clone, Copy, Debug)]
+pub struct ZiskChainConfig {
+    pub fri_proof_verification_enabled: bool,
+    pub max_tx_gas_limit: u64,
+}
+
 pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     blocks: &[(
         BlockOutput,
@@ -25,6 +33,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     pubdata_mode: PubdataMode,
     sl_chain_id: u64,
     read_state: &ReadState,
+    zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<BatchForSigning<ProverInput>> {
@@ -106,6 +115,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         sl_chain_id,
         &batch_info,
         &blob_sidecar,
+        zisk_chain_config,
         batch_tree_start,
         batch_tree_end,
         account_preimages_after,
@@ -187,6 +197,7 @@ fn compute_batch_prover_input(
     sl_chain_id: u64,
     batch_info: &PendingBatchInfo,
     blob_sidecar: &Option<BlobTransactionSidecar>,
+    zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
@@ -239,6 +250,7 @@ fn compute_batch_prover_input(
             sl_chain_id,
             batch_info,
             blob_sidecar,
+            zisk_chain_config,
             batch_tree_start,
             batch_tree_end,
             account_preimages_after,
@@ -264,6 +276,7 @@ fn assemble_zisk_batch(
     sl_chain_id: u64,
     batch_info: &PendingBatchInfo,
     blob_sidecar: &Option<BlobTransactionSidecar>,
+    zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
@@ -367,12 +380,8 @@ fn assemble_zisk_batch(
                 .unwrap_or_default(),
             tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
             account_preimages_after,
-            // ChainConfig params feeding the chain_config_hash of the public
-            // input. Current chains run with FRI verification disabled and the
-            // default 2^24 gas cap; wire from chain config once the server
-            // tracks it.
-            fri_proof_verification_enabled: false,
-            max_tx_gas_limit: 1 << 24,
+            fri_proof_verification_enabled: zisk_chain_config.fri_proof_verification_enabled,
+            max_tx_gas_limit: zisk_chain_config.max_tx_gas_limit,
         },
         blocks: block_data_vec
             .iter()

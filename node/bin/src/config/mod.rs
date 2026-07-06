@@ -747,6 +747,19 @@ pub struct GenesisConfig {
     /// Path to the file with genesis input.
     #[config_validate(required_if = NodeRole::MainNode)]
     pub genesis_input_path: Option<PathBuf>,
+
+    /// ZKsync OS chain-config parameter committed into the batch public input:
+    /// whether Gateway FRI-proof verification is enabled for this chain. Must
+    /// match the value the native STF runs with, or the two proof systems'
+    /// public inputs diverge.
+    #[config(default_t = false)]
+    pub fri_proof_verification_enabled: bool,
+
+    /// ZKsync OS chain-config parameter committed into the batch public input:
+    /// the per-transaction gas cap. Must match the value the native STF runs
+    /// with, or the two proof systems' public inputs diverge.
+    #[config(default_t = 1 << 24)]
+    pub max_tx_gas_limit: u64,
 }
 
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
@@ -2581,6 +2594,8 @@ mod tests {
                 bytecode_supplier_address: Some(Address::with_last_byte(0x01)),
                 chain_id: Some(270),
                 genesis_input_path: Some("genesis.json".into()),
+                fri_proof_verification_enabled: false,
+                max_tx_gas_limit: 1 << 24,
             },
             rpc_config: RpcConfig::default(),
             mempool_config: MempoolConfig::default(),

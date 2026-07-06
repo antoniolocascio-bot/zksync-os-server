@@ -1374,6 +1374,12 @@ async fn run_main_node_pipeline(
             committed_batch_provider: committed_batch_provider.clone(),
             read_state: state.clone(),
             merkle_tree: tree,
+            zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig {
+                fri_proof_verification_enabled: config
+                    .genesis_config
+                    .fri_proof_verification_enabled,
+                max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+            },
         })
         .pipe(BatchVerificationPipelineStep::new(
             config.batch_verification_config.clone().into(),
@@ -1563,6 +1569,12 @@ async fn run_en_pipeline(
                 committed_batch_provider: committed_batch_provider.clone(),
                 read_state: state.clone(),
                 merkle_tree: tree,
+                zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig {
+                    fri_proof_verification_enabled: config
+                        .genesis_config
+                        .fri_proof_verification_enabled,
+                    max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+                },
             })
             .pipe(NoOpSink::new());
         let components = pipeline.components();

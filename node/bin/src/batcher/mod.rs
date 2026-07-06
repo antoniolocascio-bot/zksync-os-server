@@ -54,6 +54,8 @@ pub struct Batcher<ReadState> {
     pub read_state: ReadState,
     /// Merkle tree handle for batch-boundary tree views (ZiSK batch tree update).
     pub merkle_tree: MerkleTree<RocksDBWrapper>,
+    /// Chain-config parameters committed into the ZiSK batch public input.
+    pub zisk_chain_config: batch_builder::ZiskChainConfig,
 }
 
 #[async_trait]
@@ -346,6 +348,7 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 .adapt_for_protocol_version(protocol_version),
             self.sl_chain_id,
             &self.read_state,
+            self.zisk_chain_config,
             batch_tree_start,
             batch_tree_end,
         )?;
@@ -431,6 +434,7 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             self.pubdata_mode,
             self.sl_chain_id,
             &self.read_state,
+            self.zisk_chain_config,
             batch_tree_start,
             batch_tree_end,
         )?;
