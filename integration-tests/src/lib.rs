@@ -7,7 +7,7 @@ use crate::test_config::{
     TEST_PROVIDER_POLL_INTERVAL, build_node_config, disable_prover_input_generation,
 };
 use alloy::network::EthereumWallet;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::utils::Eip1559Estimator;
 use alloy::providers::{
     DynProvider, Identity, PendingTransactionBuilder, Provider, ProviderBuilder, WalletProvider,
@@ -457,6 +457,24 @@ impl Tester {
         Ok(response.json::<StatusResponse>().await?)
     }
 
+    /// Drive an L1→L2 ETH deposit (priority transaction) for `beneficiary`
+    /// and return the canonical L2 transaction hash once the L1 side has
+    /// landed. Callers wait for the L2 receipt themselves.
+    pub async fn deposit_l1_to_l2(
+        &self,
+        beneficiary: Address,
+        amount: U256,
+    ) -> anyhow::Result<B256> {
+        deposit_l1_to_l2(
+            &self.l1,
+            &self.l2_provider,
+            &self.l2_zk_provider,
+            beneficiary,
+            amount,
+        )
+        .await
+    }
+
     pub async fn wait_for_initial_deposit(&self) -> anyhow::Result<()> {
         tokio::time::timeout(
             Duration::from_secs(60),
@@ -900,25 +918,22 @@ async fn shutdown_runtime(runtime: Runtime) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ensure_test_wallet_funded(
+/// Drive an L1→L2 ETH deposit (priority transaction) for `beneficiary` and
+/// return the canonical L2 transaction hash once the L1 side has landed.
+/// Callers wait for the L2 receipt themselves.
+pub async fn deposit_l1_to_l2(
     l1: &AnvilL1,
     l2_provider: &NodeProvider,
     l2_zk_provider: &DynProvider<Zksync>,
-    l2_wallet: &EthereumWallet,
-) -> anyhow::Result<()> {
-    let beneficiary = l2_wallet.default_signer().address();
-    let balance = l2_provider.get_balance(beneficiary).await?;
-    if balance > U256::ZERO {
-        return Ok(());
-    }
-
+    beneficiary: Address,
+    amount: U256,
+) -> anyhow::Result<B256> {
     let chain_id = l2_provider.get_chain_id().await?;
     let bridgehub = Bridgehub::new(
         l2_zk_provider.get_bridgehub_contract().await?,
         l1.provider.clone(),
         chain_id,
     );
-    let amount = U256::from(1_000_000_000_000_000_000u128) * U256::from(1_000u64);
     let max_priority_fee_per_gas = l1.provider.get_max_priority_fee_per_gas().await?;
     let base_l1_fees = l1
         .provider
@@ -973,8 +988,24 @@ async fn ensure_test_wallet_funded(
         .iter()
         .filter_map(|log| log.log_decode::<NewPriorityRequest>().ok())
         .next()
-        .expect("no L1->L2 logs produced by funding tx");
-    let l2_tx_hash = l1_to_l2_tx_log.inner.txHash;
+        .expect("no L1->L2 logs produced by deposit tx");
+    Ok(l1_to_l2_tx_log.inner.txHash)
+}
+
+async fn ensure_test_wallet_funded(
+    l1: &AnvilL1,
+    l2_provider: &NodeProvider,
+    l2_zk_provider: &DynProvider<Zksync>,
+    l2_wallet: &EthereumWallet,
+) -> anyhow::Result<()> {
+    let beneficiary = l2_wallet.default_signer().address();
+    let balance = l2_provider.get_balance(beneficiary).await?;
+    if balance > U256::ZERO {
+        return Ok(());
+    }
+
+    let amount = U256::from(1_000_000_000_000_000_000u128) * U256::from(1_000u64);
+    let l2_tx_hash = deposit_l1_to_l2(l1, l2_provider, l2_zk_provider, beneficiary, amount).await?;
 
     PendingTransactionBuilder::new(l2_zk_provider.root().clone(), l2_tx_hash)
         .get_receipt()

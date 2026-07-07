@@ -216,7 +216,47 @@ async fn zisk_pipeline_e2e_impl(case: TestCase) -> anyhow::Result<()> {
         );
     }
 
-    // 3. Batch 1 contains the genesis upgrade block and its mass
+    // 3. L1→L2 deposit: a priority transaction reaches the guest via the
+    //    TxAuth::L1 wire path (mint, bootloader result log, priority-ops
+    //    hash). Cross-check its re-execution the same way.
+    let deposit_l2_hash = tester
+        .deposit_l1_to_l2(recipient, U256::from(1_000u64))
+        .await?;
+    let deposit_receipt = alloy::providers::PendingTransactionBuilder::new(
+        tester.l2_zk_provider.root().clone(),
+        deposit_l2_hash,
+    )
+    .expect_successful_receipt()
+    .await?;
+    let block_number = deposit_receipt
+        .block_number
+        .expect("deposit receipt has block number");
+    let (batch_number, output, _) =
+        wait_input_containing_block(&prover_api_url, 8, block_number).await?;
+    let block_result = output
+        .block_results
+        .iter()
+        .find(|br| br.block_number == block_number)
+        .expect("scan matched this block");
+    let tx_index = deposit_receipt
+        .transaction_index
+        .expect("deposit receipt has tx index") as usize;
+    let tx_result = &block_result.tx_results[tx_index];
+    assert!(
+        tx_result.success,
+        "deposit must succeed in ZiSK re-execution"
+    );
+    assert_eq!(
+        tx_result.gas_used, deposit_receipt.gas_used,
+        "gas mismatch for deposit {deposit_l2_hash} in block {block_number}"
+    );
+    tracing::info!(
+        batch_number,
+        block_number,
+        "ZiSK executor reproduced the deposit's batch"
+    );
+
+    // 4. Batch 1 contains the genesis upgrade block and its mass
     //    force-deployments (the upgrade-batch fidelity case: every
     //    force-deployed account's code-derived property fields are recomputed
     //    and asserted by the executor).
