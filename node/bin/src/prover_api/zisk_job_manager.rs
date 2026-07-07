@@ -226,29 +226,37 @@ impl ZiskJobManager {
             "combined Airbender + ZiSK multi-proof ready"
         );
 
-        // Compose MultiProof and send downstream.
+        // Compose MultiProof and send downstream. The prover input is not part
+        // of the ProofCommand — keep it so the job can be requeued intact if
+        // the send fails.
+        let ZiskJobData {
+            zisk_data,
+            era_proof,
+            proving_execution_version,
+            batches,
+        } = job_data;
         let snark_proof = SnarkProof::MultiProof(MultiProofSnarkProof {
-            era_proof: job_data.era_proof,
+            era_proof,
             zisk_proof: proof,
             zisk_public_values: public_values,
-            proving_execution_version: job_data.proving_execution_version,
+            proving_execution_version,
         });
 
-        let batches = job_data
-            .batches
+        let batches = batches
             .into_iter()
             .map(|b: SignedBatchEnvelope<FriProof>| b.with_stage(BatchExecutionStage::SnarkProvedReal))
             .collect();
 
         let proof_command = ProofCommand::new(batches, snark_proof);
         if let Err(err) = self.prove_sender.send(proof_command).await {
-            // Downstream closed — recover the job data from the failed ProofCommand.
-            // The ProofCommand owns the data; extract and return to pending.
+            // Downstream closed — recover the job data from the failed ProofCommand
+            // and requeue a pickable job (the completed SNARK is dropped; a redelivery
+            // path for it would outlive the process, which is shutting down anyway).
             let failed_command = err.0;
             let (batches_back, snark_back) = failed_command.into_parts();
             if let SnarkProof::MultiProof(mp) = snark_back {
                 let recovered = ZiskJobData {
-                    zisk_data: vec![], // original data already consumed, but proof is intact
+                    zisk_data,
                     era_proof: mp.era_proof,
                     proving_execution_version: mp.proving_execution_version,
                     batches: batches_back,
@@ -269,5 +277,80 @@ impl ZiskJobManager {
     pub async fn has_pending_jobs(&self) -> bool {
         let state = self.state.lock().await;
         !state.pending.is_empty() || !state.assigned.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prover_api::test_util::create_test_batch_envelope;
+    use alloy::primitives::keccak256;
+    use tokio::sync::mpsc;
+
+    fn job_data(batch_number: u64, zisk_data: Vec<u8>) -> ZiskJobData {
+        let mut envelope = create_test_batch_envelope(batch_number, FriProof::Fake);
+        // The fixture's legacy genesis version has no batch-commitment
+        // encoding; submit_proof calls into_stored, which needs a current one.
+        envelope.batch.batch_info.protocol_version =
+            zksync_os_types::ProtocolSemanticVersion::new(0, 31, 0);
+        ZiskJobData {
+            zisk_data,
+            era_proof: vec![0xEE; 16],
+            proving_execution_version: 1,
+            batches: vec![envelope],
+        }
+    }
+
+    /// Public values whose commitment word matches the job's batch metadata,
+    /// so `submit_proof` gets past commitment verification.
+    fn matching_public_values(data: &ZiskJobData) -> Vec<u8> {
+        let first = data.batches.first().expect("job data has a batch");
+        let stored = first.batch.batch_info.clone().into_stored();
+        let prev = &first.batch.previous_stored_batch_info;
+        let mut preimage = Vec::with_capacity(96);
+        preimage.extend_from_slice(prev.state_commitment.as_slice());
+        preimage.extend_from_slice(stored.state_commitment.as_slice());
+        preimage.extend_from_slice(stored.commitment.as_slice());
+        let commitment = keccak256(&preimage);
+        let mut public_values = vec![0u8; ZISK_PUBLIC_VALUES_BYTES];
+        public_values[32..64].copy_from_slice(commitment.as_slice());
+        public_values
+    }
+
+    /// A job requeued after a downstream send failure must keep its prover
+    /// input: a later pick must not hand an empty `zisk_data` to a prover.
+    #[tokio::test]
+    async fn requeue_on_downstream_closed_keeps_prover_input() {
+        let (prove_sender, prove_receiver) = mpsc::channel(1);
+        drop(prove_receiver);
+        let manager = ZiskJobManager::new(prove_sender, Duration::from_secs(60));
+
+        let zisk_data = vec![0xAB; 32];
+        let data = job_data(7, zisk_data.clone());
+        let public_values = matching_public_values(&data);
+        manager
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add_job rejected"));
+
+        let picked = manager.pick_next_job("prover-1").await.expect("job available");
+        assert_eq!(picked.batch_number, 7);
+        assert_eq!(picked.zisk_data, zisk_data);
+
+        let err = manager
+            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "prover-1")
+            .await
+            .expect_err("downstream is closed");
+        assert!(matches!(err, ZiskSubmitError::DownstreamClosed));
+
+        let repicked = manager
+            .pick_next_job("prover-2")
+            .await
+            .expect("requeued job available");
+        assert_eq!(repicked.batch_number, 7);
+        assert_eq!(
+            repicked.zisk_data, zisk_data,
+            "requeued job must carry the original prover input"
+        );
     }
 }

@@ -118,8 +118,35 @@ pub struct ProofStorageMetrics {
     pub disk_usage: Family<ProofStorageMethod, Gauge<u64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[metrics(rename_all = "snake_case", label = "reason")]
+pub enum ZiskCacheEvictionReason {
+    /// Entry exceeded `max_age` before the Airbender SNARK arrived.
+    Expired,
+    /// Cache exceeded `max_entries`; the oldest entry was dropped.
+    Overflow,
+}
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "zisk_data_cache")]
+pub struct ZiskDataCacheMetrics {
+    /// Number of batches with ZiSK data awaiting multi-proof composition.
+    pub entries: Gauge<u64>,
+    /// Batch number of the oldest cached entry (0 when empty).
+    pub oldest_batch_number: Gauge<u64>,
+    /// Evicted entries by reason. Every eviction is a batch that can no longer
+    /// multi-prove without a replay.
+    pub evictions: Family<ZiskCacheEvictionReason, vise::Counter>,
+    /// Entries found expired when consumed (the batch missed its multi-proof).
+    pub expired_on_access: vise::Counter,
+}
+
 #[vise::register]
 pub(crate) static PROVER_METRICS: vise::Global<ProverMetrics> = vise::Global::new();
+
+#[vise::register]
+pub(crate) static ZISK_DATA_CACHE_METRICS: vise::Global<ZiskDataCacheMetrics> =
+    vise::Global::new();
 
 #[vise::register]
 pub(crate) static PROVER_API_METRICS: vise::Global<ProverApiMetrics> = vise::Global::new();

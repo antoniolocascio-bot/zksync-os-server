@@ -9,6 +9,7 @@
 //! are retained. This prevents unbounded memory growth when Airbender provers
 //! are slow or offline.
 
+use crate::prover_api::metrics::{ZISK_DATA_CACHE_METRICS, ZiskCacheEvictionReason};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -76,6 +77,7 @@ impl ZiskDataCache {
         if cache.len() > self.max_entries {
             Self::evict(&mut cache, self.max_entries, self.max_age);
         }
+        Self::record_gauges(&cache);
     }
 
     /// Check whether ZiSK data exists for a batch (non-destructive).
@@ -88,14 +90,17 @@ impl ZiskDataCache {
     /// Remove ZiSK data for a batch after successful proof generation.
     pub async fn remove(&self, batch_number: u64) -> Option<Vec<u8>> {
         let mut cache = self.inner.lock().await;
-        match cache.remove(&batch_number) {
+        let removed = match cache.remove(&batch_number) {
             Some(entry) if entry.inserted_at.elapsed() < self.max_age => Some(entry.data),
             Some(_) => {
                 tracing::warn!(batch_number, "ZiSK data expired before consumption");
+                ZISK_DATA_CACHE_METRICS.expired_on_access.inc();
                 None
             }
             None => None,
-        }
+        };
+        Self::record_gauges(&cache);
+        removed
     }
 
     /// Number of entries currently cached (including potentially expired ones).
@@ -117,6 +122,7 @@ impl ZiskDataCache {
         for k in &expired {
             tracing::warn!(batch_number = k, "evicting expired ZiSK data from cache");
             cache.remove(k);
+            ZISK_DATA_CACHE_METRICS.evictions[&ZiskCacheEvictionReason::Expired].inc();
         }
 
         // Remove oldest entries if over capacity
@@ -126,9 +132,47 @@ impl ZiskDataCache {
             {
                 tracing::warn!(batch_number = oldest_key, "evicting ZiSK data (cache full, max_entries={})", max_entries);
                 cache.remove(&oldest_key);
+                ZISK_DATA_CACHE_METRICS.evictions[&ZiskCacheEvictionReason::Overflow].inc();
             } else {
                 break;
             }
         }
+    }
+
+    /// Refresh the size/age gauges after a mutation, under the cache lock.
+    fn record_gauges(cache: &HashMap<u64, CacheEntry>) {
+        ZISK_DATA_CACHE_METRICS.entries.set(cache.len() as u64);
+        let oldest = cache
+            .iter()
+            .min_by_key(|(_, e)| e.inserted_at)
+            .map(|(&k, _)| k)
+            .unwrap_or(0);
+        ZISK_DATA_CACHE_METRICS.oldest_batch_number.set(oldest);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Overflow evicts the oldest entry; expired entries are dropped on
+    /// consumption. (Metric counters are process-global; behavior is what
+    /// unit tests can assert.)
+    #[tokio::test]
+    async fn overflow_evicts_oldest_and_expiry_drops_on_access() {
+        let cache = ZiskDataCache::with_limits(2, Duration::from_secs(3600));
+        cache.insert(1, vec![1]).await;
+        cache.insert(2, vec![2]).await;
+        cache.insert(3, vec![3]).await;
+
+        assert_eq!(cache.len().await, 2);
+        assert!(!cache.contains(1).await, "oldest entry must be evicted");
+        assert_eq!(cache.remove(2).await, Some(vec![2]));
+        assert_eq!(cache.remove(3).await, Some(vec![3]));
+
+        let expiring = ZiskDataCache::with_limits(2, Duration::ZERO);
+        expiring.insert(4, vec![4]).await;
+        assert!(!expiring.contains(4).await);
+        assert_eq!(expiring.remove(4).await, None, "expired data must not be served");
     }
 }
