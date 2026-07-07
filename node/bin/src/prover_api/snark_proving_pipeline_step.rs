@@ -33,7 +33,7 @@ impl SnarkProvingPipelineStep {
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
     ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
-        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None, false, None)
+        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None, false, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -45,6 +45,7 @@ impl SnarkProvingPipelineStep {
         zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
         require_multi_proof: bool,
         multi_proof_wait_timeout: Option<Duration>,
+        zisk_program_vk: Option<alloy::primitives::B256>,
     ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
@@ -56,11 +57,26 @@ impl SnarkProvingPipelineStep {
         );
 
         let zisk_job_manager = if let Some(cache) = zisk_data_cache {
-            sjm.set_zisk_data_cache(cache);
+            sjm.set_zisk_data_cache(cache.clone());
             let zjm = Arc::new(super::zisk_job_manager::ZiskJobManager::new(
                 proof_commands_sender,
                 assignment_timeout,
+                zisk_program_vk,
             ));
+
+            // Periodic gauge refresh: queue/cache ages must advance while the
+            // lane is idle — a stalled pipeline is exactly what they alert on.
+            {
+                let zjm = zjm.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(15));
+                    loop {
+                        tick.tick().await;
+                        zjm.refresh_gauges().await;
+                        cache.refresh_gauges().await;
+                    }
+                });
+            }
             sjm.set_zisk_job_manager(zjm.clone());
             if require_multi_proof {
                 sjm.set_require_multi_proof(true);

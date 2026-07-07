@@ -289,6 +289,7 @@ impl SnarkJobManager {
                         era_proof: payload,
                         proving_execution_version: proving_version as u32,
                         batches: consumed_batches_proven,
+                        added_at: std::time::Instant::now(),
                     },
                 )
                 .await

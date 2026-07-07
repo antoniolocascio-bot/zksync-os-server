@@ -1578,6 +1578,13 @@ pub struct ProverApiConfig {
     /// when the batch entered SNARK proving.
     pub multi_proof_wait_timeout: Option<Duration>,
 
+    /// Expected ZiSK program VK: the first 32 bytes of a ZiSK proof's public
+    /// values, fixed by the guest build (record it from the reproducible
+    /// build output). When set, a submission with a different VK is rejected
+    /// and counted (`zisk_lane_vk_drift`) — the prover is running a different
+    /// guest build. Unset: the reported VK is only logged on each submit.
+    pub zisk_program_vk: Option<B256>,
+
     /// Default: store files in ./db/fri_proofs/ with 1GiB disk usage cap
     #[config(nest, default)]
     pub proof_storage: ProofStorageConfig,

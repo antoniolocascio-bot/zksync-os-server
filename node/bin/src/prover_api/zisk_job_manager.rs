@@ -12,6 +12,7 @@
 //! 2. The Airbender SNARK has been submitted (the batch is ready for proving on L1)
 
 use crate::prover_api::metrics::ZISK_LANE_METRICS;
+use alloy::primitives::B256;
 use crate::prover_api::zisk_proof_constants::{ZISK_PUBLIC_VALUES_BYTES, ZISK_SNARK_PROOF_BYTES};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -37,6 +38,9 @@ pub struct ZiskJobData {
     pub proving_execution_version: u32,
     /// Batch envelopes for downstream pipeline.
     pub batches: Vec<SignedBatchEnvelope<FriProof>>,
+    /// When the job was created (Airbender SNARK arrival). Preserved across
+    /// requeues so `zisk_lane_time_to_submit` measures total wall-clock lag.
+    pub added_at: std::time::Instant,
 }
 
 /// Job metadata returned to the prover on pick.
@@ -57,6 +61,8 @@ pub enum ZiskSubmitError {
     InvalidPublicValuesSize { got: usize, expected: usize },
     #[error("batch commitment mismatch: ZiSK public values first 32 bytes do not match batch commitment")]
     CommitmentMismatch,
+    #[error("program VK mismatch: prover reported {reported}, server expects {expected}")]
+    VkDrift { reported: B256, expected: B256 },
     #[error("downstream channel closed")]
     DownstreamClosed,
 }
@@ -78,12 +84,18 @@ pub struct ZiskJobManager {
     /// task listening on this channel (a mismatch means one proof system is
     /// wrong — a security event). Unset: log + count + retry.
     halt_on_mismatch: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
+    /// Expected ZiSK program VK (first 32 bytes of the proof's public
+    /// values). When set, a submission with a different VK is rejected and
+    /// counted (`zisk_lane_vk_drift`) — the prover runs a different guest
+    /// build. Unset: the reported VK is only logged.
+    expected_program_vk: Option<B256>,
 }
 
 impl ZiskJobManager {
     pub fn new(
         prove_sender: Sender<ProofCommand>,
         assignment_timeout: Duration,
+        expected_program_vk: Option<B256>,
     ) -> Self {
         Self {
             state: Mutex::new(ZiskJobState {
@@ -93,7 +105,29 @@ impl ZiskJobManager {
             assignment_timeout,
             prove_sender,
             halt_on_mismatch: std::sync::Mutex::new(None),
+            expected_program_vk,
         }
+    }
+
+    /// Refresh the queue-depth/age gauges. Called under the state lock after
+    /// every mutation, and periodically so ages advance while idle.
+    fn record_queue_gauges(state: &ZiskJobState) {
+        ZISK_LANE_METRICS.jobs_pending.set(state.pending.len() as u64);
+        ZISK_LANE_METRICS.jobs_assigned.set(state.assigned.len() as u64);
+        let oldest_age = state
+            .pending
+            .values()
+            .map(|d| d.added_at)
+            .chain(state.assigned.values().map(|(_, _, d)| d.added_at))
+            .min()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        ZISK_LANE_METRICS.oldest_job_age_seconds.set(oldest_age);
+    }
+
+    /// Refresh the gauges without mutating the queue (periodic liveness).
+    pub async fn refresh_gauges(&self) {
+        Self::record_queue_gauges(&*self.state.lock().await);
     }
 
     /// Arm halt-on-mismatch: a commitment mismatch will fire this sender,
@@ -132,6 +166,7 @@ impl ZiskJobManager {
             "ZiSK job added"
         );
         state.pending.insert(batch_number, job_data);
+        Self::record_queue_gauges(&state);
         Ok(())
     }
 
@@ -169,6 +204,7 @@ impl ZiskJobManager {
 
         let zisk_data = job_data.zisk_data.clone();
         state.assigned.insert(batch_number, (prover_id.to_string(), now, job_data));
+        Self::record_queue_gauges(&state);
 
         tracing::info!(
             batch = batch_number,
@@ -209,13 +245,39 @@ impl ZiskJobManager {
             });
         }
 
+        // Program VK tripwire (4.4): the first 32 bytes of the public values
+        // are the ZiSK program VK. Drift means the prover runs a different
+        // guest build — reject before touching the job, so it stays assigned
+        // and times out back to pending for another prover.
+        let reported_vk = B256::from_slice(&public_values[..32]);
+        if let Some(expected) = self.expected_program_vk {
+            if reported_vk != expected {
+                ZISK_LANE_METRICS.vk_drift.inc();
+                tracing::error!(
+                    batch = batch_number,
+                    prover_id,
+                    %reported_vk,
+                    %expected,
+                    "ZiSK program VK drift — prover is running a different guest build"
+                );
+                return Err(ZiskSubmitError::VkDrift {
+                    reported: reported_vk,
+                    expected,
+                });
+            }
+        } else {
+            tracing::info!(batch = batch_number, %reported_vk, "ZiSK program VK reported (no expected VK configured)");
+        }
+
         // Remove from assigned jobs.
         let job_data = {
             let mut state = self.state.lock().await;
-            match state.assigned.remove(&batch_number) {
+            let data = match state.assigned.remove(&batch_number) {
                 Some((_, _, data)) => data,
                 None => return Err(ZiskSubmitError::UnknownJob(batch_number)),
-            }
+            };
+            Self::record_queue_gauges(&state);
+            data
         };
 
         // Validate batch commitment using the shared verifier.
@@ -242,7 +304,9 @@ impl ZiskJobManager {
                 } else {
                     // Continue mode: requeue so a faulty prover can be retried
                     // (a deterministic divergence keeps paging via the metric).
-                    self.state.lock().await.pending.insert(batch_number, job_data);
+                    let mut state = self.state.lock().await;
+                    state.pending.insert(batch_number, job_data);
+                    Self::record_queue_gauges(&state);
                 }
                 return Err(ZiskSubmitError::CommitmentMismatch);
             }
@@ -264,6 +328,7 @@ impl ZiskJobManager {
             era_proof,
             proving_execution_version,
             batches,
+            added_at,
         } = job_data;
         let snark_proof = SnarkProof::MultiProof(MultiProofSnarkProof {
             era_proof,
@@ -290,16 +355,20 @@ impl ZiskJobManager {
                     era_proof: mp.era_proof,
                     proving_execution_version: mp.proving_execution_version,
                     batches: batches_back,
+                    added_at,
                 };
                 tracing::error!(
                     batch = batch_number,
                     "downstream channel closed, returning ZiSK job to pending queue"
                 );
-                self.state.lock().await.pending.insert(batch_number, recovered);
+                let mut state = self.state.lock().await;
+                state.pending.insert(batch_number, recovered);
+                Self::record_queue_gauges(&state);
             }
             return Err(ZiskSubmitError::DownstreamClosed);
         }
 
+        ZISK_LANE_METRICS.time_to_submit.observe(added_at.elapsed());
         Ok(())
     }
 
@@ -328,6 +397,7 @@ mod tests {
             era_proof: vec![0xEE; 16],
             proving_execution_version: 1,
             batches: vec![envelope],
+            added_at: std::time::Instant::now(),
         }
     }
 
@@ -353,7 +423,7 @@ mod tests {
     async fn requeue_on_downstream_closed_keeps_prover_input() {
         let (prove_sender, prove_receiver) = mpsc::channel(1);
         drop(prove_receiver);
-        let manager = ZiskJobManager::new(prove_sender, Duration::from_secs(60));
+        let manager = ZiskJobManager::new(prove_sender, Duration::from_secs(60), None);
 
         let zisk_data = vec![0xAB; 32];
         let data = job_data(7, zisk_data.clone());
@@ -390,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn commitment_mismatch_fires_halt_when_armed() {
         let (prove_sender, _prove_receiver) = mpsc::channel(1);
-        let manager = ZiskJobManager::new(prove_sender, Duration::from_secs(60));
+        let manager = ZiskJobManager::new(prove_sender, Duration::from_secs(60), None);
         let (halt_tx, halt_rx) = tokio::sync::oneshot::channel();
         manager.set_halt_on_mismatch(halt_tx);
 
@@ -418,5 +488,46 @@ mod tests {
             !manager.has_pending_jobs().await,
             "halting mode must not requeue the mismatching job"
         );
+    }
+
+    /// With an expected program VK configured, a submission whose public
+    /// values embed a different VK is rejected before the job is touched:
+    /// the job stays assigned, and a corrected submission still succeeds.
+    #[tokio::test]
+    async fn vk_drift_rejects_submit_and_keeps_job_assigned() {
+        let (prove_sender, mut prove_receiver) = mpsc::channel(1);
+        let expected_vk = B256::repeat_byte(0x42);
+        let manager =
+            ZiskJobManager::new(prove_sender, Duration::from_secs(60), Some(expected_vk));
+
+        let data = job_data(7, vec![0xAB; 32]);
+        let mut public_values = matching_public_values(&data);
+        manager
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add_job rejected"));
+        manager.pick_next_job("prover-1").await.expect("job available");
+
+        // Wrong program VK in bytes 0..32 -> drift rejection.
+        public_values[..32].copy_from_slice(B256::repeat_byte(0x13).as_slice());
+        let err = manager
+            .submit_proof(
+                7,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                public_values.clone(),
+                "prover-1",
+            )
+            .await
+            .expect_err("VK drift must be rejected");
+        assert!(matches!(err, ZiskSubmitError::VkDrift { .. }));
+
+        // The job was not consumed or requeued: a submission with the
+        // expected VK from the same assignment goes through.
+        public_values[..32].copy_from_slice(expected_vk.as_slice());
+        manager
+            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "prover-1")
+            .await
+            .expect("corrected submission succeeds");
+        assert!(prove_receiver.try_recv().is_ok(), "multi-proof sent downstream");
     }
 }

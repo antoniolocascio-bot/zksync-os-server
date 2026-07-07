@@ -1285,6 +1285,7 @@ async fn run_main_node_pipeline(
             zisk_data_cache,
             config.prover_input_generator_config.multi_proof_verifier,
             config.prover_api_config.multi_proof_wait_timeout,
+            config.prover_api_config.zisk_program_vk,
         )
     } else {
         SnarkProvingPipelineStep::new(

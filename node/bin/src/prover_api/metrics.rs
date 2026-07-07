@@ -134,6 +134,9 @@ pub struct ZiskDataCacheMetrics {
     pub entries: Gauge<u64>,
     /// Batch number of the oldest cached entry (0 when empty).
     pub oldest_batch_number: Gauge<u64>,
+    /// Age of the oldest cached entry in seconds (0 when empty). An entry
+    /// nearing `max_age` is a batch about to lose its multi-proof.
+    pub oldest_entry_age_seconds: Gauge<u64>,
     /// Evicted entries by reason. Every eviction is a batch that can no longer
     /// multi-prove without a replay.
     pub evictions: Family<ZiskCacheEvictionReason, vise::Counter>,
@@ -156,6 +159,20 @@ pub struct ZiskLaneMetrics {
     /// Batches submitted Airbender-only although multi-proof was required —
     /// only possible after `multi_proof_wait_timeout` elapsed.
     pub degraded_to_single_proof: vise::Counter,
+    /// A ZiSK prover submitted a proof whose embedded program VK differs
+    /// from the server's expected one — the prover is running a different
+    /// guest build. Fires only when `zisk_program_vk` is configured.
+    pub vk_drift: vise::Counter,
+    /// ZiSK jobs waiting to be picked by a prover.
+    pub jobs_pending: Gauge<u64>,
+    /// ZiSK jobs assigned to provers, awaiting proof submission.
+    pub jobs_assigned: Gauge<u64>,
+    /// Age of the oldest ZiSK job (pending or assigned) in seconds.
+    pub oldest_job_age_seconds: Gauge<u64>,
+    /// Time from ZiSK job creation (Airbender SNARK arrival) to an accepted
+    /// ZiSK proof submission.
+    #[metrics(unit = Unit::Seconds, buckets = Buckets::LATENCIES)]
+    pub time_to_submit: Histogram<Duration>,
 }
 
 #[vise::register]

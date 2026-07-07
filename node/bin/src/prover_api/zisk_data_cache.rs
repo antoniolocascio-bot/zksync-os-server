@@ -142,12 +142,20 @@ impl ZiskDataCache {
     /// Refresh the size/age gauges after a mutation, under the cache lock.
     fn record_gauges(cache: &HashMap<u64, CacheEntry>) {
         ZISK_DATA_CACHE_METRICS.entries.set(cache.len() as u64);
-        let oldest = cache
-            .iter()
-            .min_by_key(|(_, e)| e.inserted_at)
-            .map(|(&k, _)| k)
-            .unwrap_or(0);
-        ZISK_DATA_CACHE_METRICS.oldest_batch_number.set(oldest);
+        let oldest = cache.iter().min_by_key(|(_, e)| e.inserted_at);
+        ZISK_DATA_CACHE_METRICS
+            .oldest_batch_number
+            .set(oldest.map(|(&k, _)| k).unwrap_or(0));
+        ZISK_DATA_CACHE_METRICS
+            .oldest_entry_age_seconds
+            .set(oldest.map(|(_, e)| e.inserted_at.elapsed().as_secs()).unwrap_or(0));
+    }
+
+    /// Refresh the gauges without mutating the cache. Ages only advance on
+    /// mutation otherwise — a stalled pipeline would freeze them at their
+    /// last (low) values, hiding exactly the condition worth alerting on.
+    pub async fn refresh_gauges(&self) {
+        Self::record_gauges(&*self.inner.lock().await);
     }
 }
 
