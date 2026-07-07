@@ -144,6 +144,23 @@ pub struct ZiskDataCacheMetrics {
 #[vise::register]
 pub(crate) static PROVER_METRICS: vise::Global<ProverMetrics> = vise::Global::new();
 
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "zisk_lane")]
+pub struct ZiskLaneMetrics {
+    /// ZiSK public values disagreed with the batch commitment — one proof
+    /// system is wrong. The headline divergence alarm: page, don't just log.
+    pub commitment_mismatches: vise::Counter,
+    /// Airbender SNARK submissions rejected (job left in place) because the
+    /// batch's ZiSK proof path was unavailable while multi-proof is required.
+    pub blocked_submits: vise::Counter,
+    /// Batches submitted Airbender-only although multi-proof was required —
+    /// only possible after `multi_proof_wait_timeout` elapsed.
+    pub degraded_to_single_proof: vise::Counter,
+}
+
+#[vise::register]
+pub(crate) static ZISK_LANE_METRICS: vise::Global<ZiskLaneMetrics> = vise::Global::new();
+
 #[vise::register]
 pub(crate) static ZISK_DATA_CACHE_METRICS: vise::Global<ZiskDataCacheMetrics> =
     vise::Global::new();

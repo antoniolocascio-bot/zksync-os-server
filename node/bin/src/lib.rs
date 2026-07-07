@@ -1284,6 +1284,7 @@ async fn run_main_node_pipeline(
             config.prover_api_config.max_assigned_batch_range,
             zisk_data_cache,
             config.prover_input_generator_config.multi_proof_verifier,
+            config.prover_api_config.multi_proof_wait_timeout,
         )
     } else {
         SnarkProvingPipelineStep::new(
@@ -1293,6 +1294,25 @@ async fn run_main_node_pipeline(
             config.prover_api_config.max_assigned_batch_range,
         )
     };
+
+    // Halt-on-mismatch (config, not deploy): a ZiSK commitment mismatch is a
+    // security event — one proof system is wrong. When armed, the mismatch
+    // fires this critical task, which panics to bring the node down (the
+    // same mechanism as the consistency checker's revert-on-divergence).
+    if config
+        .prover_input_generator_config
+        .halt_on_zisk_commitment_mismatch
+        && let Some(ref zjm) = zisk_job_manager
+    {
+        let (halt_tx, halt_rx) = tokio::sync::oneshot::channel::<String>();
+        zjm.set_halt_on_mismatch(halt_tx);
+        runtime.spawn_critical_task("zisk mismatch halt", async move {
+            if let Ok(msg) = halt_rx.await {
+                panic!("halting block production: {msg}");
+            }
+            // Sender dropped without firing (normal shutdown) — exit quietly.
+        });
+    }
 
     let prover_api_port = if config.prover_api_config.enabled {
         let prover_listener = prebound_prover_api_listener

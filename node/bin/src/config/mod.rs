@@ -1513,6 +1513,15 @@ pub struct ProverInputGeneratorConfig {
     #[config(default_t = false)]
     pub multi_proof_verifier: bool,
 
+    /// When true, a ZiSK proof whose public values disagree with the batch
+    /// commitment halts the node (a mismatch means one proof system is wrong
+    /// — a security event). Default: continue — the mismatch is logged and
+    /// counted (`zisk_lane_commitment_mismatches`) and the job is retried, so
+    /// a faulty prover cannot stall the chain. The switch is config, not a
+    /// deploy.
+    #[config(default_t = false)]
+    pub halt_on_zisk_commitment_mismatch: bool,
+
 }
 
 /// Only used on the Main Node.
@@ -1560,6 +1569,14 @@ pub struct ProverApiConfig {
     /// Max number of FRI proofs that will be aggregated to a single SNARK job.
     #[config(default_t = 10)]
     pub max_fris_per_snark: usize,
+
+    /// How long a batch may block on its ZiSK proof path (no input, or the
+    /// ZiSK job queue full) before an Airbender-only submission is accepted
+    /// despite `multi_proof_verifier`. Unset (default): block indefinitely —
+    /// finalization waits for the ZiSK proof or operator intervention; the
+    /// escape hatch is flipping this config, not a deploy. Measured from
+    /// when the batch entered SNARK proving.
+    pub multi_proof_wait_timeout: Option<Duration>,
 
     /// Default: store files in ./db/fri_proofs/ with 1GiB disk usage cap
     #[config(nest, default)]

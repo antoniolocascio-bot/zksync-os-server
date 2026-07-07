@@ -1,5 +1,5 @@
 use crate::prover_api::fri_job_manager::FriJob;
-use crate::prover_api::metrics::{ProverStage, ProverType};
+use crate::prover_api::metrics::{ProverStage, ProverType, ZISK_LANE_METRICS};
 use crate::prover_api::prover_job_map::ProverJobMap;
 use crate::prover_api::zisk_data_cache::ZiskDataCache;
 use crate::prover_api::zisk_job_manager::{ZiskJobData, ZiskJobManager};
@@ -40,6 +40,12 @@ pub struct SnarkJobManager {
     /// When true, refuse to send Airbender-only proofs if ZiSK data was expected.
     /// Prevents silent fallback to single-proof mode when ZiSK provers are offline.
     require_multi_proof: bool,
+    /// How long a batch may block on its ZiSK proof path before an
+    /// Airbender-only submission is allowed despite `require_multi_proof`.
+    /// `None`: block indefinitely (the operator escape hatch is flipping the
+    /// config — no deploy needed). Measured from when the batch entered SNARK
+    /// proving.
+    multi_proof_wait_timeout: Option<Duration>,
 }
 
 impl SnarkJobManager {
@@ -61,7 +67,13 @@ impl SnarkJobManager {
             zisk_data_cache: None,
             zisk_job_manager: None,
             require_multi_proof: false,
+            multi_proof_wait_timeout: None,
         }
+    }
+
+    /// See [`Self::multi_proof_wait_timeout`].
+    pub fn set_multi_proof_wait_timeout(&mut self, timeout: Option<Duration>) {
+        self.multi_proof_wait_timeout = timeout;
     }
 
     /// Set the ZiSK data cache for multi-proof composition.
@@ -150,9 +162,9 @@ impl SnarkJobManager {
         );
 
         // Check ZiSK data availability. For multi-batch ranges we only support
-        // ZiSK proving when the range is exactly one batch. Multi-batch SNARK
-        // proofs combined with ZiSK require chaining tree updates across blocks
-        // which is not yet implemented.
+        // ZiSK proving when the range is exactly one batch (enforced at
+        // startup via `max_fris_per_snark = 1` when the second proof system
+        // is on; the branch below is defensive).
         let has_zisk = if let Some(ref cache) = self.zisk_data_cache {
             if batch_from != batch_to {
                 // Multi-batch range: ZiSK proving not supported, send Airbender-only.
@@ -169,6 +181,63 @@ impl SnarkJobManager {
         } else {
             false
         };
+
+        // Multi-proof policy is decided BEFORE any job is consumed, so a
+        // blocked submission leaves the SNARK job in place: the assignment
+        // times out and the batch is re-offered until its ZiSK path clears
+        // (block-until-proof). After `multi_proof_wait_timeout` (when set),
+        // the batch is allowed through Airbender-only with a loud signal.
+        let multi_proof_expected = self.require_multi_proof && self.zisk_data_cache.is_some();
+        let wait_expired = || async {
+            match self.multi_proof_wait_timeout {
+                None => false,
+                Some(timeout) => self
+                    .jobs
+                    .get_job_age(batch_from)
+                    .await
+                    .is_some_and(|age| age >= timeout),
+            }
+        };
+        if multi_proof_expected && batch_from == batch_to {
+            let blocked_reason = if !has_zisk {
+                Some("no ZiSK input available for the batch (evicted or not regenerated)")
+            } else if let Some(zjm) = self.zisk_job_manager.as_ref()
+                && !zjm.has_capacity().await
+            {
+                Some("ZiSK job queue is full (provers offline or behind)")
+            } else {
+                None
+            };
+            if let Some(reason) = blocked_reason {
+                if wait_expired().await {
+                    ZISK_LANE_METRICS.degraded_to_single_proof.inc();
+                    tracing::error!(
+                        batch = batch_from,
+                        reason,
+                        "multi-proof wait timeout expired — accepting Airbender-only \
+                         submission for a batch that required both proofs"
+                    );
+                    // fall through: consume and send Airbender-only below
+                } else {
+                    ZISK_LANE_METRICS.blocked_submits.inc();
+                    tracing::warn!(
+                        batch = batch_from,
+                        reason,
+                        "multi-proof required — rejecting Airbender-only submission; \
+                         the job stays queued and will be re-offered"
+                    );
+                    anyhow::bail!(
+                        "multi_proof_verifier requires a ZiSK proof for batch {batch_from} \
+                         but {reason}; the Airbender submission is rejected and the job \
+                         will be re-offered (waiting{})",
+                        match self.multi_proof_wait_timeout {
+                            Some(t) => format!(" up to {t:?}"),
+                            None => " indefinitely — flip multi_proof_wait_timeout to cap".into(),
+                        }
+                    );
+                }
+            }
+        }
 
         // Ensure we can send downstream before consuming jobs from the retryable map.
         // On the ZiSK route the permit backs the Airbender-only fallbacks.
@@ -226,7 +295,10 @@ impl SnarkJobManager {
             {
                 Ok(()) => Ok(()),
                 Err(rejected) => {
-                    // Queue was full — fall back to Airbender-only using recovered data
+                    // Queue filled up between the capacity pre-check and here —
+                    // fall back to Airbender-only using the recovered data
+                    // (under require_multi_proof the pre-check above already
+                    // rejected without consuming; this race window is benign).
                     tracing::warn!(
                         batch = batch_from,
                         "ZiSK job queue full, sending Airbender-only proof"
@@ -247,6 +319,8 @@ impl SnarkJobManager {
     }
 
     /// Send an Airbender-only SNARK proof downstream via a reserved permit.
+    /// The multi-proof gate lives in `submit_proof` BEFORE job consumption;
+    /// by the time this runs the submission has already been allowed through.
     fn send_airbender_only(
         &self,
         permit: Permit<'_, ProofCommand>,
@@ -254,13 +328,6 @@ impl SnarkJobManager {
         payload: Vec<u8>,
         proving_version: ProvingVersion,
     ) -> anyhow::Result<()> {
-        if self.require_multi_proof && self.zisk_data_cache.is_some() {
-            let batch_num = batches.first().map(|b| b.batch_number()).unwrap_or(0);
-            anyhow::bail!(
-                "multi_proof_verifier is required but ZiSK proof unavailable for batch {batch_num}. \
-                 The batch cannot be submitted as Airbender-only. Check ZiSK prover status."
-            );
-        }
         permit.send(ProofCommand::new(
             batches,
             SnarkProof::Real(RealSnarkProof::V2 {
@@ -389,3 +456,77 @@ impl FakeSnarkProver {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prover_api::test_util::create_test_batch_envelope;
+    use zksync_os_types::ProtocolSemanticVersion;
+
+    fn envelope(batch: u64) -> SignedBatchEnvelope<FriProof> {
+        let mut e = create_test_batch_envelope(batch, FriProof::Fake);
+        e.batch.batch_info.protocol_version = ProtocolSemanticVersion::new(0, 31, 0);
+        e
+    }
+
+    async fn manager_with_job(
+        require: bool,
+        wait_timeout: Option<Duration>,
+    ) -> (SnarkJobManager, mpsc::Receiver<ProofCommand>, ProvingVersion) {
+        let (tx, rx) = mpsc::channel(4);
+        let mut sjm = SnarkJobManager::new(tx, 1, Duration::from_secs(60), 10);
+        sjm.set_zisk_data_cache(Arc::new(ZiskDataCache::new()));
+        sjm.set_require_multi_proof(require);
+        sjm.set_multi_proof_wait_timeout(wait_timeout);
+        let envelope = envelope(1);
+        let proving_version = envelope.batch.proving_version().expect("proving version");
+        sjm.add_job(envelope).await;
+        (sjm, rx, proving_version)
+    }
+
+    /// With multi-proof required and no ZiSK input for the batch, the
+    /// Airbender submission is rejected BEFORE the job is consumed: the job
+    /// stays in the map and is re-offered instead of being dropped.
+    #[tokio::test]
+    async fn blocked_submit_keeps_the_job() {
+        let (sjm, _rx, proving_version) = manager_with_job(true, None).await;
+
+        let err = sjm
+            .submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
+            .await
+            .expect_err("must be blocked");
+        assert!(err.to_string().contains("multi_proof_verifier requires"), "{err}");
+        assert!(
+            sjm.jobs.get_job_batch_metadata(1).await.is_some(),
+            "job must remain queued after a blocked submission"
+        );
+    }
+
+    /// Once the wait timeout expires, the same submission degrades to
+    /// Airbender-only instead of blocking forever.
+    #[tokio::test]
+    async fn wait_timeout_degrades_to_single_proof() {
+        let (sjm, mut rx, proving_version) = manager_with_job(true, Some(Duration::ZERO)).await;
+
+        sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
+            .await
+            .expect("degrade must be allowed after the timeout");
+        let cmd = rx.try_recv().expect("Airbender-only command sent downstream");
+        drop(cmd);
+        assert!(
+            sjm.jobs.get_job_batch_metadata(1).await.is_none(),
+            "job must be consumed by the degraded submission"
+        );
+    }
+
+    /// Without the multi-proof requirement nothing blocks.
+    #[tokio::test]
+    async fn optional_multi_proof_sends_airbender_only() {
+        let (sjm, mut rx, proving_version) = manager_with_job(false, None).await;
+
+        sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
+            .await
+            .expect("optional mode must pass through");
+        rx.try_recv().expect("Airbender-only command sent downstream");
+    }
+}

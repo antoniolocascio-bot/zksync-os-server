@@ -33,9 +33,10 @@ impl SnarkProvingPipelineStep {
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
     ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
-        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None, false)
+        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None, false, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_zisk_cache(
         max_fris_per_snark: usize,
         last_proved_batch_number: u64,
@@ -43,6 +44,7 @@ impl SnarkProvingPipelineStep {
         max_assigned_batch_range: usize,
         zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
         require_multi_proof: bool,
+        multi_proof_wait_timeout: Option<Duration>,
     ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
@@ -62,7 +64,11 @@ impl SnarkProvingPipelineStep {
             sjm.set_zisk_job_manager(zjm.clone());
             if require_multi_proof {
                 sjm.set_require_multi_proof(true);
-                tracing::info!("ZiSK job manager enabled (multi-proof REQUIRED)");
+                sjm.set_multi_proof_wait_timeout(multi_proof_wait_timeout);
+                tracing::info!(
+                    wait_timeout = ?multi_proof_wait_timeout,
+                    "ZiSK job manager enabled (multi-proof REQUIRED)"
+                );
             } else {
                 tracing::info!("ZiSK job manager enabled (multi-proof optional)");
             }

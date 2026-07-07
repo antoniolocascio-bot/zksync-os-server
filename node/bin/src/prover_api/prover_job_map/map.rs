@@ -243,6 +243,15 @@ impl<T: Clone> ProverJobMap<T> {
             .map(|entry| entry.batch_envelope.batch.clone())
     }
 
+    /// How long the job for `batch_number` has been in the map, if present.
+    pub async fn get_job_age(&self, batch_number: u64) -> Option<std::time::Duration> {
+        let jobs = self
+            .lock_with_tracking(JobMapMethod::GetJobBatchMetadata)
+            .await;
+        jobs.get(&batch_number)
+            .map(|entry| entry.metadata.added_at.elapsed())
+    }
+
     /// If a job is present for given batch_number, returns (vk, prover_input)
     pub async fn get_prover_input(&self, batch_number: u64) -> Option<(&'static str, T)> {
         let jobs = self.lock_with_tracking(JobMapMethod::GetProverInput).await;
