@@ -15583,7 +15583,7 @@ dependencies = [
 [[package]]
 name = "zksync-os-zisk-lib"
 version = "0.1.0"
-source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#37c3ff57d0186e3f5ff21d9c9de31c52f0302823"
+source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#6a6daa78ec4cca3aaa5e5514df3e586e2764ff3b"
 dependencies = [
  "alloy-consensus 1.7.3",
  "alloy-eips 1.7.3",

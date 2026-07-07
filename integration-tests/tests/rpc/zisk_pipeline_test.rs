@@ -69,7 +69,7 @@ async fn try_peek_zisk_data(
     batch_number: u64,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let client = reqwest::Client::new();
-    for _ in 0..120 {
+    for _ in 0..240 {
         if let Some(bytes) = peek_zisk_data_once(&client, prover_api_url, batch_number).await? {
             return Ok(Some(bytes));
         }
@@ -95,7 +95,7 @@ async fn wait_input_containing_block(
     block_number: u64,
 ) -> anyhow::Result<(u64, BatchOutput, B256)> {
     let client = reqwest::Client::new();
-    for _ in 0..120 {
+    for _ in 0..240 {
         for batch_number in 2..=max_batch {
             let Some(bytes) =
                 peek_zisk_data_once(&client, prover_api_url, batch_number).await?
@@ -322,6 +322,125 @@ async fn zisk_input_regenerated_after_restart_impl(case: TestCase) -> anyhow::Re
             "ZiSK input regenerated and re-executed after restart"
         );
     }
+
+    Ok(())
+}
+
+/// Header-hash fidelity across batch shapes: every peekable batch must
+/// re-execute cleanly, and the run must include at least one multi-block
+/// batch so the guest's intra-batch hash chaining (server-provided ring hash
+/// of an earlier in-batch block vs the guest-recomputed one) actually runs.
+/// Combined with the populated `block_header_hash` — which makes the guest
+/// assert every block's recomputed header hash against the canonical one —
+/// this pins the header format per execution version (e.g. the AtlasV3
+/// tx-rolling-hash seed change).
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn zisk_multiblock_batch_hashes() -> anyhow::Result<()> {
+    zisk_multiblock_batch_hashes_impl(CURRENT_TO_L1).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn zisk_multiblock_batch_hashes_v31_to_gateway() -> anyhow::Result<()> {
+    zisk_multiblock_batch_hashes_impl(V31_TO_GATEWAY).await
+}
+
+async fn zisk_multiblock_batch_hashes_impl(case: TestCase) -> anyhow::Result<()> {
+    // This test drives prover input generation explicitly; honor the
+    // profile's intent by skipping.
+    if std::env::var("NEXTEST_PROFILE").as_deref() == Ok("no-pig") {
+        tracing::warn!("no-pig profile — skipping ZiSK multi-block batch test");
+        return Ok(());
+    }
+
+    let env = case.environment().await?;
+    let mut config = env.default_config().await?;
+    // Both in-process fake provers off so the prover API stays bound and FRI
+    // jobs remain peekable (see zisk_pipeline_e2e_impl).
+    config.prover_api_config.fake_fri_provers.enabled = false;
+    config.prover_api_config.fake_snark_provers.enabled = false;
+    // A wide batch window makes the multi-block property robust: blocks only
+    // seal when they carry transactions, so the two receipt-waited transfers
+    // per iteration land in two blocks that share a batch even when a loaded
+    // machine stretches the receipt waits past the default 1s test window.
+    config.batcher_config.batch_timeout = Duration::from_secs(5);
+    let tester = env.launch(config).await?;
+
+    if !tester
+        .config()
+        .prover_input_generator_config
+        .enable_input_generation
+    {
+        tracing::warn!("prover input generation disabled — skipping ZiSK multi-block batch test");
+        return Ok(());
+    }
+    let Some(prover_api_url) = tester.prover_api_url() else {
+        tracing::warn!("prover API not bound — skipping ZiSK multi-block batch test");
+        return Ok(());
+    };
+
+    // Re-execute every peekable batch until a multi-block batch has been
+    // observed. The guest asserts each block's recomputed header hash against
+    // the canonical `block_header_hash` and cross-checks intra-batch ring
+    // hashes, so any header drift panics here.
+    //
+    // Blocks only seal when they carry transactions, so each iteration sends
+    // two receipt-waited transfers: two blocks that share a batch whenever
+    // both land inside the batch window. A loaded machine can stretch the
+    // receipt waits past any fixed window, so the loop keeps producing pairs
+    // (deadline-bounded) instead of asserting on a fixed batch count.
+    let recipient: Address = "0xdead000000000000000000000000000000000002".parse()?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let client = reqwest::Client::new();
+    let mut next_batch = 1u64;
+    let mut multi_block_batches = 0usize;
+    while multi_block_batches == 0 {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "no multi-block batch observed among the first {} batches within \
+             the deadline — intra-batch hash verification was not exercised",
+            next_batch - 1,
+        );
+
+        for _ in 0..2 {
+            tester
+                .l2_provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .with_to(recipient)
+                        .with_value(U256::from(1u64)),
+                )
+                .await?
+                .expect_successful_receipt()
+                .await?;
+        }
+
+        // Drain every batch whose input is already peekable; inputs stay
+        // peekable (no prover consumes them), so the sequential scan is safe.
+        while let Some(zisk_bytes) =
+            peek_zisk_data_once(&client, &prover_api_url, next_batch).await?
+        {
+            let (output, commitment) = executor::execute_and_commit_from_bincode(&zisk_bytes)
+                .map_err(|e| {
+                    anyhow::anyhow!("ZiSK re-execution failed for batch {next_batch}: {e}")
+                })?;
+            assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
+            if output.block_results.len() >= 2 {
+                multi_block_batches += 1;
+            }
+            tracing::info!(
+                batch_number = next_batch,
+                blocks = output.block_results.len(),
+                %commitment,
+                "ZiSK executor reproduced the batch"
+            );
+            next_batch += 1;
+        }
+    }
+    tracing::info!(
+        multi_block_batches,
+        batches_checked = next_batch - 1,
+        "multi-block batch re-executed"
+    );
 
     Ok(())
 }

@@ -412,7 +412,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             gas_limit: ctx.gas_limit,
             coinbase: ctx.coinbase,
             prev_randao,
-            block_header_hash: B256::ZERO,
+            // Canonical hash of this block: the guest recomputes the header
+            // from its own execution and asserts equality, so any header
+            // drift fails loudly at re-execution instead of surfacing as a
+            // wrong batch commitment at proving time.
+            block_header_hash: block_output.header.hash(),
             storage_proofs,
             account_preimages,
             transactions,
