@@ -4955,7 +4955,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9244,7 +9244,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11694,7 +11694,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11762,7 +11762,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -13141,7 +13141,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -15573,7 +15573,7 @@ dependencies = [
 [[package]]
 name = "zksync-os-revm"
 version = "0.1.0"
-source = "git+https://github.com/antoniolocascio-bot/zksync-os-revm?branch=dev#44196556a8df31ce0a2ce2e4539a17e942dac0a6"
+source = "git+https://github.com/antoniolocascio-bot/zksync-os-revm?branch=dev#6246f2bcb0c413971e7c169e9476f71f0d696979"
 dependencies = [
  "auto_impl",
  "revm 38.0.0",
@@ -15583,7 +15583,7 @@ dependencies = [
 [[package]]
 name = "zksync-os-zisk-lib"
 version = "0.1.0"
-source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#3c4ca22f2457e2da69f371dbb94ee77f0c8e20f6"
+source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#678348971a67cc1b111922bffa032f2b8783a439"
 dependencies = [
  "alloy-consensus 1.7.3",
  "alloy-eips 1.7.3",

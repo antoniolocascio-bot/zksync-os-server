@@ -325,15 +325,11 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
 
         let protocol_version = &blocks.first().as_ref().unwrap().1.protocol_version;
 
-        // Batch-boundary tree views for the ZiSK batch-level tree update:
-        // before the first block and after the last block of the batch.
+        // Batch-boundary tree view for the ZiSK batch-level tree update:
+        // the tree before the first block of the batch.
         let batch_tree_start = blocks.first().map(|(_, rr, _, _)| MerkleTreeVersion {
             tree: self.merkle_tree.clone(),
             block: rr.block_context.block_number - 1,
-        });
-        let batch_tree_end = blocks.last().map(|(_, rr, _, _)| MerkleTreeVersion {
-            tree: self.merkle_tree.clone(),
-            block: rr.block_context.block_number,
         });
 
         /* ---------- seal the batch ---------- */
@@ -350,7 +346,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             &self.read_state,
             self.zisk_chain_config,
             batch_tree_start,
-            batch_tree_end,
         )?;
         Ok(Some(batch_envelope))
     }
@@ -412,15 +407,11 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             "Block number mismatch in last block of a rebuilt batch"
         );
 
-        // Batch-boundary tree views for the ZiSK batch-level tree update:
-        // before the first block and after the last block of the batch.
+        // Batch-boundary tree view for the ZiSK batch-level tree update:
+        // the tree before the first block of the batch.
         let batch_tree_start = blocks.first().map(|(_, rr, _, _)| MerkleTreeVersion {
             tree: self.merkle_tree.clone(),
             block: rr.block_context.block_number - 1,
-        });
-        let batch_tree_end = blocks.last().map(|(_, rr, _, _)| MerkleTreeVersion {
-            tree: self.merkle_tree.clone(),
-            block: rr.block_context.block_number,
         });
 
         // Rebuild the batch from blocks
@@ -436,7 +427,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             &self.read_state,
             self.zisk_chain_config,
             batch_tree_start,
-            batch_tree_end,
         )?;
 
         // Verify that the rebuilt batch matches the stored batch by comparing hashes

@@ -76,7 +76,6 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     block_output: &BlockOutput,
     replay_record: &ReplayRecord,
     tree_view: &MerkleTreeVersion<RocksDBWrapper>,
-    tree_view_after: &MerkleTreeVersion<RocksDBWrapper>,
     read_state: &ReadState,
 ) -> anyhow::Result<ZiskBlockData> {
     let ctx = &replay_record.block_context;
@@ -367,8 +366,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     // Phase 3: tree update
     let tree_update = if !block_output.storage_writes.is_empty() {
-        let mut tree_end = tree_view_after.clone();
-        Some(build_tree_update(&mut tree, &mut tree_end, &block_output.storage_writes, leaf_count))
+        Some(build_tree_update(&mut tree, &block_output.storage_writes, leaf_count))
     } else {
         None
     };
@@ -711,7 +709,6 @@ fn get_leaf_proof(tree: &mut MerkleTreeVersion<RocksDBWrapper>, idx: u64) -> Lea
 
 pub fn build_tree_update(
     tree: &mut MerkleTreeVersion<RocksDBWrapper>,
-    tree_after: &mut MerkleTreeVersion<RocksDBWrapper>,
     writes: &[zksync_os_interface::types::StorageWrite],
     leaf_count: u64,
 ) -> BatchTreeUpdate {
@@ -750,20 +747,20 @@ pub fn build_tree_update(
             entries.push((flat_key, write.value));
             ensure_leaf(tree, tree_index, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
         } else {
-            // Insert new leaf — find predecessor using in-memory state
-            // First check if we already know the predecessor from previous inserts
-            let prev_index = if let Some((&prev_key, &prev_idx)) = key_to_index.range(..flat_key).next_back() {
-                let _ = prev_key;
-                prev_idx
-            } else {
-                // Fallback to tree (first insert, or predecessor not yet loaded)
-                let idx = tree.prev_tree_index(flat_key_bytes32);
-                ensure_leaf(tree, idx, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
-                idx
-            };
-
-            // Ensure predecessor is loaded and get its next
-            ensure_leaf(tree, prev_index, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+            // Insert new leaf. Load the tree's own predecessor first so the
+            // ordered in-memory map always contains it; the true predecessor
+            // is then the largest key below the new key across existing AND
+            // pending-inserted leaves. (Taking the in-memory candidate alone
+            // is wrong: any already-loaded smaller key — e.g. a leaf touched
+            // by an earlier update — would shadow the tree's predecessor and
+            // corrupt the linked list.)
+            let tree_prev = tree.prev_tree_index(flat_key_bytes32);
+            ensure_leaf(tree, tree_prev, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+            let prev_index = *key_to_index
+                .range(..flat_key)
+                .next_back()
+                .expect("predecessor always exists (MIN guard)")
+                .1;
             let old_next = index_to_next[&prev_index];
             ensure_leaf(tree, old_next, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
 
@@ -780,80 +777,146 @@ pub fn build_tree_update(
         }
     }
 
-    // Build sorted_leaves
+    // Anchor planning: the guest's new-root pass needs a sibling for every
+    // node off the new paths. Siblings inside the pre-existing tree that the
+    // old-root pass would not authenticate must be covered by an *anchor*
+    // leaf (the leftmost leaf of that subtree) included in the witness, so
+    // that the old-root pass authenticates the region. Iterate to a fixpoint:
+    // each added anchor changes both traversals.
+    let insert_count = operations
+        .iter()
+        .filter(|op| matches!(op, WriteOp::Insert { .. }))
+        .count() as u64;
+    loop {
+        let mut old_indices: Vec<u64> = leaf_proofs.keys().copied().collect();
+        old_indices.sort_unstable();
+        let authenticated = simulate_pass1_authenticated(&old_indices, leaf_count);
+
+        let mut new_indices: Vec<u64> = old_indices;
+        new_indices.extend(leaf_count..leaf_count + insert_count);
+        new_indices.sort_unstable();
+        new_indices.dedup();
+
+        let missing = simulate_pass2_missing(&new_indices, leaf_count, &authenticated);
+        if missing.is_empty() {
+            break;
+        }
+        for (depth, sibling) in missing {
+            // Leftmost leaf of the uncovered subtree; < leaf_count by construction.
+            let anchor = sibling << depth;
+            ensure_leaf(tree, anchor, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+        }
+    }
+
+    // Build sorted_leaves (touched leaves + anchors)
     let mut sorted_leaves: Vec<(u64, TreeLeaf)> = leaf_proofs
         .values()
         .map(|p| (p.index, TreeLeaf { key: p.key, value: p.value, next_index: p.next_index }))
         .collect();
     sorted_leaves.sort_by_key(|(idx, _)| *idx);
 
-    // Compute intermediate hashes for BOTH the old leaf set AND the new leaf set.
-    // apply() calls zip_leaves twice: once to verify old root, once for new root.
     let old_leaf_indices: Vec<u64> = sorted_leaves.iter().map(|(idx, _)| *idx).collect();
+    let intermediate_hashes =
+        compute_old_intermediate_hashes(&old_leaf_indices, leaf_count, &leaf_proofs, tree);
 
-    // Simulate apply() to determine the final leaf indices
-    let mut sim_next_index = leaf_count;
-    let mut new_indices: Vec<u64> = old_leaf_indices.clone();
-    for op in &operations {
-        if let WriteOp::Insert { .. } = op {
-            new_indices.push(sim_next_index);
-            sim_next_index += 1;
-        }
-    }
-    new_indices.sort();
-    new_indices.dedup();
-
-    // For new leaf indices (>= leaf_count), there are no tree proofs.
-    // Their siblings in the tree are empty subtrees. We need to use the
-    // tree's hash_at_position() to get the actual sibling hash at each depth.
-    // Build a function that resolves sibling hashes for ANY position.
-    // Compute separate intermediate hashes for old root verification and new root computation.
-    tracing::info!(
-        old_leaf_count = old_leaf_indices.len(),
-        new_leaf_count = new_indices.len(),
+    tracing::debug!(
+        leaves = old_leaf_indices.len(),
+        hashes = intermediate_hashes.len(),
         leaf_count_before = leaf_count,
-        leaf_count_after = sim_next_index,
-        leaf_proofs_count = leaf_proofs.len(),
-        "Computing intermediate hashes for tree update"
+        inserts = insert_count,
+        "tree update witness built"
     );
-    let (intermediate_hashes, intermediate_hashes_new) = compute_intermediate_hashes_full(
-        &old_leaf_indices, leaf_count,
-        &new_indices, sim_next_index,
-        &leaf_proofs, tree, tree_after,
-    );
-    tracing::info!(
-        old_hashes = intermediate_hashes.len(),
-        new_hashes = intermediate_hashes_new.len(),
-        "Intermediate hashes computed"
-    );
-
-    // Get the actual tree root after from the block_end tree
-    let expected_root_after = tree_after.root_info().ok().map(|(root, _)| root);
 
     BatchTreeUpdate {
-        operations, entries, sorted_leaves,
+        operations,
+        entries,
+        sorted_leaves,
         intermediate_hashes,
-        intermediate_hashes_new,
         leaf_count_before: leaf_count,
-        expected_root_after,
     }
 }
 
-/// Compute intermediate hashes for both old and new leaf sets.
-/// Uses the tree directly to resolve sibling hashes at any position.
-fn compute_intermediate_hashes_full(
+/// Mirror of the guest's old-root pass (`zip_and_record`), positions only:
+/// returns every (depth, index) the pass authenticates — leaf hashes,
+/// consumed siblings, and computed internal nodes.
+fn simulate_pass1_authenticated(old_indices: &[u64], leaf_count: u64) -> HashSet<(u8, u64)> {
+    let mut authenticated: HashSet<(u8, u64)> =
+        old_indices.iter().map(|idx| (0u8, *idx)).collect();
+    let mut nodes: Vec<u64> = old_indices.to_vec();
+    let mut last_idx_on_level = leaf_count - 1;
+
+    for depth in 0..TREE_DEPTH {
+        let mut next_level = Vec::new();
+        let mut i = 0;
+        while i < nodes.len() {
+            let idx = nodes[i];
+            if idx % 2 == 1 {
+                authenticated.insert((depth, idx - 1));
+                i += 1;
+            } else if nodes.get(i + 1).copied() == Some(idx + 1) {
+                i += 2;
+            } else {
+                if idx != last_idx_on_level {
+                    authenticated.insert((depth, idx + 1));
+                }
+                i += 1;
+            }
+            next_level.push(idx / 2);
+            authenticated.insert((depth + 1, idx / 2));
+        }
+        nodes = next_level;
+        last_idx_on_level /= 2;
+    }
+    authenticated
+}
+
+/// Mirror of the guest's new-root pass: returns the (depth, index) of every
+/// sibling that is neither computed, nor authenticated by the old-root pass,
+/// nor provably empty (subtree entirely at or beyond `leaf_count_before`).
+fn simulate_pass2_missing(
+    new_indices: &[u64],
+    leaf_count_before: u64,
+    authenticated: &HashSet<(u8, u64)>,
+) -> Vec<(u8, u64)> {
+    let mut missing = Vec::new();
+    let mut nodes: Vec<u64> = new_indices.to_vec();
+
+    for depth in 0..TREE_DEPTH {
+        let mut next_level = Vec::new();
+        let mut i = 0;
+        while i < nodes.len() {
+            let idx = nodes[i];
+            let sibling = idx ^ 1;
+            if nodes.get(i + 1).copied() == Some(sibling) {
+                i += 2;
+            } else {
+                i += 1;
+                if !authenticated.contains(&(depth, sibling))
+                    && (sibling << depth) < leaf_count_before
+                {
+                    missing.push((depth, sibling));
+                }
+            }
+            next_level.push(idx / 2);
+        }
+        nodes = next_level;
+    }
+    missing
+}
+
+/// Intermediate sibling hashes for the guest's old-root pass, in traversal
+/// order, resolved from already-loaded leaf proofs (falling back to loading a
+/// proof from the needed subtree).
+fn compute_old_intermediate_hashes(
     old_indices: &[u64],
     old_leaf_count: u64,
-    new_indices: &[u64],
-    new_leaf_count: u64,
     leaf_proofs: &HashMap<u64, LeafWithProof>,
     tree: &mut MerkleTreeVersion<RocksDBWrapper>,
-    tree_after: &mut MerkleTreeVersion<RocksDBWrapper>,
-) -> (Vec<B256>, Vec<B256>) {
+) -> Vec<B256> {
     let empty_hashes = zisk_merkle::empty_subtree_hashes_vec();
 
     // Build sibling cache from already-loaded proofs.
-    // Key: (depth, node_index_at_that_depth) → hash of that node
+    // Key: (depth, node_index_at_that_depth) -> hash of that node
     let mut sibling_cache: HashMap<(u8, u64), B256> = HashMap::new();
     for proof in leaf_proofs.values() {
         for d in 0..TREE_DEPTH {
@@ -862,116 +925,53 @@ fn compute_intermediate_hashes_full(
         }
     }
 
-    // Function to resolve sibling hash, loading from tree if necessary.
-    // We pass tree as a mutable reference so we can load new proofs on demand.
-    let mut resolve_sibling = |depth: u8, sibling_node: u64, leaf_count: u64| -> B256 {
-        // Check cache first
+    let mut resolve_sibling = |depth: u8, sibling_node: u64| -> B256 {
         if let Some(&h) = sibling_cache.get(&(depth, sibling_node)) {
             return h;
         }
-        // Beyond tree → empty subtree
         let range_start = sibling_node << depth;
-        if range_start >= leaf_count {
+        if range_start >= old_leaf_count {
             return empty_hashes[depth as usize];
         }
-        // Load a proof from a leaf in this subtree to populate cache
         let leaf_in_subtree = range_start.min(old_leaf_count.saturating_sub(1));
-        if leaf_in_subtree < old_leaf_count {
-            let p = get_leaf_proof(tree, leaf_in_subtree);
-            for d in 0..TREE_DEPTH {
-                let sn = (p.index >> d) ^ 1;
-                sibling_cache.entry((d, sn)).or_insert(p.siblings[d as usize]);
-            }
-            if let Some(&h) = sibling_cache.get(&(depth, sibling_node)) {
-                return h;
-            }
+        let p = get_leaf_proof(tree, leaf_in_subtree);
+        for d in 0..TREE_DEPTH {
+            let sn = (p.index >> d) ^ 1;
+            sibling_cache.entry((d, sn)).or_insert(p.siblings[d as usize]);
+        }
+        if let Some(&h) = sibling_cache.get(&(depth, sibling_node)) {
+            return h;
         }
         empty_hashes[depth as usize]
     };
 
-    // Simulate zip_leaves for old leaf set
     let mut old_hashes = Vec::new();
-    {
-        let mut node_indices: Vec<u64> = old_indices.to_vec();
-        let mut last_idx = old_leaf_count - 1;
-        for depth in 0..TREE_DEPTH {
-            let mut i = 0;
-            let mut next_level = Vec::new();
-            while i < node_indices.len() {
-                let idx = node_indices[i];
-                if idx % 2 == 1 {
-                    old_hashes.push(resolve_sibling(depth, idx - 1, old_leaf_count));
-                    next_level.push(idx / 2);
-                    i += 1;
-                } else if node_indices.get(i + 1).copied() == Some(idx + 1) {
-                    next_level.push(idx / 2);
-                    i += 2;
-                } else {
-                    if idx != last_idx {
-                        old_hashes.push(resolve_sibling(depth, idx + 1, old_leaf_count));
-                    }
-                    next_level.push(idx / 2);
-                    i += 1;
+    let mut node_indices: Vec<u64> = old_indices.to_vec();
+    let mut last_idx = old_leaf_count - 1;
+    for depth in 0..TREE_DEPTH {
+        let mut i = 0;
+        let mut next_level = Vec::new();
+        while i < node_indices.len() {
+            let idx = node_indices[i];
+            if idx % 2 == 1 {
+                old_hashes.push(resolve_sibling(depth, idx - 1));
+                next_level.push(idx / 2);
+                i += 1;
+            } else if node_indices.get(i + 1).copied() == Some(idx + 1) {
+                next_level.push(idx / 2);
+                i += 2;
+            } else {
+                if idx != last_idx {
+                    old_hashes.push(resolve_sibling(depth, idx + 1));
                 }
+                next_level.push(idx / 2);
+                i += 1;
             }
-            node_indices = next_level;
-            last_idx /= 2;
         }
+        node_indices = next_level;
+        last_idx /= 2;
     }
-
-    // Simulate zip_leaves for new leaf set — use tree_after for sibling resolution
-    let mut new_hashes = Vec::new();
-    {
-        // Build sibling cache from the AFTER tree
-        let mut new_sibling_cache: HashMap<(u8, u64), B256> = HashMap::new();
-        let mut resolve_new_sibling = |depth: u8, sibling_node: u64| -> B256 {
-            if let Some(&h) = new_sibling_cache.get(&(depth, sibling_node)) {
-                return h;
-            }
-            let range_start = sibling_node << depth;
-            if range_start >= new_leaf_count {
-                return empty_hashes[depth as usize];
-            }
-            // Load from the AFTER tree
-            let leaf_in_subtree = range_start.min(new_leaf_count.saturating_sub(1));
-            let p = get_leaf_proof(tree_after, leaf_in_subtree);
-            for d in 0..TREE_DEPTH {
-                let sn = (p.index >> d) ^ 1;
-                new_sibling_cache.entry((d, sn)).or_insert(p.siblings[d as usize]);
-            }
-            new_sibling_cache.get(&(depth, sibling_node))
-                .copied()
-                .unwrap_or(empty_hashes[depth as usize])
-        };
-
-        let mut node_indices: Vec<u64> = new_indices.to_vec();
-        let mut last_idx = new_leaf_count - 1;
-        for depth in 0..TREE_DEPTH {
-            let mut i = 0;
-            let mut next_level = Vec::new();
-            while i < node_indices.len() {
-                let idx = node_indices[i];
-                if idx % 2 == 1 {
-                    new_hashes.push(resolve_new_sibling(depth, idx - 1));
-                    next_level.push(idx / 2);
-                    i += 1;
-                } else if node_indices.get(i + 1).copied() == Some(idx + 1) {
-                    next_level.push(idx / 2);
-                    i += 2;
-                } else {
-                    if idx != last_idx {
-                        new_hashes.push(resolve_new_sibling(depth, idx + 1));
-                    }
-                    next_level.push(idx / 2);
-                    i += 1;
-                }
-            }
-            node_indices = next_level;
-            last_idx /= 2;
-        }
-    }
-
-    (old_hashes, new_hashes)
+    old_hashes
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,4 +1597,72 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tree_update_tests {
+    use super::*;
+    use alloy::primitives::Address as AlloyAddress;
+    use zksync_os_interface::types::StorageWrite;
+    use zksync_os_merkle_tree::{MerkleTree, RocksDBWrapper, TreeEntry};
+
+    fn write(key: B256, value: B256) -> StorageWrite {
+        StorageWrite {
+            key,
+            value,
+            account: AlloyAddress::ZERO,
+            account_key: B256::ZERO,
+        }
+    }
+
+    /// End-to-end: build a real RocksDB tree, produce a witness with
+    /// `build_tree_update`, and check that the guest's trust-free
+    /// `BatchTreeUpdate::apply` reproduces the tree's actual post-state root.
+    /// Mixes updates, inserts far from the touched region (anchor case), and
+    /// chained inserts.
+    #[test]
+    fn guest_apply_matches_real_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RocksDBWrapper::new(dir.path()).unwrap();
+        let mut tree = MerkleTree::new(db).unwrap();
+
+        // Pre-state: a spread of keys so inserts land between existing leaves.
+        let pre: Vec<TreeEntry> = (1u8..=20)
+            .map(|i| TreeEntry {
+                key: B256::repeat_byte(i * 10),
+                value: B256::repeat_byte(i),
+            })
+            .collect();
+        let before = tree.extend(&pre).unwrap();
+        let version_before = tree.latest_version().unwrap().unwrap();
+        let (root_before, leaf_count_before) = (before.root_hash, before.leaf_count);
+
+        // Post-state: update two existing keys, insert three new ones —
+        // including neighbors of untouched regions and adjacent new keys.
+        let changes = vec![
+            write(B256::repeat_byte(30), B256::repeat_byte(0xa1)), // update
+            write(B256::repeat_byte(155), B256::repeat_byte(0xa2)), // insert between 150/160
+            write(B256::repeat_byte(156), B256::repeat_byte(0xa3)), // chained insert
+            write(B256::repeat_byte(200), B256::repeat_byte(0xa4)), // update
+            write(B256::repeat_byte(75), B256::repeat_byte(0xa5)),  // insert between 70/80
+        ];
+        let post_entries: Vec<TreeEntry> = changes
+            .iter()
+            .map(|w| TreeEntry { key: w.key, value: w.value })
+            .collect();
+        let after = tree.extend(&post_entries).unwrap();
+        let root_after = after.root_hash;
+
+        // Build the witness from the PRE-state tree view only.
+        let mut tree_view = MerkleTreeVersion {
+            tree,
+            block: version_before,
+        };
+        let update = build_tree_update(&mut tree_view, &changes, leaf_count_before);
+
+        // The guest recomputes the post-state root with no trusted input.
+        let (computed_root, computed_count) = update.apply(&root_before);
+        assert_eq!(computed_root, root_after, "guest-computed root != real tree root");
+        assert_eq!(computed_count, after.leaf_count);
+    }
 }

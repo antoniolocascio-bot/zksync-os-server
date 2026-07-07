@@ -19,6 +19,7 @@ pub struct ZiskChainConfig {
     pub max_tx_gas_limit: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     blocks: &[(
         BlockOutput,
@@ -35,7 +36,6 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     read_state: &ReadState,
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
-    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<BatchForSigning<ProverInput>> {
     let block_number_from = blocks.first().unwrap().1.block_context.block_number;
     let block_number_to = blocks.last().unwrap().1.block_context.block_number;
@@ -117,7 +117,6 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         &blob_sidecar,
         zisk_chain_config,
         batch_tree_start,
-        batch_tree_end,
         account_preimages_after,
     )?;
 
@@ -199,7 +198,6 @@ fn compute_batch_prover_input(
     blob_sidecar: &Option<BlobTransactionSidecar>,
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
-    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
 ) -> anyhow::Result<ProverInput> {
     use zk_os_forward_system::run::generate_batch_proof_input;
@@ -252,7 +250,6 @@ fn compute_batch_prover_input(
             blob_sidecar,
             zisk_chain_config,
             batch_tree_start,
-            batch_tree_end,
             account_preimages_after,
         )?)
     } else {
@@ -278,7 +275,6 @@ fn assemble_zisk_batch(
     blob_sidecar: &Option<BlobTransactionSidecar>,
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
-    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
 ) -> anyhow::Result<Vec<u8>> {
     use blake2::{Blake2s256, Digest};
@@ -378,7 +374,7 @@ fn assemble_zisk_batch(
                     }).collect()
                 })
                 .unwrap_or_default(),
-            tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
+            tree_update: build_batch_tree_update(blocks, batch_tree_start)?,
             account_preimages_after,
             fri_proof_verification_enabled: zisk_chain_config.fri_proof_verification_enabled,
             max_tx_gas_limit: zisk_chain_config.max_tx_gas_limit,
@@ -450,11 +446,10 @@ fn assemble_zisk_batch(
     Ok(serialized)
 }
 
-/// Build a batch-level tree update directly from the batch-start and batch-end tree views.
-///
-/// This is sound: it queries the actual tree state to produce merkle proofs for
-/// both the old root verification (from batch_tree_start) and the new root
-/// computation (from batch_tree_end). No trusted `expected_root_after` needed.
+/// Build a batch-level tree update from the batch-start tree view: pre-state
+/// leaf proofs (touched leaves + anchors) and old-root sibling hashes. The
+/// guest recomputes the new root from that authenticated pre-state and the
+/// REVM-verified writes alone — no post-state data is shipped at all.
 fn build_batch_tree_update(
     blocks: &[(
         zksync_os_types::BlockOutput,
@@ -463,7 +458,6 @@ fn build_batch_tree_update(
         ProverInput,
     )],
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
-    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<Option<zksync_os_zisk_lib::merkle::BatchTreeUpdate>> {
     // Collect all storage writes across all blocks, deduplicate (last-writer-wins per key)
     let mut combined_writes: Vec<zksync_os_interface::types::StorageWrite> = Vec::new();
@@ -485,12 +479,9 @@ fn build_batch_tree_update(
         return Ok(None);
     }
 
-    let (mut tree_start, mut tree_end) = match (batch_tree_start, batch_tree_end) {
-        (Some(s), Some(e)) => (s, e),
-        _ => {
-            tracing::warn!("batch tree views not available, falling back to None tree_update");
-            return Ok(None);
-        }
+    let Some(mut tree_start) = batch_tree_start else {
+        tracing::warn!("batch tree view not available, falling back to None tree_update");
+        return Ok(None);
     };
 
     let leaf_count = tree_start.root_info()?.1;
@@ -498,7 +489,6 @@ fn build_batch_tree_update(
     Ok(Some(
         crate::prover_input_generator::zisk_input_builder::build_tree_update(
             &mut tree_start,
-            &mut tree_end,
             &combined_writes,
             leaf_count,
         ),

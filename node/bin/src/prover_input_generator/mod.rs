@@ -171,16 +171,13 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
         );
         let versioned_tree = VersionedMerkleTree::new(self.merkle_tree.clone(), block_number - 1);
         let enable_second_proof = self.enable_second_proof_system;
-        // Pointwise tree views before/after the block for the ZiSK input
-        // builder (it extracts per-slot merkle proofs, which the streamed
-        // BlockMerkleTreeData does not carry).
+        // Pointwise pre-state tree view for the ZiSK input builder (it
+        // extracts per-slot merkle proofs, which the streamed
+        // BlockMerkleTreeData does not carry). The witness is pre-state-only;
+        // the guest recomputes the post-state root itself.
         let zisk_tree_before = MerkleTreeVersion {
             tree: self.merkle_tree.clone(),
             block: block_number - 1,
-        };
-        let zisk_tree_after = MerkleTreeVersion {
-            tree: self.merkle_tree.clone(),
-            block: block_number,
         };
 
         let mut handle = tokio::task::spawn_blocking(move || {
@@ -191,7 +188,6 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
                 tree,
                 versioned_tree,
                 zisk_tree_before,
-                zisk_tree_after,
                 &block_output,
                 da_commitment_scheme,
                 enable_logging,
@@ -231,7 +227,6 @@ fn compute_prover_input(
     tree_view: BlockMerkleTreeData,
     versioned_tree: VersionedMerkleTree,
     zisk_tree_before: MerkleTreeVersion<RocksDBWrapper>,
-    zisk_tree_after: MerkleTreeVersion<RocksDBWrapper>,
     block_output: &BlockOutput,
     da_commitment_scheme: DACommitmentScheme,
     enable_logging: bool,
@@ -343,7 +338,7 @@ fn compute_prover_input(
     // Optionally generate ZiSK prover input alongside airbender witness
     let zisk_data = if enable_second_proof {
         tracing::debug!(block_number, "Generating ZiSK prover input alongside airbender witness");
-        match zisk_input_builder::build_block_data(block_output, replay_record, &zisk_tree_before, &zisk_tree_after, &state_handle) {
+        match zisk_input_builder::build_block_data(block_output, replay_record, &zisk_tree_before, &state_handle) {
             Ok(block_data) => Some(
                 bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"),
             ),
