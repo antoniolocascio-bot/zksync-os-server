@@ -17,12 +17,23 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use base64::Engine;
 use std::time::Duration;
-use zksync_os_integration_tests::CURRENT_TO_L1;
+use zksync_os_integration_tests::{CURRENT_TO_L1, SettlementLayer, TestCase};
+use zksync_os_server::default_protocol_version::PROTOCOL_VERSION_V31_0;
 use zksync_os_integration_tests::assert_traits::ReceiptAssert;
 use zksync_os_integration_tests::l1_helpers::wait_for_l1_state;
 use zksync_os_integration_tests::test_config::make_commit_only_config;
 use zksync_os_zisk_lib::executor;
 use zksync_os_zisk_lib::types::BatchOutput;
+
+/// v31.0 protocol chains stamp execution version 6, so their blocks run on
+/// the v0.3.x zksync-os line (AtlasV3 in REVM) — the newest supported spec.
+/// The shipped v31.0 chain state settles on Gateway (its L1 state has the
+/// chain already migrated), so the v31 variants run gateway-settling; the
+/// second-proof input pipeline and guest execution are settlement-agnostic.
+const V31_TO_GATEWAY: TestCase = TestCase {
+    protocol_version: PROTOCOL_VERSION_V31_0,
+    settlement_layer: SettlementLayer::Gateway,
+};
 
 #[derive(serde::Deserialize)]
 struct ZiskBatchDataPayload {
@@ -110,6 +121,16 @@ async fn wait_input_containing_block(
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
+    zisk_pipeline_e2e_impl(CURRENT_TO_L1).await
+}
+
+#[ignore = "POC_DEFECTS.md #13: guest write-set mismatch on v31/AtlasV3 blocks (computed 0 writes, tree_update has 4)"]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn zisk_pipeline_e2e_v31_to_gateway() -> anyhow::Result<()> {
+    zisk_pipeline_e2e_impl(V31_TO_GATEWAY).await
+}
+
+async fn zisk_pipeline_e2e_impl(case: TestCase) -> anyhow::Result<()> {
     // This test drives prover input generation explicitly; honor the
     // profile's intent by skipping.
     if std::env::var("NEXTEST_PROFILE").as_deref() == Ok("no-pig") {
@@ -117,7 +138,7 @@ async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let env = CURRENT_TO_L1.environment().await?;
+    let env = case.environment().await?;
     let mut config = env.default_config().await?;
     // Both in-process fake provers off: the harness keeps the prover API
     // bound (it disables the API when both fakes run), and FRI jobs stay in
@@ -220,6 +241,16 @@ async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
 /// input generator again.
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_input_regenerated_after_restart() -> anyhow::Result<()> {
+    zisk_input_regenerated_after_restart_impl(CURRENT_TO_L1).await
+}
+
+#[ignore = "POC_DEFECTS.md #13: guest write-set mismatch on v31/AtlasV3 blocks (computed 0 writes, tree_update has 4)"]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn zisk_input_regenerated_after_restart_v31_to_gateway() -> anyhow::Result<()> {
+    zisk_input_regenerated_after_restart_impl(V31_TO_GATEWAY).await
+}
+
+async fn zisk_input_regenerated_after_restart_impl(case: TestCase) -> anyhow::Result<()> {
     // This test drives prover input generation explicitly (the commit-only
     // config keeps it on), so honor the profile's intent by skipping.
     if std::env::var("NEXTEST_PROFILE").as_deref() == Ok("no-pig") {
@@ -227,7 +258,7 @@ async fn zisk_input_regenerated_after_restart() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let env = CURRENT_TO_L1.environment().await?;
+    let env = case.environment().await?;
     let mut config = env.default_config().await?;
     // Fake FRI provers on, SNARK provers off: batches commit on L1 and then
     // stay unproven, exactly the window where a restart loses in-memory state.
