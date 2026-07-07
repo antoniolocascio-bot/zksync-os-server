@@ -281,6 +281,13 @@ impl SnarkJobManager {
         timeout_for_real_fris: Option<Duration>,
     ) -> anyhow::Result<()> {
         loop {
+            // Reserve downstream capacity BEFORE picking: bailing on
+            // backpressure after the pick leaves the picked jobs assigned to
+            // "fake_prover" until the assignment timeout, stalling the whole
+            // prove pipeline for that window. An unused permit is just
+            // dropped.
+            let permit = self.try_reserve_permit_downstream()?;
+
             let assigned: Vec<(FriJob, FriProof)> = self
                 .jobs
                 .pick_jobs_while_with_limit(self.max_fris_per_snark, "fake_prover", |job| {
@@ -310,7 +317,6 @@ impl SnarkJobManager {
 
             let batch_from = assigned.first().unwrap().0.batch_number;
             let batch_to = assigned.last().unwrap().0.batch_number;
-            let permit = self.try_reserve_permit_downstream()?;
             let Some(completed) = self
                 .jobs
                 .complete_many_jobs(batch_from, batch_to, ProverType::Fake, "fake_prover")
