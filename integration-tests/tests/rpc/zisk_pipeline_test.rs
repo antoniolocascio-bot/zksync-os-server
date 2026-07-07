@@ -124,7 +124,6 @@ async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
     zisk_pipeline_e2e_impl(CURRENT_TO_L1).await
 }
 
-#[ignore = "POC_DEFECTS.md #13: guest write-set mismatch on v31/AtlasV3 blocks (computed 0 writes, tree_update has 4)"]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_pipeline_e2e_v31_to_gateway() -> anyhow::Result<()> {
     zisk_pipeline_e2e_impl(V31_TO_GATEWAY).await
@@ -244,7 +243,6 @@ async fn zisk_input_regenerated_after_restart() -> anyhow::Result<()> {
     zisk_input_regenerated_after_restart_impl(CURRENT_TO_L1).await
 }
 
-#[ignore = "POC_DEFECTS.md #13: guest write-set mismatch on v31/AtlasV3 blocks (computed 0 writes, tree_update has 4)"]
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_input_regenerated_after_restart_v31_to_gateway() -> anyhow::Result<()> {
     zisk_input_regenerated_after_restart_impl(V31_TO_GATEWAY).await

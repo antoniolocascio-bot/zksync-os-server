@@ -1095,8 +1095,8 @@ fn extract_l2_to_l1_logs(block_output: &BlockOutput) -> Vec<L2ToL1LogEntry> {
 // ---------------------------------------------------------------------------
 
 fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -> Vec<TxInput> {
-    transactions.iter().enumerate().filter_map(|(i, tx)| {
-        let mut tx_input = convert_tx(tx)?;
+    transactions.iter().enumerate().map(|(i, tx)| {
+        let mut tx_input = convert_tx(tx);
         // Include the server's gas_used for all transactions.
         // REVM's gas computation may differ from ZKsync OS native gas
         // (especially for L1 deposits and upgrade txs), so the server's
@@ -1111,11 +1111,11 @@ fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -
             }
             None => {}
         }
-        Some(tx_input)
+        tx_input
     }).collect()
 }
 
-fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
+fn convert_tx(tx: &ZkTransaction) -> TxInput {
     use alloy::sol_types::SolValue;
 
     // Helper to ABI-encode an L1/upgrade tx as L2CanonicalTransaction.
@@ -1145,7 +1145,10 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
     }
 
     let auth = match tx.envelope() {
-        ZkEnvelope::System(_) => return None,
+        ZkEnvelope::System(system_envelope) => TxAuth::System {
+            tx_hash: *system_envelope.hash(),
+            encoded_2718: system_envelope.encoded_2718(),
+        },
         ZkEnvelope::L2(_) => {
             TxAuth::L2 { signed_bytes: tx.envelope().encoded_2718() }
         }
@@ -1159,12 +1162,12 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
         }
     };
 
-    Some(TxInput {
+    TxInput {
         chain_id: tx.envelope().chain_id(),
         gas_used_override: None,
         force_fail: false,
         auth,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1341,19 @@ fn run_pre_execution<DB: DatabaseRef>(
                  env.max_fee_per_gas(), env.max_priority_fee_per_gas(),
                  env.chain_id().or(tx_input.chain_id), env.tx_type() as u8,
                  U256::ZERO, None, h)
+            }
+            TxAuth::System { tx_hash, encoded_2718 } => {
+                // Mirrors the consistency checker's System arm: bootloader
+                // caller, zero fees/value/nonce, block gas limit (the tx's
+                // own is zero), service tx type 0x7d.
+                use alloy::consensus::Transaction;
+                use alloy::eips::Decodable2718;
+                let env = zksync_os_types::SystemTxEnvelope::decode_2718(&mut &encoded_2718[..])
+                    .expect("decode system tx");
+                let to = env.to().expect("system tx always has `to`");
+                (zksync_os_types::BOOTLOADER_FORMAL_ADDRESS, TxKind::Call(to), U256::ZERO,
+                 env.input().to_vec(), 0, gas_limit, 0, Some(0),
+                 None, zksync_os_types::SYSTEM_TX_TYPE_ID, U256::ZERO, None, *tx_hash)
             }
         };
         let mut b = revm::context::TxEnv::builder()
