@@ -1308,10 +1308,11 @@ fn run_pre_execution<DB: DatabaseRef>(
                 let data_abs = 32 + data_rel;
                 let data_len: usize = alloy::primitives::U256::from_be_slice(&abi_encoded[data_abs..data_abs+32]).to();
                 let data = abi_encoded[data_abs+32..data_abs+32+data_len].to_vec();
-                let rr = a(11);
+                // Always pass the recipient, zero address included: the Atlas
+                // handler requires one for every L1->L2 tx (the consistency
+                // checker passes it unconditionally too).
                 (a(1), TxKind::Call(a(2)), w(9), data, w(8).to::<u64>(), gl, w(5).to::<u128>(),
-                 None, tx_input.chain_id, tt, w(10),
-                 if rr.is_zero() { None } else { Some(rr) }, *tx_hash)
+                 None, tx_input.chain_id, tt, w(10), Some(a(11)), *tx_hash)
             }
             TxAuth::L2 { signed_bytes } => {
                 use alloy::consensus::Transaction;
