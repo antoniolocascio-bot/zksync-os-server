@@ -16,6 +16,7 @@ use zksync_os_batch_types::BlockMerkleTreeData;
 use zksync_os_batch_types::batcher_model::ProverInput;
 use zksync_os_contract_interface::models::DACommitmentScheme;
 use zksync_os_interface::traits::TxListSource;
+use alloy::primitives::B256;
 use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
@@ -182,12 +183,22 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
 
         let mut handle = tokio::task::spawn_blocking(move || {
             let tree_output = tree.output;
+            // Native execution's exact touched-key sets, used to verify the
+            // ZiSK witness discovery is complete (a gap fails generation
+            // loudly instead of surfacing at proving time).
+            let native_touched_keys: Vec<B256> = tree
+                .read_keys
+                .iter()
+                .chain(tree.written_keys.iter())
+                .copied()
+                .collect();
             let prover_input = compute_prover_input(
                 &replay_record,
                 read_state,
                 tree,
                 versioned_tree,
                 zisk_tree_before,
+                &native_touched_keys,
                 &block_output,
                 da_commitment_scheme,
                 enable_logging,
@@ -227,6 +238,7 @@ fn compute_prover_input(
     tree_view: BlockMerkleTreeData,
     versioned_tree: VersionedMerkleTree,
     zisk_tree_before: MerkleTreeVersion<RocksDBWrapper>,
+    native_touched_keys: &[B256],
     block_output: &BlockOutput,
     da_commitment_scheme: DACommitmentScheme,
     enable_logging: bool,
@@ -338,7 +350,13 @@ fn compute_prover_input(
     // Optionally generate ZiSK prover input alongside airbender witness
     let zisk_data = if enable_second_proof {
         tracing::debug!(block_number, "Generating ZiSK prover input alongside airbender witness");
-        match zisk_input_builder::build_block_data(block_output, replay_record, &zisk_tree_before, &state_handle) {
+        match zisk_input_builder::build_block_data(
+            block_output,
+            replay_record,
+            &zisk_tree_before,
+            native_touched_keys,
+            &state_handle,
+        ) {
             Ok(block_data) => Some(
                 bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"),
             ),

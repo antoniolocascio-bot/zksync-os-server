@@ -76,6 +76,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     block_output: &BlockOutput,
     replay_record: &ReplayRecord,
     tree_view: &MerkleTreeVersion<RocksDBWrapper>,
+    native_touched_keys: &[B256],
     read_state: &ReadState,
 ) -> anyhow::Result<ZiskBlockData> {
     let ctx = &replay_record.block_context;
@@ -351,6 +352,26 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     );
 
     extract_storage_read_proofs(&storage_read_keys, &mut tree, &mut proven_flat_keys, &mut storage_proofs);
+
+    // Witness-discovery completeness: every flat key the native execution
+    // touched (reads and writes, recorded by the sequencer's tree pass) must
+    // have a proof in the witness. The discovery above is heuristic for
+    // upgrade blocks (pre-execution passes, preimage scans); this check makes
+    // it verified — a gap fails generation loudly here instead of surfacing
+    // as a ProvenDB miss at proving time.
+    let mut missing = 0usize;
+    for key in native_touched_keys {
+        if !proven_flat_keys.contains(key) {
+            missing += 1;
+            tracing::error!(block_number, %key, "witness discovery missed a natively-touched key");
+        }
+    }
+    anyhow::ensure!(
+        missing == 0,
+        "witness discovery incomplete for block {block_number}: {missing} of {} \
+         natively-touched keys have no proof in the witness",
+        native_touched_keys.len(),
+    );
 
     // Compute actual tree root from extracted proofs. All proofs were extracted from
     // the same tree version (even if RocksDB was updated concurrently), so they're

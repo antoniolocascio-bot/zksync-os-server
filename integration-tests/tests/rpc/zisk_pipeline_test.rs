@@ -99,9 +99,14 @@ async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
         batches.push((batch_number, block_number, receipt));
     }
 
-    // 3. For each touched batch, fetch the server-assembled BatchInput and
-    //    re-execute it with the ZiSK REVM executor.
+    // 3. For each touched batch — plus batch 1, which contains the genesis
+    //    upgrade block and its mass force-deployments (the upgrade-batch
+    //    fidelity case: every force-deployed account's code-derived property
+    //    fields are recomputed and asserted by the executor) — fetch the
+    //    server-assembled BatchInput and re-execute it with the ZiSK REVM
+    //    executor.
     let mut batch_numbers: Vec<u64> = batches.iter().map(|(batch, _, _)| *batch).collect();
+    batch_numbers.push(1);
     batch_numbers.sort_unstable();
     batch_numbers.dedup();
     for batch_number in &batch_numbers {
