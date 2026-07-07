@@ -92,7 +92,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     // not the BlockContext's mix_hash (which may be 0). The Airbender VM sets
     // the header's mix_hash to the actual prevrandao value.
     let prev_randao = block_output.header.mix_hash;
-    let spec_id = spec_id_from_execution_version(ctx.execution_version);
+    let spec_id = spec_id_from_execution_version(ctx.execution_version)?;
 
     let transactions = convert_all_txs(&replay_record.transactions, block_output);
 
@@ -130,7 +130,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let has_upgrade = transactions.iter().any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. }));
     let mut bytecodes_extra = Vec::new();
     if has_upgrade {
-        pre_create_upgrade_accounts(
+        resolve_upgrade_bytecodes(
             block_output, block_number, read_state, &mut state_view,
             &mut accounts_map, &mut bytecodes_map, &mut bytecodes_out,
             &mut bytecodes_extra,
@@ -195,14 +195,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let max_iterations = if has_upgrade { 5 } else { 1 };
 
     for iteration in 0..max_iterations {
-        // Use post-execution state for upgrade blocks so the preimage DB has all
-        // bytecodes that were deployed during the upgrade. For non-upgrade blocks,
-        // use pre-execution state (block_number - 1).
-        let state_view_for_pre = if has_upgrade {
-            read_state.state_view_at(block_number)?
-        } else {
-            read_state.state_view_at(block_number - 1)?
-        };
+        // Always pre-execute against the true pre-state (like the consistency
+        // checker): post-state accounts/storage flip the upgrade logic's
+        // "already deployed / already initialized" branches and made the
+        // upgrade tx revert. Code minted inside this block is bridged via
+        // `bytecodes_map` (keccak-keyed), resolved from post-state separately.
+        let state_view_for_pre = read_state.state_view_at(block_number - 1)?;
         let (read_keys, extra_addrs, storage_reads, pre_exec_preimages) = pre_execute_for_reads(
             ctx, spec_id, basefee, prev_randao, &transactions, block_output,
             &accounts_map, &storage_prestate, &bytecodes_map,
@@ -300,10 +298,10 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                             bytecodes_out.push((obs_hash, raw_code.to_vec()));
                             entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
                         }
-                        accounts_map.insert(addr, AccountInfo {
-                            nonce: props.nonce, balance: props.balance, code_hash: obs_hash,
-                            code: None, account_id: None,
-                        });
+                        // Deliberately NOT inserted into accounts_map: this
+                        // account only exists post-state, and pre-execution
+                        // must see the true pre-state (see
+                        // resolve_upgrade_bytecodes).
                         // Store full preimage (code+artifacts) under blake2s hash
                         // for deployer precompile.
                         bytecodes_extra.push((pre_hash, full_preimage));
@@ -352,6 +350,15 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     );
 
     extract_storage_read_proofs(&storage_read_keys, &mut tree, &mut proven_flat_keys, &mut storage_proofs);
+
+    // Include proofs for every key the native execution touched, discovered
+    // or not. REVM serves reads on accounts created within the block from its
+    // journal (zeros) without consulting the DB, so native-side bookkeeping
+    // reads (e.g. initializer reads on freshly force-deployed contracts) are
+    // structurally invisible to the pre-execution discovery. The proofs are
+    // tree-authenticated, so adding them grants the witness no extra trust.
+    let native_keys: HashSet<B256> = native_touched_keys.iter().copied().collect();
+    extract_storage_read_proofs(&native_keys, &mut tree, &mut proven_flat_keys, &mut storage_proofs);
 
     // Witness-discovery completeness: every flat key the native execution
     // touched (reads and writes, recorded by the sequencer's tree pass) must
@@ -438,11 +445,17 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     })
 }
 
-pub fn spec_id_from_execution_version(version: u32) -> ZkSpecId {
-    match ExecutionVersion::try_from(version) {
-        Ok(ExecutionVersion::V1 | ExecutionVersion::V2 | ExecutionVersion::V3) => ZkSpecId::AtlasV1,
-        _ => ZkSpecId::AtlasV2,
-    }
+/// REVM spec for a ZKsync OS execution version, shared with the consistency
+/// checker so both REVM consumers always execute with identical semantics.
+/// Errors on unknown versions instead of guessing: a silently wrong spec made
+/// the whole second-proof lane diverge from native (upgrade-tx pre-execution
+/// reverts, guest receipt/gas drift) when V6 chains ran with `AtlasV2`.
+pub fn spec_id_from_execution_version(version: u32) -> anyhow::Result<ZkSpecId> {
+    let execution_version = ExecutionVersion::try_from(version)
+        .map_err(|e| anyhow::anyhow!("unknown execution version {version}: {e}"))?;
+    zksync_os_revm_consistency_checker::helpers::zk_spec_version(execution_version).ok_or_else(
+        || anyhow::anyhow!("no REVM spec mapping for execution version {execution_version:?}"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1230,14 +1243,13 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
             return Ok(bytecode.clone());
         }
         // Fallback: try preimage DB via state_view (like the server's OverriddenStateView).
-        if code_hash != KECCAK_EMPTY && code_hash != B256::ZERO {
-            if let Some(preimage) = self.state_view.borrow_mut().get_preimage(code_hash)
-                && !preimage.is_empty()
-            {
-                self.resolved_preimages.borrow_mut().push((code_hash, preimage.clone()));
-                return Ok(Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
-            }
-            tracing::debug!(%code_hash, "TrackingDB code_by_hash miss");
+        if code_hash != KECCAK_EMPTY
+            && code_hash != B256::ZERO
+            && let Some(preimage) = self.state_view.borrow_mut().get_preimage(code_hash)
+            && !preimage.is_empty()
+        {
+            self.resolved_preimages.borrow_mut().push((code_hash, preimage.clone()));
+            return Ok(Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
         }
         Ok(Bytecode::default())
     }
@@ -1357,14 +1369,15 @@ fn run_pre_execution<DB: DatabaseRef>(
     }
 }
 
-/// Pre-create accounts that are force-deployed during upgrade transactions.
+/// Resolve the bytecodes minted by an upgrade block's force deployments so
+/// the pre-execution and the guest can look them up by their keccak256 hash.
 ///
-/// The ComplexUpgrader proxy at 0x800f delegates to an implementation whose address
-/// is in the ERC1967 storage slot. That implementation doesn't exist yet at
-/// block_number-1 (it's force-deployed in the current block). We must pre-create
-/// it from the post-execution state so REVM can execute the upgrade tx.
+/// Accounts are deliberately NOT materialized from post-state: the upgrade
+/// logic branches on whether its targets already exist (deploy/initialize vs
+/// skip), so pre-execution must see the true pre-state — mirroring the
+/// consistency checker, which only preloads a keccak-keyed code cache.
 #[allow(clippy::too_many_arguments)]
-fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
+fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
     block_output: &BlockOutput,
     block_number: u64,
     read_state: &ReadState,
@@ -1374,34 +1387,26 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
     bytecodes_out: &mut Vec<(B256, Vec<u8>)>,
     extra_bytecodes: &mut Vec<(B256, Vec<u8>)>,
 ) -> anyhow::Result<()> {
-    // Pre-create all addresses from storage writes and account diffs.
-    for write in &block_output.storage_writes {
-        accounts_map
-            .entry(write.account)
-            .or_insert_with(|| AccountInfo {
-                nonce: 0, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
-                code: None, account_id: None,
-            });
-    }
-    for diff in &block_output.account_diffs {
-        accounts_map
-            .entry(diff.address)
-            .or_insert_with(|| AccountInfo {
-                nonce: 1, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
-                code: None, account_id: None,
-            });
-    }
-
-    // Resolve ALL accounts with missing bytecodes from post-execution state.
-    // During genesis/upgrade, system contracts are force-deployed. Their bytecodes
-    // exist in force_preimages but the pre-execution state has observable_bytecode_hash=0.
-    // Read the post-execution state to get the correct bytecode hashes.
+    // Resolve bytecodes minted by the force deployments from post-execution
+    // state, WITHOUT materializing the accounts: pre-execution must see the
+    // true pre-state (a force-deploy target that already "exists" flips the
+    // upgrade logic's deployed/initialized branches — the checker proved the
+    // upgrade executes correctly against pristine pre-state plus a
+    // keccak-keyed code cache).
     {
         let mut state_after = read_state.state_view_at(block_number)?;
-        let addrs_needing_code: Vec<Address> = accounts_map
+        let addrs_needing_code: Vec<Address> = block_output
+            .storage_writes
             .iter()
-            .filter(|(_, info)| info.code_hash == KECCAK_EMPTY || info.code_hash == B256::ZERO)
-            .map(|(addr, _)| *addr)
+            .map(|w| w.account)
+            .chain(block_output.account_diffs.iter().map(|d| d.address))
+            .filter(|addr| {
+                accounts_map
+                    .get(addr)
+                    .is_none_or(|info| info.code_hash == KECCAK_EMPTY || info.code_hash == B256::ZERO)
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .collect();
         tracing::info!(count = addrs_needing_code.len(), "resolving post-execution bytecodes");
         for addr in addrs_needing_code {
@@ -1439,10 +1444,6 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                         extra_bytecodes.push((pre_hash, padded_code_with_artifacts));
                     }
                 }
-                accounts_map.insert(addr, AccountInfo {
-                    nonce: props.nonce, balance: props.balance, code_hash: effective,
-                    code: None, account_id: None,
-                });
                 tracing::info!(
                     addr = %addr, code_hash = %effective, code_len = bytecodes_map.get(&effective).map(|b| b.len()).unwrap_or(0),
                     "resolved post-execution bytecode for force-deployed account"
@@ -1586,11 +1587,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
         let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
         let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
         let effective = if obs_hash.is_zero() { KECCAK_EMPTY } else { obs_hash };
-        tracing::info!(address = %impl_addr, code_hash = %effective, "pre-creating upgrade implementation");
-        accounts_map.insert(impl_addr, AccountInfo {
-            nonce: props.nonce, balance: props.balance, code_hash: effective,
-            code: None, account_id: None,
-        });
+        tracing::info!(address = %impl_addr, code_hash = %effective, "resolving upgrade implementation bytecode");
         if !pre_hash.is_zero()
             && let Some(padded_code) = state_after.get_preimage(pre_hash)
         {
@@ -1611,12 +1608,6 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                 }
             }
         }
-    } else {
-        tracing::info!(address = %impl_addr, "pre-creating empty upgrade implementation");
-        accounts_map.insert(impl_addr, AccountInfo {
-            nonce: 1, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
-            code: None, account_id: None,
-        });
     }
     Ok(())
 }

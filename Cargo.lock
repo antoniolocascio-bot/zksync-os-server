@@ -4955,7 +4955,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9244,7 +9244,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11694,7 +11694,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11762,7 +11762,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13141,7 +13141,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -15583,7 +15583,7 @@ dependencies = [
 [[package]]
 name = "zksync-os-zisk-lib"
 version = "0.1.0"
-source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#3637018a81fb2d92436a7f54822d286237d42a1b"
+source = "git+https://github.com/antoniolocascio-bot/zksync-os-zisk?branch=dev#e282629ae16b8e17fc63898410d2f02a9b802a1a"
 dependencies = [
  "alloy-consensus 1.7.3",
  "alloy-eips 1.7.3",

@@ -200,31 +200,15 @@ async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
     //    force-deployments (the upgrade-batch fidelity case: every
     //    force-deployed account's code-derived property fields are recomputed
     //    and asserted by the executor).
-    match try_peek_zisk_data(&prover_api_url, 1).await? {
-        Some(bytes) => {
-            let (output, commitment) = executor::execute_and_commit_from_bincode(&bytes)
-                .map_err(|e| anyhow::anyhow!("ZiSK executor failed for batch 1: {e}"))?;
-            assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
-            assert!(
-                !output.block_results.is_empty(),
-                "batch 1 produced no block results"
-            );
-            tracing::info!(%commitment, "ZiSK executor reproduced the genesis-upgrade batch");
-        }
-        None => {
-            // KNOWN GAP (plan task 1.3 / POC_DEFECTS.md #10): upgrade-tx
-            // pre-execution reverts under the rebased Atlas handler, so
-            // witness discovery for the genesis-upgrade block fails its
-            // completeness check and no ZiSK input is generated. Once
-            // upgrade-batch parity is restored this branch stops firing and
-            // batch 1 is asserted again.
-            tracing::warn!(
-                "KNOWN GAP: no ZiSK input for batch 1 (genesis upgrade) — \
-                 upgrade-batch discovery is open under plan task 1.3; \
-                 skipping its assertions"
-            );
-        }
-    }
+    let zisk_bytes = peek_zisk_data(&prover_api_url, 1).await?;
+    let (output, commitment) = executor::execute_and_commit_from_bincode(&zisk_bytes)
+        .map_err(|e| anyhow::anyhow!("ZiSK executor failed for batch 1: {e}"))?;
+    assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
+    assert!(
+        !output.block_results.is_empty(),
+        "batch 1 produced no block results"
+    );
+    tracing::info!(%commitment, "ZiSK executor reproduced the genesis-upgrade batch");
 
     Ok(())
 }
@@ -289,13 +273,10 @@ async fn zisk_input_regenerated_after_restart() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // Every committed-but-unproven batch past genesis must reappear with a
-    // valid, executable BatchInput; committed batches are recreated with
-    // their original numbers. (Batch 1, the genesis-upgrade batch, is not
-    // asserted here: its ZiSK input generation currently fails loudly —
-    // upgrade-tx pre-execution parity under the new Atlas is open under plan
-    // task 1.3, and the pipeline e2e owns that coverage.)
-    for batch_number in 2..=committed_state.last_committed_batch {
+    // Every committed-but-unproven batch — the genesis-upgrade batch included
+    // — must reappear with a valid, executable BatchInput; committed batches
+    // are recreated with their original numbers.
+    for batch_number in 1..=committed_state.last_committed_batch {
         let zisk_bytes = peek_zisk_data(&prover_api_url, batch_number).await?;
         let (output, commitment) = executor::execute_and_commit_from_bincode(&zisk_bytes)
             .map_err(|e| {

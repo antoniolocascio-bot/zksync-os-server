@@ -344,7 +344,7 @@ fn assemble_zisk_batch(
 
     let spec_id = match crate::prover_input_generator::zisk_input_builder::spec_id_from_execution_version(
         first_ctx.execution_version,
-    ) {
+    )? {
         zksync_os_revm::ZkSpecId::AtlasV1 => 0u8,
         zksync_os_revm::ZkSpecId::AtlasV2 => 1u8,
         zksync_os_revm::ZkSpecId::AtlasV3 => 2u8,
