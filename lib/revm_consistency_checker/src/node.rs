@@ -270,16 +270,84 @@ where
 
                 match revm_txs {
                     Ok(txs) => {
-                        // Commit after each tx
-                        for tx in txs {
-                            evm.transact_commit(tx)?;
-                        }
+                        // Execute + compare inside catch_unwind: a checker-side
+                        // panic (often itself caused by divergent state) must
+                        // surface as a divergence signal, not tear down the node.
+                        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> anyhow::Result<CompareReport> {
+                                let mut log_mismatches = Vec::new();
+                                for (tx_index, (tx, tx_output_raw)) in
+                                    txs.into_iter().zip(&block_output.tx_results).enumerate()
+                                {
+                                    let tx_output = tx_output_raw.as_ref().expect(
+                                        "block_output of a sealed block must not contain invalid transactions",
+                                    );
+                                    evm.0.ctx.chain.set_tx_number(tx_index as u16);
+                                    let result = evm.transact_commit(tx)?;
 
-                        let compare_report = CompareReport::build(
-                            evm.0.db_mut(),
-                            &block_output.storage_writes,
-                            &block_output.account_diffs,
-                        )?;
+                                    // Event logs. Natively-failed txs are replayed
+                                    // as forced failures which execute nothing, so
+                                    // both sides are empty there; for successful
+                                    // txs this compares real output.
+                                    if result.logs() != tx_output.logs.as_slice() {
+                                        log_mismatches.push(format!(
+                                            "tx {tx_index}: event logs diverge (revm {} vs native {})",
+                                            result.logs().len(),
+                                            tx_output.logs.len(),
+                                        ));
+                                    }
+
+                                    // L2→L1 logs, including the bootloader result
+                                    // log for L1→L2 transactions. Preimages are not
+                                    // compared: they are hashed into the log's value.
+                                    let revm_l2_to_l1 = evm.0.ctx.chain.take_logs();
+                                    let native_l2_to_l1 = &tx_output.l2_to_l1_logs;
+                                    let l2_to_l1_match = revm_l2_to_l1.len()
+                                        == native_l2_to_l1.len()
+                                        && revm_l2_to_l1.iter().zip(native_l2_to_l1).all(
+                                            |(r, n)| {
+                                                r.l2_shard_id == n.log.l2_shard_id
+                                                    && r.is_service == n.log.is_service
+                                                    && r.tx_number_in_block
+                                                        == n.log.tx_number_in_block
+                                                    && r.sender == n.log.sender
+                                                    && r.key == n.log.key
+                                                    && r.value == n.log.value
+                                            },
+                                        );
+                                    if !l2_to_l1_match {
+                                        log_mismatches.push(format!(
+                                            "tx {tx_index}: L2→L1 logs diverge (revm {} vs native {})",
+                                            revm_l2_to_l1.len(),
+                                            native_l2_to_l1.len(),
+                                        ));
+                                    }
+                                }
+
+                                let mut report = CompareReport::build(
+                                    evm.0.db_mut(),
+                                    &block_output.storage_writes,
+                                    &block_output.account_diffs,
+                                )?;
+                                report.logs = log_mismatches;
+                                Ok(report)
+                            },
+                        ));
+
+                        let compare_report = match checked {
+                            Ok(Ok(report)) => report,
+                            Ok(Err(err)) => CompareReport::from_failure(format!(
+                                "checker execution failed: {err:#}"
+                            )),
+                            Err(panic) => {
+                                let msg = panic
+                                    .downcast_ref::<&str>()
+                                    .map(|s| (*s).to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                                CompareReport::from_failure(format!("checker panicked: {msg}"))
+                            }
+                        };
                         self.handle_report(block_output, &replay_record, &compare_report)?;
                     }
                     Err(err) => {
