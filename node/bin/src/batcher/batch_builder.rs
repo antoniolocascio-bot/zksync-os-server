@@ -351,6 +351,7 @@ fn assemble_zisk_batch(
     };
 
     let batch_input = BatchInput {
+        version: zksync_os_zisk_lib::types::BATCH_INPUT_VERSION,
         chain_id: first_ctx.chain_id,
         spec_id,
         protocol_version_minor: first_replay.protocol_version.minor as u32,
