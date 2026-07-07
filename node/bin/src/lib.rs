@@ -1264,6 +1264,18 @@ async fn run_main_node_pipeline(
         zisk_data_cache.clone(),
     );
 
+    // Until a multi-batch ZiSK guest exists, one SNARK covers exactly one
+    // batch: a wider range could not be paired with a ZiSK proof and would
+    // either stall (require_multi_proof) or silently degrade to
+    // Airbender-only. Enforce the constraint at startup instead.
+    if zisk_data_cache.is_some() {
+        assert_eq!(
+            config.prover_api_config.max_fris_per_snark, 1,
+            "second_proof_system requires prover_api.max_fris_per_snark = 1: multi-batch \
+             SNARK ranges cannot be covered by the single-batch ZiSK guest",
+        );
+    }
+
     let (snark_proving_step, snark_job_manager, zisk_job_manager) = if zisk_data_cache.is_some() {
         SnarkProvingPipelineStep::new_with_zisk_cache(
             config.prover_api_config.max_fris_per_snark,

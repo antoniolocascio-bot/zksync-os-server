@@ -30,6 +30,7 @@ pub(crate) fn disable_prover_input_generation(config: &mut Config) {
         && config.prover_api_config.fake_snark_provers.enabled
     {
         config.prover_input_generator_config.enable_input_generation = false;
+        config.prover_input_generator_config.second_proof_system = false;
     }
 }
 
@@ -48,6 +49,12 @@ pub(crate) async fn build_node_config(
     config.rpc_config.send_raw_transaction_sync_timeout = Duration::from_secs(10);
     config.prover_api_config.fake_fri_provers.enabled = !with_proofs;
     config.prover_api_config.fake_snark_provers.enabled = !with_proofs;
+    // ZiSK second-proof lane: whenever prover input generation runs, batch
+    // inputs are assembled and served via /ZiSK/{batch}/peek (exercised by
+    // zisk_pipeline_test). The single-batch ZiSK guest requires one SNARK per
+    // batch; the server enforces this pairing at startup.
+    config.prover_input_generator_config.second_proof_system = true;
+    config.prover_api_config.max_fris_per_snark = 1;
     config.batch_verification_config.server_enabled = false;
     config.batch_verification_config.client_enabled = false;
     config.batch_verification_config.threshold = 1;

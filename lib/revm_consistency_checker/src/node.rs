@@ -18,6 +18,7 @@ use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
 use zksync_os_revm::{DefaultZk, ZkBuilder, ZkContext, ZkSpecId};
 use zksync_os_sequencer::model::blocks::AppliedBlock;
+use zksync_os_interface::traits::PreimageSource;
 use zksync_os_storage_api::{ReadStateHistory, ReplayRecord, ViewState};
 use zksync_os_types::{BlockOutput, ExecutionVersion, SYSTEM_CONTEXT_ADDRESS};
 
@@ -202,6 +203,35 @@ where
                 // For each block, we create an in-memory cache database to accumulate transaction state changes separately
                 let state_provider =
                     RevmStateProvider::new(state_view, block_hashes, state_block_number);
+
+                // Force deployments (upgrade/genesis blocks) mint code inside
+                // this very block; the deployer precompile looks it up by its
+                // observable keccak256 hash, which the pre-state view cannot
+                // resolve. Preload it from the block's own outputs: the
+                // post-state account carries both hashes and the unpadded
+                // length, and the post-state preimage store has the blob.
+                let mut post_state_view = self
+                    .state
+                    .state_view_at(replay_record.block_context.block_number)
+                    .map_err(anyhow::Error::from)?;
+                for diff in &block_output.account_diffs {
+                    let Some(props) = post_state_view.get_account(diff.address) else {
+                        continue;
+                    };
+                    if props.bytecode_hash.is_zero() || props.observable_bytecode_hash.is_zero() {
+                        continue;
+                    }
+                    let blake2s_hash = B256::from(props.bytecode_hash.as_u8_array());
+                    let Some(padded) = post_state_view.get_preimage(blake2s_hash) else {
+                        continue;
+                    };
+                    let raw = crate::helpers::get_unpadded_code(&padded, &props);
+                    state_provider.preload_code(
+                        B256::from(props.observable_bytecode_hash.as_u8_array()),
+                        raw,
+                    );
+                }
+
                 let cache_db = CacheDB::new(state_provider);
                 let mut evm = ZkContext::<EmptyDB>::default()
                     .with_db(cache_db)

@@ -42,6 +42,20 @@ where
             keccak_code_cache: RefCell::new(HashMap::new()),
         }
     }
+
+    /// Preload a bytecode into the keccak256-keyed cache.
+    ///
+    /// Code minted in the very block being checked (force deployments in
+    /// upgrade/genesis blocks) is looked up by the deployer precompile via
+    /// its observable keccak256 hash, but the provider's pre-state view can
+    /// never have cached it through an account read — the account does not
+    /// exist yet.
+    pub fn preload_code(&self, observable_code_hash: B256, code: Bytecode) {
+        self.keccak_code_cache
+            .borrow_mut()
+            .insert(observable_code_hash, code);
+    }
+
 }
 
 #[derive(Debug, thiserror::Error)]
