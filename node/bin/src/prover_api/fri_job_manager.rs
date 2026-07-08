@@ -268,12 +268,12 @@ impl FriJobManager {
                 )
             }
             ProvingVersion::ZiskV1 => {
-                use crate::prover_api::zisk_proof_verifier;
-                zisk_proof_verifier::verify_zisk_proof(
-                    batch_metadata.previous_stored_batch_info.state_commitment,
-                    batch_metadata.batch_info.clone().into_stored(),
-                    proof_bytes,
-                )
+                // ZiSK proofs go through `/ZiSK/submit`, where the batch
+                // public input is verified; the FRI channel has no way to
+                // check them and must not accept them.
+                Err(SubmitError::Other(
+                    "ZiSK proofs are submitted via /ZiSK/submit, not /FRI/submit".into(),
+                ))
             }
         };
 

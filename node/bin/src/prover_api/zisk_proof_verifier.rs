@@ -17,7 +17,6 @@ use zksync_os_contract_interface::models::StoredBatchInfo;
 use zksync_os_zisk_lib::commitment as zisk_commitment;
 
 use crate::batcher::batch_builder::ZiskChainConfig;
-use crate::prover_api::fri_job_manager::SubmitError;
 
 /// The batch public input the ZiSK guest commits to, computed from server-side
 /// batch metadata with the guest lib's own hash functions.
@@ -38,28 +37,6 @@ pub fn expected_zisk_public_input(
         &chain_config_hash,
         &stored_batch_info.commitment,
     )
-}
-
-/// Verify a ZiSK FRI proof submitted via `/FRI/submit`.
-pub fn verify_zisk_proof(
-    _previous_state_commitment: B256,
-    stored_batch_info: StoredBatchInfo,
-    proof_bytes: &[u8],
-) -> Result<(), SubmitError> {
-    if proof_bytes.is_empty() {
-        return Err(SubmitError::Other("ZiSK proof bytes are empty".into()));
-    }
-
-    // The binding check against the batch public input happens at SNARK
-    // submission (`ZiskJobManager::submit_proof`), where the chain config
-    // needed for the expected value is available.
-    tracing::info!(
-        batch_number = stored_batch_info.batch_number,
-        proof_len = proof_bytes.len(),
-        "ZiSK FRI proof accepted"
-    );
-
-    Ok(())
 }
 
 /// Check that `public_values[32..64]` matches the expected batch public input.

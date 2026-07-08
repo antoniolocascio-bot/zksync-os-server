@@ -77,28 +77,16 @@ async fn peek_zisk_data_once(
     ))
 }
 
-/// Poll the prover API until the batch's ZiSK data is available; None on timeout.
-async fn try_peek_zisk_data(
-    prover_api_url: &str,
-    batch_number: u64,
-) -> anyhow::Result<Option<Vec<u8>>> {
+/// Poll the prover API until the batch's ZiSK data is available.
+async fn peek_zisk_data(prover_api_url: &str, batch_number: u64) -> anyhow::Result<Vec<u8>> {
     let client = reqwest::Client::new();
     for _ in 0..240 {
         if let Some(bytes) = peek_zisk_data_once(&client, prover_api_url, batch_number).await? {
-            return Ok(Some(bytes));
+            return Ok(bytes);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    Ok(None)
-}
-
-/// Poll the prover API until the batch's ZiSK data is available.
-async fn peek_zisk_data(prover_api_url: &str, batch_number: u64) -> anyhow::Result<Vec<u8>> {
-    try_peek_zisk_data(prover_api_url, batch_number)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!("timed out waiting for ZiSK data of batch {batch_number}")
-        })
+    anyhow::bail!("timed out waiting for ZiSK data of batch {batch_number}")
 }
 
 /// Scan peekable batches until one's re-executed input contains
