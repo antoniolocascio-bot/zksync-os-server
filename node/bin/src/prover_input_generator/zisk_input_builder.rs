@@ -259,13 +259,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                     if !preimage_hash.is_zero()
                         && !observable_hash.is_zero()
                         && let Some(padded_code) = state_view_reload.get_preimage(preimage_hash)
-                    {
-                        if push_code_from_blob(
+                        && push_code_from_blob(
                             observable_hash, &padded_code, props.unpadded_code_len as usize,
                             &mut bytecodes_map, &mut bytecodes_out,
-                        ) {
-                            resolved = true;
-                        }
+                        )
+                    {
+                        resolved = true;
                     }
                 }
                 // If pre-execution state had observable_hash=0, try post-execution state
@@ -528,13 +527,13 @@ fn load_accounts_and_bytecodes<S: ViewState>(
             // padding using unpadded_code_len from AccountProperties.
             if !preimage_hash.is_zero() {
                 if !observable_hash.is_zero() {
-                    if let Some(padded_code) = state_view.get_preimage(preimage_hash) {
-                        if seen_hashes.insert(preimage_hash) {
-                            push_code_from_blob(
-                                observable_hash, &padded_code, props.unpadded_code_len as usize,
-                                &mut bytecodes_map, &mut bytecodes_out,
-                            );
-                        }
+                    if let Some(padded_code) = state_view.get_preimage(preimage_hash)
+                        && seen_hashes.insert(preimage_hash)
+                    {
+                        push_code_from_blob(
+                            observable_hash, &padded_code, props.unpadded_code_len as usize,
+                            &mut bytecodes_map, &mut bytecodes_out,
+                        );
                     }
                 } else if let Some(code) = force_preimage_map.get(&preimage_hash) {
                     // Account has bytecode_hash (blake2s) but no observable_bytecode_hash (keccak).

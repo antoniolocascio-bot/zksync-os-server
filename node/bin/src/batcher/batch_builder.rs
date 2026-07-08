@@ -93,7 +93,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         let mut state_after = read_state.state_view_at(last_block_number)?;
         let mut seen = std::collections::HashSet::new();
         let mut preimages = Vec::new();
-        let mut add = |addr: Address,
+        let add = |addr: Address,
                        state_after: &mut _,
                        seen: &mut std::collections::HashSet<Address>,
                        preimages: &mut Vec<(Address, Vec<u8>)>| {
