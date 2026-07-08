@@ -33,7 +33,21 @@ impl SnarkProvingPipelineStep {
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
     ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
-        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None, false, None, None)
+        Self::new_with_zisk_cache(
+            max_fris_per_snark,
+            last_proved_batch_number,
+            assignment_timeout,
+            max_assigned_batch_range,
+            None,
+            false,
+            None,
+            None,
+            0,
+            crate::batcher::batch_builder::ZiskChainConfig {
+                fri_proof_verification_enabled: false,
+                max_tx_gas_limit: 0,
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -46,6 +60,8 @@ impl SnarkProvingPipelineStep {
         require_multi_proof: bool,
         multi_proof_wait_timeout: Option<Duration>,
         zisk_program_vk: Option<alloy::primitives::B256>,
+        chain_id: u64,
+        zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig,
     ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
@@ -62,6 +78,8 @@ impl SnarkProvingPipelineStep {
                 proof_commands_sender,
                 assignment_timeout,
                 zisk_program_vk,
+                chain_id,
+                zisk_chain_config,
             ));
 
             // Periodic gauge refresh: queue/cache ages must advance while the

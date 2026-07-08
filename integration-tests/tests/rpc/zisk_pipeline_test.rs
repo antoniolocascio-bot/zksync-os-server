@@ -35,6 +35,20 @@ const V31_TO_GATEWAY: TestCase = TestCase {
     settlement_layer: SettlementLayer::Gateway,
 };
 
+/// Equivalence teeth (plan 6.5/6.6): the REVM consistency checker reverts on
+/// any native-vs-REVM divergence, and every sealed batch's ZiSK input is
+/// re-executed in-process with the guest executor and checked against the
+/// expected batch public input — both failing the node (and the test) loudly.
+fn enable_equivalence_checks(config: &mut zksync_os_server::config::Config) {
+    config
+        .sequencer_config
+        .revm_consistency_checker_revert_on_divergence = true;
+    config.prover_input_generator_config.zisk_shadow_execution = true;
+    config
+        .prover_input_generator_config
+        .halt_on_zisk_commitment_mismatch = true;
+}
+
 #[derive(serde::Deserialize)]
 struct ZiskBatchDataPayload {
     batch_number: u64,
@@ -144,6 +158,7 @@ async fn zisk_pipeline_e2e_impl(case: TestCase) -> anyhow::Result<()> {
     // the job map so /ZiSK/{batch}/peek can serve them.
     config.prover_api_config.fake_fri_provers.enabled = false;
     config.prover_api_config.fake_snark_provers.enabled = false;
+    enable_equivalence_checks(&mut config);
     let tester = env.launch(config).await?;
 
     if !tester
@@ -403,6 +418,7 @@ async fn zisk_multiblock_batch_hashes_impl(case: TestCase) -> anyhow::Result<()>
     // per iteration land in two blocks that share a batch even when a loaded
     // machine stretches the receipt waits past the default 1s test window.
     config.batcher_config.batch_timeout = Duration::from_secs(5);
+    enable_equivalence_checks(&mut config);
     let tester = env.launch(config).await?;
 
     if !tester

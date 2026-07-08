@@ -1286,6 +1286,13 @@ async fn run_main_node_pipeline(
             config.prover_input_generator_config.multi_proof_verifier,
             config.prover_api_config.multi_proof_wait_timeout,
             config.prover_api_config.zisk_program_vk,
+            chain_id,
+            crate::batcher::batch_builder::ZiskChainConfig {
+                fri_proof_verification_enabled: config
+                    .genesis_config
+                    .fri_proof_verification_enabled,
+                max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+            },
         )
     } else {
         SnarkProvingPipelineStep::new(
@@ -1413,6 +1420,10 @@ async fn run_main_node_pipeline(
                     .fri_proof_verification_enabled,
                 max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
             },
+            zisk_shadow_execution: config.prover_input_generator_config.zisk_shadow_execution,
+            halt_on_shadow_mismatch: config
+                .prover_input_generator_config
+                .halt_on_zisk_commitment_mismatch,
         })
         .pipe(BatchVerificationPipelineStep::new(
             config.batch_verification_config.clone().into(),
@@ -1608,6 +1619,10 @@ async fn run_en_pipeline(
                         .fri_proof_verification_enabled,
                     max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
                 },
+                zisk_shadow_execution: config.prover_input_generator_config.zisk_shadow_execution,
+                halt_on_shadow_mismatch: config
+                    .prover_input_generator_config
+                    .halt_on_zisk_commitment_mismatch,
             })
             .pipe(NoOpSink::new());
         let components = pipeline.components();

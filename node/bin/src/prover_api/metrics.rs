@@ -173,6 +173,10 @@ pub struct ZiskLaneMetrics {
     /// ZiSK proof submission.
     #[metrics(unit = Unit::Seconds, buckets = Buckets::LATENCIES)]
     pub time_to_submit: Histogram<Duration>,
+    /// Wall-clock of the in-process guest re-execution per batch when
+    /// `zisk_shadow_execution` is enabled.
+    #[metrics(unit = Unit::Seconds, buckets = Buckets::LATENCIES)]
+    pub shadow_execution_time: Histogram<Duration>,
 }
 
 #[vise::register]

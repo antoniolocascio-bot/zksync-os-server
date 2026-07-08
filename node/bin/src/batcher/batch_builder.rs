@@ -35,6 +35,8 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     sl_chain_id: u64,
     read_state: &ReadState,
     zisk_chain_config: ZiskChainConfig,
+    zisk_shadow_execution: bool,
+    halt_on_shadow_mismatch: bool,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<BatchForSigning<ProverInput>> {
     let block_number_from = blocks.first().unwrap().1.block_context.block_number;
@@ -119,6 +121,17 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         batch_tree_start,
         account_preimages_after,
     )?;
+
+    if zisk_shadow_execution && let Some(zisk_data) = batch_prover_input.zisk_data() {
+        shadow_execute_zisk_batch(
+            zisk_data,
+            &prev_batch_info.state_commitment,
+            &batch_info,
+            chain_id,
+            zisk_chain_config,
+            halt_on_shadow_mismatch,
+        )?;
+    }
 
     // Sanity check: all blocks in the batch should have the same protocol version
     for (_, replay_record, _, _) in blocks.iter().skip(1) {
@@ -494,4 +507,93 @@ fn build_batch_tree_update(
             leaf_count,
         ),
     ))
+}
+
+/// Equivalence self-check (`zisk_shadow_execution`): re-execute the batch's
+/// assembled `BatchInput` in-process with the guest executor and compare the
+/// computed batch public input against the expected one. The full guest
+/// pipeline — witness, ProvenDB, tree update, header commitments, PI — runs
+/// per batch without proving. A mismatch is the headline divergence signal;
+/// under `halt_on_shadow_mismatch` it fails batch sealing loudly.
+fn shadow_execute_zisk_batch(
+    zisk_data: &[u8],
+    previous_state_commitment: &alloy::primitives::B256,
+    batch_info: &PendingBatchInfo,
+    chain_id: u64,
+    zisk_chain_config: ZiskChainConfig,
+    halt_on_shadow_mismatch: bool,
+) -> anyhow::Result<()> {
+    use crate::prover_api::metrics::ZISK_LANE_METRICS;
+
+    let batch_number = batch_info.commit_info.batch_number;
+    let stored = batch_info.clone().into_stored();
+    let expected = crate::prover_api::zisk_proof_verifier::expected_zisk_public_input(
+        previous_state_commitment,
+        &stored,
+        chain_id,
+        zisk_chain_config,
+    );
+
+    let started = std::time::Instant::now();
+    // The guest executor asserts internally (header hashes, tree roots, log
+    // consistency); a panic is a divergence report, not a node crash.
+    let result = std::panic::catch_unwind(|| {
+        zksync_os_zisk_lib::executor::execute_and_commit_from_bincode(zisk_data)
+    });
+    let elapsed = started.elapsed();
+    ZISK_LANE_METRICS.shadow_execution_time.observe(elapsed);
+
+    let failure = match result {
+        Ok(Ok((_, commitment))) if commitment == expected => {
+            tracing::info!(
+                batch_number,
+                %commitment,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "ZiSK shadow execution matched the expected batch public input"
+            );
+            return Ok(());
+        }
+        Ok(Ok((_, commitment))) => {
+            // Component-level diagnostics: re-run the debug variant to see
+            // which PI word drifted (state commitments, chain config, batch
+            // output hash).
+            if let Ok(input) = bincode1::deserialize::<zksync_os_zisk_lib::types::BatchInput>(zisk_data) {
+                let (_, _, g_before, g_after, g_batch) =
+                    zksync_os_zisk_lib::executor::execute_and_commit_debug(&input);
+                let chain_config_hash = zksync_os_zisk_lib::commitment::chain_config_hash(
+                    chain_id,
+                    zisk_chain_config.fri_proof_verification_enabled,
+                    zisk_chain_config.max_tx_gas_limit,
+                );
+                tracing::error!(
+                    batch_number,
+                    guest_state_before = %g_before,
+                    server_state_before = %previous_state_commitment,
+                    guest_state_after = %g_after,
+                    server_state_after = %stored.state_commitment,
+                    guest_batch_output_hash = %g_batch,
+                    server_batch_commitment = %stored.commitment,
+                    %chain_config_hash,
+                    "ZiSK shadow execution PI components"
+                );
+            }
+            format!("guest computed {commitment}, expected {expected}")
+        }
+        Ok(Err(e)) => format!("guest execution failed: {e}"),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            format!("guest execution panicked: {msg}")
+        }
+    };
+
+    ZISK_LANE_METRICS.commitment_mismatches.inc();
+    tracing::error!(batch_number, "ZiSK shadow execution divergence: {failure}");
+    if halt_on_shadow_mismatch {
+        anyhow::bail!("ZiSK shadow execution divergence on batch {batch_number}: {failure}");
+    }
+    Ok(())
 }

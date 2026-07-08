@@ -56,6 +56,12 @@ pub struct Batcher<ReadState> {
     pub merkle_tree: MerkleTree<RocksDBWrapper>,
     /// Chain-config parameters committed into the ZiSK batch public input.
     pub zisk_chain_config: batch_builder::ZiskChainConfig,
+    /// Re-execute every sealed batch's ZiSK input in-process and compare the
+    /// batch public input (equivalence self-check; see config docs).
+    pub zisk_shadow_execution: bool,
+    /// Fail batch sealing on a shadow-execution divergence (shares the
+    /// `halt_on_zisk_commitment_mismatch` switch).
+    pub halt_on_shadow_mismatch: bool,
 }
 
 #[async_trait]
@@ -345,6 +351,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             self.sl_chain_id,
             &self.read_state,
             self.zisk_chain_config,
+            self.zisk_shadow_execution,
+            self.halt_on_shadow_mismatch,
             batch_tree_start,
         )?;
         Ok(Some(batch_envelope))
@@ -426,6 +434,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             self.sl_chain_id,
             &self.read_state,
             self.zisk_chain_config,
+            self.zisk_shadow_execution,
+            self.halt_on_shadow_mismatch,
             batch_tree_start,
         )?;
 

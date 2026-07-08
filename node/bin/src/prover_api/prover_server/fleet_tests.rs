@@ -74,7 +74,16 @@ async fn zisk_fleet_pick_and_reassignment_over_http() {
         Duration::from_secs(60),
         10,
     ));
-    let zisk_job_manager = Arc::new(ZiskJobManager::new(prove_tx, ASSIGNMENT_TIMEOUT, None));
+    let zisk_job_manager = Arc::new(ZiskJobManager::new(
+        prove_tx,
+        ASSIGNMENT_TIMEOUT,
+        None,
+        270,
+        crate::batcher::batch_builder::ZiskChainConfig {
+            fri_proof_verification_enabled: false,
+            max_tx_gas_limit: 1 << 24,
+        },
+    ));
 
     let zisk_data = vec![0xAB; 64];
     zisk_job_manager

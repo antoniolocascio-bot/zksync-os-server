@@ -1518,9 +1518,19 @@ pub struct ProverInputGeneratorConfig {
     /// — a security event). Default: continue — the mismatch is logged and
     /// counted (`zisk_lane_commitment_mismatches`) and the job is retried, so
     /// a faulty prover cannot stall the chain. The switch is config, not a
-    /// deploy.
+    /// deploy. Also applies to `zisk_shadow_execution` mismatches.
     #[config(default_t = false)]
     pub halt_on_zisk_commitment_mismatch: bool,
+
+    /// When true, every sealed batch's ZiSK `BatchInput` is re-executed
+    /// in-process with the guest executor (CPU-only, no proving) and the
+    /// computed batch public input is compared against the expected one — the
+    /// full guest pipeline as an equivalence check per batch. A mismatch is
+    /// counted (`zisk_lane_commitment_mismatches`) and, under
+    /// `halt_on_zisk_commitment_mismatch`, fails batch sealing loudly.
+    /// Intended for equivalence testing and shadow deployments.
+    #[config(default_t = false)]
+    pub zisk_shadow_execution: bool,
 
 }
 
