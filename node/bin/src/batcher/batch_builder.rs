@@ -93,20 +93,73 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         let mut state_after = read_state.state_view_at(last_block_number)?;
         let mut seen = std::collections::HashSet::new();
         let mut preimages = Vec::new();
+        let mut add = |addr: Address,
+                       state_after: &mut _,
+                       seen: &mut std::collections::HashSet<Address>,
+                       preimages: &mut Vec<(Address, Vec<u8>)>| {
+            if !seen.insert(addr) {
+                return;
+            }
+            let addr_bytes: [u8; 20] = addr.into();
+            let flat_key = zksync_os_zisk_lib::merkle::derive_account_properties_key(&addr_bytes);
+            if let Some(hash_value) =
+                ReadStorage::read(state_after, alloy::primitives::B256::from(flat_key.0))
+                && let Some(preimage) = PreimageSource::get_preimage(state_after, hash_value)
+            {
+                preimages.push((addr, preimage));
+            }
+        };
+        const ACCOUNT_PROPERTIES_ADDRESS: Address =
+            alloy::primitives::address!("0000000000000000000000000000000000008003");
         for (block_output, _, _, _) in blocks {
             for diff in &block_output.account_diffs {
-                if !seen.insert(diff.address) { continue; }
-                let addr_bytes: [u8; 20] = diff.address.into();
-                let flat_key = zksync_os_zisk_lib::merkle::derive_account_properties_key(&addr_bytes);
-                if let Some(hash_value) =
-                    ReadStorage::read(&mut state_after, alloy::primitives::B256::from(flat_key.0))
-                    && let Some(preimage) = state_after.get_preimage(hash_value)
-                {
-                    preimages.push((diff.address, preimage));
+                add(diff.address, &mut state_after, &mut seen, &mut preimages);
+            }
+            // An account whose 0x8003 leaf changed but which is absent from
+            // account_diffs (e.g. code force-deployed to an address with zero
+            // nonce/balance) still has a tree write the guest must reproduce;
+            // its target address is the low 20 bytes of the write's slot key.
+            for w in &block_output.storage_writes {
+                if w.account == ACCOUNT_PROPERTIES_ADDRESS {
+                    let addr = Address::from_slice(&w.account_key.0[12..32]);
+                    add(addr, &mut state_after, &mut seen, &mut preimages);
                 }
             }
         }
         preimages
+    };
+
+    // Codes referenced by the after-preimages: every account whose 0x8003
+    // leaf we hand to the guest must have its code available so the guest can
+    // recompute the code-derived property fields. Tie code inclusion to
+    // preimage inclusion here rather than relying on the input builder's
+    // separate (incomplete) upgrade-block bytecode heuristics.
+    let referenced_bytecodes = {
+        use zksync_os_interface::traits::PreimageSource;
+        let last_block_number = blocks.last().unwrap().1.block_context.block_number;
+        let mut state_after = read_state.state_view_at(last_block_number)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<(alloy::primitives::B256, Vec<u8>)> = Vec::new();
+        for (addr, preimage) in &account_preimages_after {
+            let props = zksync_os_zisk_lib::merkle::AccountProperties::decode(preimage);
+            let observable = props.observable_bytecode_hash;
+            let blake2s = props.bytecode_hash;
+            if observable.is_zero() || blake2s.is_zero() || !seen.insert(observable) {
+                continue;
+            }
+            if let Some(blob) = state_after.get_preimage(blake2s) {
+                match crate::prover_input_generator::zisk_input_builder::recover_code_matching(
+                    observable, &blob, props.unpadded_code_len as usize,
+                ) {
+                    Some(code) => out.push((observable, code)),
+                    None => tracing::warn!(
+                        %addr, %observable,
+                        "could not recover code for after-preimage account"
+                    ),
+                }
+            }
+        }
+        out
     };
 
     let batch_prover_input = compute_batch_prover_input(
@@ -120,6 +173,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         zisk_chain_config,
         batch_tree_start,
         account_preimages_after,
+        referenced_bytecodes,
     )?;
 
     if zisk_shadow_execution && let Some(zisk_data) = batch_prover_input.zisk_data() {
@@ -130,6 +184,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
             chain_id,
             zisk_chain_config,
             halt_on_shadow_mismatch,
+            blocks,
         )?;
     }
 
@@ -212,6 +267,7 @@ fn compute_batch_prover_input(
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
+    referenced_bytecodes: Vec<(alloy::primitives::B256, Vec<u8>)>,
 ) -> anyhow::Result<ProverInput> {
     use zk_os_forward_system::run::generate_batch_proof_input;
     use zk_os_forward_system_prev::run::generate_batch_proof_input as generate_batch_proof_input_prev;
@@ -264,6 +320,7 @@ fn compute_batch_prover_input(
             zisk_chain_config,
             batch_tree_start,
             account_preimages_after,
+            referenced_bytecodes,
         )?)
     } else {
         None
@@ -289,6 +346,7 @@ fn assemble_zisk_batch(
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
+    referenced_bytecodes: Vec<(alloy::primitives::B256, Vec<u8>)>,
 ) -> anyhow::Result<Vec<u8>> {
     use blake2::{Blake2s256, Digest};
     use crate::prover_input_generator::zisk_input_builder::ZiskBlockData;
@@ -411,6 +469,11 @@ fn assemble_zisk_batch(
                     }
                 }
             }
+            for (hash, code) in &referenced_bytecodes {
+                if seen.insert(*hash) {
+                    all_bytecodes.push((*hash, code.clone()));
+                }
+            }
             all_bytecodes
         },
     };
@@ -522,6 +585,12 @@ fn shadow_execute_zisk_batch(
     chain_id: u64,
     zisk_chain_config: ZiskChainConfig,
     halt_on_shadow_mismatch: bool,
+    blocks: &[(
+        BlockOutput,
+        ReplayRecord,
+        zksync_os_merkle_tree::TreeBatchOutput,
+        ProverInput,
+    )],
 ) -> anyhow::Result<()> {
     use crate::prover_api::metrics::ZISK_LANE_METRICS;
 
@@ -589,6 +658,38 @@ fn shadow_execute_zisk_batch(
             format!("guest execution panicked: {msg}")
         }
     };
+
+    // Name any flat keys mentioned in the failure: map them back to the
+    // batch's native writes so divergences arrive as (address, slot), not
+    // opaque hashes.
+    for hex_key in failure
+        .split(|c: char| !c.is_ascii_hexdigit() && c != 'x')
+        .filter(|w| w.len() == 66 && w.starts_with("0x"))
+    {
+        if let Ok(flat_key) = hex_key.parse::<alloy::primitives::B256>() {
+            for (block_output, _, _, _) in blocks {
+                for w in &block_output.storage_writes {
+                    if w.key == flat_key {
+                        tracing::error!(
+                            batch_number, %flat_key, account = %w.account,
+                            slot = %w.account_key, value = %w.value,
+                            "divergent key is a native storage write"
+                        );
+                    }
+                }
+                for d in &block_output.account_diffs {
+                    let props_key = crate::prover_input_generator::zisk_input_builder::account_flat_key(d.address);
+                    if props_key == flat_key {
+                        tracing::error!(
+                            batch_number, %flat_key, account = %d.address,
+                            nonce = d.nonce, balance = %d.balance,
+                            "divergent key is a native account-properties write"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     ZISK_LANE_METRICS.commitment_mismatches.inc();
     tracing::error!(batch_number, "ZiSK shadow execution divergence: {failure}");

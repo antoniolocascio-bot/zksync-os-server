@@ -260,19 +260,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                         && !observable_hash.is_zero()
                         && let Some(padded_code) = state_view_reload.get_preimage(preimage_hash)
                     {
-                        let raw_len = props.unpadded_code_len as usize;
-                        let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
-                            &padded_code[..raw_len]
-                        } else {
-                            &padded_code[..]
-                        };
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            bytecodes_map.entry(observable_hash)
-                        {
-                            bytecodes_out.push((observable_hash, raw_code.to_vec()));
-                            entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
+                        if push_code_from_blob(
+                            observable_hash, &padded_code, props.unpadded_code_len as usize,
+                            &mut bytecodes_map, &mut bytecodes_out,
+                        ) {
+                            resolved = true;
                         }
-                        resolved = true;
                     }
                 }
                 // If pre-execution state had observable_hash=0, try post-execution state
@@ -286,18 +279,10 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                         && !pre_hash.is_zero()
                         && let Some(full_preimage) = state_after.get_preimage(pre_hash)
                     {
-                        let raw_len = props.unpadded_code_len as usize;
-                        let raw_code = if raw_len > 0 && raw_len <= full_preimage.len() {
-                            &full_preimage[..raw_len]
-                        } else {
-                            &full_preimage[..]
-                        };
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            bytecodes_map.entry(obs_hash)
-                        {
-                            bytecodes_out.push((obs_hash, raw_code.to_vec()));
-                            entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
-                        }
+                        push_code_from_blob(
+                            obs_hash, &full_preimage, props.unpadded_code_len as usize,
+                            &mut bytecodes_map, &mut bytecodes_out,
+                        );
                         // Deliberately NOT inserted into accounts_map: this
                         // account only exists post-state, and pre-execution
                         // must see the true pre-state (see
@@ -544,15 +529,11 @@ fn load_accounts_and_bytecodes<S: ViewState>(
             if !preimage_hash.is_zero() {
                 if !observable_hash.is_zero() {
                     if let Some(padded_code) = state_view.get_preimage(preimage_hash) {
-                        let raw_len = props.unpadded_code_len as usize;
-                        let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
-                            &padded_code[..raw_len]
-                        } else {
-                            &padded_code
-                        };
                         if seen_hashes.insert(preimage_hash) {
-                            bytecodes_out.push((observable_hash, raw_code.to_vec()));
-                            bytecodes_map.insert(observable_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
+                            push_code_from_blob(
+                                observable_hash, &padded_code, props.unpadded_code_len as usize,
+                                &mut bytecodes_map, &mut bytecodes_out,
+                            );
                         }
                     }
                 } else if let Some(code) = force_preimage_map.get(&preimage_hash) {
@@ -1016,7 +997,61 @@ fn compute_old_intermediate_hashes(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn account_flat_key(account: Address) -> B256 {
+/// Recover the raw EVM code whose `keccak256` equals `keccak_key` from a
+/// blake2s preimage blob (`code || padding || jumpdest-artifacts`) and push it
+/// into the guest's keccak-keyed bytecode map.
+///
+/// `unpadded_code_len` is the fast path — it holds for virtually every account
+/// — but it is not reliable for all (observed off for some upgrade
+/// force-deploy targets, leaving alignment padding in the slice). Since the
+/// observable hash IS `keccak256(unpadded code)`, the code is the unique blob
+/// prefix that hashes to it, so on a fast-path miss we scan prefix lengths to
+/// recover exactly that code. A wrong-keyed entry would poison the map the
+/// guest verifies with `keccak256(code) == key`, so nothing is pushed unless
+/// it matches. Returns whether an entry was accepted.
+fn push_code_from_blob(
+    keccak_key: B256,
+    blob: &[u8],
+    unpadded_code_len: usize,
+    bytecodes_map: &mut HashMap<B256, Bytecode>,
+    bytecodes_out: &mut Vec<(B256, Vec<u8>)>,
+) -> bool {
+    let Some(code) = recover_code_matching(keccak_key, blob, unpadded_code_len) else {
+        tracing::debug!(
+            key = %keccak_key, blob_len = blob.len(),
+            "no blob prefix reproduces the keccak key; not preloading"
+        );
+        return false;
+    };
+    if let std::collections::hash_map::Entry::Vacant(entry) = bytecodes_map.entry(keccak_key) {
+        bytecodes_out.push((keccak_key, code.to_vec()));
+        entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(code.as_slice())));
+    }
+    true
+}
+
+/// Recover the raw EVM code whose `keccak256` equals `keccak_key` from a
+/// blake2s preimage blob (`code || padding || jumpdest-artifacts`).
+/// `unpadded_code_len` is the fast path; on a miss the unique matching blob
+/// prefix is found by scan (see `push_code_from_blob`). `None` if no prefix
+/// matches.
+pub(crate) fn recover_code_matching(
+    keccak_key: B256,
+    blob: &[u8],
+    unpadded_code_len: usize,
+) -> Option<Vec<u8>> {
+    if unpadded_code_len > 0
+        && unpadded_code_len <= blob.len()
+        && alloy::primitives::keccak256(&blob[..unpadded_code_len]) == keccak_key
+    {
+        return Some(blob[..unpadded_code_len].to_vec());
+    }
+    (1..=blob.len())
+        .find(|&n| alloy::primitives::keccak256(&blob[..n]) == keccak_key)
+        .map(|n| blob[..n].to_vec())
+}
+
+pub(crate) fn account_flat_key(account: Address) -> B256 {
     zisk_merkle::derive_account_properties_key(&account.into_array())
 }
 
@@ -1441,21 +1476,14 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
                     && let Some(padded_code_with_artifacts) = state_after.get_preimage(pre_hash)
                 {
                     {
-                        let raw_len = props.unpadded_code_len as usize;
-                        let raw_code = if raw_len > 0 && raw_len <= padded_code_with_artifacts.len() {
-                            &padded_code_with_artifacts[..raw_len]
-                        } else {
-                            &padded_code_with_artifacts[..]
-                        };
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            bytecodes_map.entry(effective)
-                        {
-                            bytecodes_out.push((effective, raw_code.to_vec()));
-                            entry.insert(Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
-                        }
+                        push_code_from_blob(
+                            effective, &padded_code_with_artifacts,
+                            props.unpadded_code_len as usize,
+                            bytecodes_map, bytecodes_out,
+                        );
                         // Store the FULL preimage (code + artifacts) under the blake2s hash.
                         // The deployer precompile looks up by this hash.
-                        tracing::info!(
+                        tracing::debug!(
                             addr = %addr,
                             blake2s_hash = %pre_hash,
                             preimage_len = padded_code_with_artifacts.len(),
@@ -1612,20 +1640,10 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
             && let Some(padded_code) = state_after.get_preimage(pre_hash)
         {
             {
-                let raw_len = props.unpadded_code_len as usize;
-                let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
-                    &padded_code[..raw_len]
-                } else {
-                    &padded_code[..]
-                };
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    bytecodes_map.entry(effective)
-                {
-                    bytecodes_out.push((effective, raw_code.to_vec()));
-                    entry.insert(
-                        Bytecode::new_raw(Bytes::copy_from_slice(raw_code)),
-                    );
-                }
+                push_code_from_blob(
+                    effective, &padded_code, props.unpadded_code_len as usize,
+                    bytecodes_map, bytecodes_out,
+                );
             }
         }
     }
