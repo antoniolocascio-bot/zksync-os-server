@@ -2,6 +2,8 @@
 //!
 //! This module provides an HTTP server that manages proof generation jobs
 //! and proof storage.
+#[cfg(test)]
+mod fleet_tests;
 mod v1;
 
 use std::sync::Arc;

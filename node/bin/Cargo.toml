@@ -123,3 +123,7 @@ url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true
