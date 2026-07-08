@@ -35,7 +35,7 @@ const V31_TO_GATEWAY: TestCase = TestCase {
     settlement_layer: SettlementLayer::Gateway,
 };
 
-/// Equivalence teeth (plan 6.5/6.6): the REVM consistency checker reverts on
+/// Equivalence teeth: the REVM consistency checker reverts on
 /// any native-vs-REVM divergence, and every sealed batch's ZiSK input is
 /// re-executed in-process with the guest executor and checked against the
 /// expected batch public input — both failing the node (and the test) loudly.

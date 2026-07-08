@@ -1,4 +1,4 @@
-//! Fleet mechanics of the ZiSK prover HTTP API (task 2.8): multiple daemons
+//! Fleet mechanics of the ZiSK prover HTTP API: multiple daemons
 //! picking concurrently against one server, and timeout-based reassignment
 //! when a daemon disappears mid-job.
 //!

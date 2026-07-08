@@ -254,7 +254,7 @@ impl ZiskJobManager {
             });
         }
 
-        // Program VK tripwire (4.4): the first 32 bytes of the public values
+        // Program VK tripwire: the first 32 bytes of the public values
         // are the ZiSK program VK. Drift means the prover runs a different
         // guest build — reject before touching the job, so it stays assigned
         // and times out back to pending for another prover.
