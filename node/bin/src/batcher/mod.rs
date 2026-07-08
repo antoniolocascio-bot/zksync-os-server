@@ -207,11 +207,14 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> PipelineComponent
                 "Batch da_input",
             );
 
-            if let Some(sidecar) = batch_envelope.batch.blob_sidecar.clone() {
-                self.sidecar_sender
-                    .send(sidecar)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send sidecar: {e}"))?;
+            if let Some(sidecar) = batch_envelope.batch.blob_sidecar.clone()
+                && self.sidecar_sender.send(sidecar).await.is_err()
+            {
+                // The sidecar consumer is not a pipeline component and drops
+                // on shutdown while a seal can still be in flight; erroring
+                // here panics a critical task mid-teardown.
+                tracing::info!("sidecar channel closed; stopping batcher");
+                return Ok(());
             }
             output.send_and_record(batch_envelope, &state_reporter)?;
         }
