@@ -297,12 +297,16 @@ impl SnarkJobManager {
             .collect();
 
         // Multi-proof rendezvous: the batch's ZiSK proof has been in flight
-        // since batch seal — if it already landed, compose the MultiProof
-        // now. Otherwise this submission was allowed through as
-        // Airbender-only: no ZiSK expectation for the batch, optional mode,
-        // or degraded after the wait timeout.
+        // since batch seal — if it already landed and multi-proof is
+        // REQUIRED, compose the MultiProof now. In optional (shadow) mode
+        // the MultiProof must never reach L1 (`prove.rs` always encodes it
+        // as a type-5 payload, which needs the MultiProofVerifier deployed):
+        // the ZiSK proof's submit-time commitment validation is the shadow
+        // signal, and the batch goes downstream Airbender-only.
         if let Some(zjm) = zisk_lane {
-            if let Some(completed) = zjm.take_completed(batch_from).await {
+            if self.require_multi_proof
+                && let Some(completed) = zjm.take_completed(batch_from).await
+            {
                 if let Some(cache) = self.zisk_data_cache.as_ref() {
                     cache.remove(batch_from).await;
                 }
@@ -323,9 +327,10 @@ impl SnarkJobManager {
                 ));
                 return Ok(());
             }
-            // The batch goes downstream without a ZiSK proof — a proof
-            // landing later can never be composed (batches are processed in
-            // order), so drop any parked proofs up to here. In-flight jobs
+            // The batch goes downstream without a ZiSK proof — a parked
+            // proof at or below this batch can never be composed (batches
+            // are processed in order; in optional mode composition is off
+            // entirely), so drop parked proofs up to here. In-flight jobs
             // are left alone: their submit-time validation is still the
             // shadow-mode divergence signal.
             zjm.discard_completed_up_to(batch_to).await;
@@ -643,21 +648,27 @@ mod tests {
         );
     }
 
-    /// Without the multi-proof requirement nothing blocks, and a ZiSK proof
-    /// landing for an already-sent batch is discarded (never composable).
+    /// Without the multi-proof requirement nothing blocks — and even with a
+    /// parked ZiSK proof, optional (shadow) mode sends Airbender-only:
+    /// a MultiProof always encodes as a type-5 L1 payload, which shadow
+    /// deployments (no MultiProofVerifier on L1) cannot accept. The parked
+    /// proof is swept.
     #[tokio::test]
     async fn optional_multi_proof_sends_airbender_only() {
         let (sjm, zjm, mut rx, proving_version) = manager_with_job(false, None).await;
         park_zisk_proof(&zjm, 1).await;
-        // Simulate an even earlier straggler that also can't be composed.
         sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
             .await
             .expect("optional mode must pass through");
         let cmd = rx.try_recv().expect("command sent downstream");
         let (_batches, proof) = cmd.into_parts();
         assert!(
-            matches!(proof, SnarkProof::MultiProof(_)),
-            "a parked proof is still composed opportunistically in optional mode"
+            matches!(proof, SnarkProof::Real(_)),
+            "optional mode must never send a MultiProof to L1"
+        );
+        assert!(
+            zjm.take_completed(1).await.is_none(),
+            "the parked proof is swept once the batch went Airbender-only"
         );
     }
 
