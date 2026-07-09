@@ -56,9 +56,13 @@ mod real_prover_upgrade {
             .expect("prover API must be bound for prover tests");
         let urls = vec![prover_api_url.clone()];
 
-        // Background Airbender services for both protocol versions. Huge
-        // iteration budgets — they are killed once everything is finalized.
+        // Background Airbender services for both protocol versions, spawned
+        // together so their one-time SNARK precomputations (minutes of GPU
+        // work each) warm up concurrently. Huge iteration budgets — they are
+        // killed once everything is finalized.
         let mut airbender_v6 = spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await;
+        let mut airbender_v7 =
+            spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000).await;
 
         // v30 traffic.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
@@ -73,10 +77,13 @@ mod real_prover_upgrade {
             .get_receipt()
             .await?;
 
-        // The v7 service joins before the upgrade so the upgrade batch (the
-        // first V7 batch) can finalize as `execute_default_upgrade` demands.
-        let mut airbender_v7 =
-            spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000).await;
+        // Absorb the prover warmup here: the first real finalization takes
+        // precomputation + FRI + SNARK wrap + prove/execute txs. After this,
+        // the UpgradeTester's own short finality waits see warm provers.
+        tester
+            .l2_zk_provider
+            .wait_finalized_with_timeout(1, REAL_PROOF_FINALITY_TIMEOUT)
+            .await?;
 
         // The real v30 -> v31 protocol upgrade, minimal shape: version bump +
         // no-op delegate, no force deployments (the supplier path is the v31+
