@@ -7,7 +7,13 @@
 pub const ZISK_SNARK_PROOF_BYTES: usize = 768;
 
 /// ZiSK public values size: 8 × 32-byte uint256 slots = 256 bytes.
-pub const ZISK_PUBLIC_VALUES_BYTES: usize = 256;
+// 320 = programVK(32) + guest publics(256: ziskos's full 64-word output
+// region, the guest's 8 commitment words first, zeros after) + vadcopVK(32).
+// Settled against a real cargo-zisk v0.18 proof file (plan 2.1): the
+// draft-era 256/192 assumption undercounted the publics region. The
+// commitment stays at [32..64]. NOTE: the on-chain ZiskVerifier's digest
+// reconstruction must use the same 320-byte preimage (task 7.x/8).
+pub const ZISK_PUBLIC_VALUES_BYTES: usize = 320;
 
 /// ERC-1967 implementation storage slot.
 /// `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`
