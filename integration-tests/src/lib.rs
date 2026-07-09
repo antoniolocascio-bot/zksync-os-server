@@ -216,7 +216,25 @@ impl TestEnvironment {
         self.launch(config).await
     }
 
-    pub async fn launch(mut self, mut config: Config) -> anyhow::Result<Tester> {
+    pub async fn launch(self, config: Config) -> anyhow::Result<Tester> {
+        self.launch_impl(config, true).await
+    }
+
+    /// Launch without auto-spawning prover services even when the fake
+    /// provers are disabled (`prover-tests`). For tests that orchestrate the
+    /// real provers manually — e.g. across a protocol upgrade, where the
+    /// Airbender app binary must change between batches.
+    pub async fn launch_without_provers(self, config: Config) -> anyhow::Result<Tester> {
+        self.launch_impl(config, false).await
+    }
+
+    async fn launch_impl(
+        mut self,
+        mut config: Config,
+        auto_spawn_provers: bool,
+    ) -> anyhow::Result<Tester> {
+        #[cfg(not(feature = "prover-tests"))]
+        let _ = auto_spawn_provers;
         if !prover_input_generation_enabled() {
             disable_prover_input_generation(&mut config);
         }
@@ -238,7 +256,8 @@ impl TestEnvironment {
             None
         };
         #[cfg(feature = "prover-tests")]
-        let enable_prover = !config.prover_api_config.fake_fri_provers.enabled;
+        let enable_prover =
+            auto_spawn_provers && !config.prover_api_config.fake_fri_provers.enabled;
         let mut tester = Tester::launch_node_inner(
             self.l1,
             config,
@@ -1277,76 +1296,20 @@ impl AnvilL1 {
 }
 
 /// Launch the ZiSK GPU prover service with `--iterations 1`.
+/// Spawn the real Airbender prover service for a specific protocol version
+/// (the app binary and the service release are version-specific). Returns
+/// the child so the caller can await its exit or kill it — needed by tests
+/// that cross a protocol upgrade, where the pre- and post-upgrade batches
+/// must be proven by different app binaries.
 ///
-/// This must only be called after the Airbender GPU prover has exited so both
-/// provers never contend for the same GPU simultaneously. The ZiSK prover runs
-/// `cargo-zisk prove` (STARK aggregation, GPU) and `cargo-zisk prove-snark`
-/// (SNARK wrapping, GPU), then submits the proof to the server and exits.
-///
-/// Required environment variables:
-/// - `ZISK_PROVER_BIN` — path to `zksync-os-zisk-prover-service` binary
-/// - `ZISK_BINARY` — path to `cargo-zisk` GPU binary
-/// - `ZISK_ELF` — path to the ZiSK guest ELF
-/// - `ZISK_PK` — path to ZiSK STARK proving key directory
-/// - `ZISK_SK` — path to ZiSK SNARK proving key directory
-#[cfg(feature = "gpu-prover-tests")]
-async fn spawn_zisk_gpu_prover(sequencer_url: &str) {
-    let zisk_bin = std::env::var("ZISK_PROVER_BIN")
-        .unwrap_or_else(|_| "zksync-os-zisk-prover-service".to_string());
-    let cargo_zisk = std::env::var("ZISK_BINARY")
-        .unwrap_or_else(|_| "cargo-zisk".to_string());
-    let elf_path = std::env::var("ZISK_ELF").expect(
-        "ZISK_ELF must be set for gpu-prover-tests (path to ZiSK guest ELF)"
-    );
-    let proving_key = std::env::var("ZISK_PK").unwrap_or_else(|_| {
-        format!("{}/.zisk/provingKey", std::env::var("HOME").unwrap())
-    });
-    let proving_key_snark = std::env::var("ZISK_SK").unwrap_or_else(|_| {
-        format!("{}/.zisk/provingKeySnark", std::env::var("HOME").unwrap())
-    });
-
-    tracing::info!(
-        zisk_bin = %zisk_bin,
-        cargo_zisk = %cargo_zisk,
-        elf_path = %elf_path,
-        "Launching ZiSK GPU prover (--iterations 1)"
-    );
-
-    let mut child = tokio::process::Command::new(&zisk_bin)
-        .arg("--sequencer-url")
-        .arg(sequencer_url)
-        .arg("--zisk-binary")
-        .arg(&cargo_zisk)
-        .arg("--elf-path")
-        .arg(&elf_path)
-        .arg("--proving-key")
-        .arg(&proving_key)
-        .arg("--proving-key-snark")
-        .arg(&proving_key_snark)
-        .arg("--iterations")
-        .arg("1")
-        .spawn()
-        .expect("failed to spawn ZiSK prover service");
-
-    let code = child
-        .wait()
-        .await
-        .expect("failed to wait for ZiSK prover service");
-    if code.success() {
-        tracing::info!("ZiSK GPU prover service finished running");
-    } else {
-        panic!("ZiSK GPU prover service terminated with exit code {}", code);
-    }
-}
-
+/// Requires `COMPACT_CRS_FILE` (path to the SNARK trusted setup).
 #[cfg(feature = "prover-tests")]
-async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterations: usize) {
-    #[cfg(feature = "gpu-prover-tests")]
-    let zisk_sequencer_url = sequencer_urls
-        .first()
-        .expect("at least one sequencer URL for prover tests")
-        .clone();
-    let protocol_version = tester.chain_layout.protocol_version();
+pub async fn spawn_airbender_prover(
+    tester: &Tester,
+    protocol_version: &str,
+    sequencer_urls: &[String],
+    iterations: usize,
+) -> tokio::process::Child {
     let app_bin_path = match protocol_version {
         PROTOCOL_VERSION => utils::materialize_multiblock_batch_bin(
             &tester.tempdir.path().join("app_bins"),
@@ -1367,7 +1330,7 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
     let path =
         download_prover_and_unpack(protocol_version, cfg!(feature = "gpu-prover-tests")).await;
 
-    let mut child = tokio::process::Command::new(path)
+    tokio::process::Command::new(path)
         .arg("--sequencer-urls")
         .arg(sequencer_urls.join(","))
         .arg("--app-bin-path")
@@ -1384,7 +1347,19 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
         .arg("1")
         .arg("--disable-zk")
         .spawn()
-        .expect("failed to spawn prover service");
+        .expect("failed to spawn prover service")
+}
+
+#[cfg(feature = "prover-tests")]
+async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterations: usize) {
+    #[cfg(feature = "gpu-prover-tests")]
+    let zisk_sequencer_url = sequencer_urls
+        .first()
+        .expect("at least one sequencer URL for prover tests")
+        .clone();
+    let protocol_version = tester.chain_layout.protocol_version();
+    let mut child =
+        spawn_airbender_prover(tester, protocol_version, sequencer_urls, iterations).await;
     tokio::task::spawn(async move {
         let code = child
             .wait()
@@ -1399,16 +1374,18 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
         // GPU is now free. Launch the ZiSK GPU prover to generate the second
         // proof. Both provers share a single GPU and must run sequentially.
         #[cfg(feature = "gpu-prover-tests")]
-        spawn_zisk_gpu_prover(&zisk_sequencer_url).await;
+        run_zisk_gpu_prover(&zisk_sequencer_url, 1).await;
     });
 }
 
-/// Launch the ZiSK GPU prover service with `--iterations 1`.
+/// Run the ZiSK GPU prover service until `iterations` proofs are accepted.
 ///
 /// This must only be called after the Airbender GPU prover has exited so both
 /// provers never contend for the same GPU simultaneously. The ZiSK prover runs
-/// a single integrated `cargo-zisk prove --plonk` (STARK aggregation + PLONK
-/// SNARK wrap, GPU), then submits the proof to the server and exits.
+/// one integrated `cargo-zisk prove --plonk` per batch (STARK aggregation +
+/// PLONK SNARK wrap, GPU), submits each proof to the server, and exits with 0
+/// only after `iterations` submissions were accepted — a clean exit is itself
+/// the assertion that every proof passed the server's commitment + VK checks.
 ///
 /// Required environment variables:
 /// - `ZISK_PROVER_BIN` — path to `zksync-os-zisk-prover-service` binary
@@ -1417,7 +1394,7 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
 /// - `ZISK_PK` — path to ZiSK STARK proving key directory
 /// - `ZISK_SK` — path to ZiSK PLONK proving key directory
 #[cfg(feature = "gpu-prover-tests")]
-async fn spawn_zisk_gpu_prover(sequencer_url: &str) {
+pub async fn run_zisk_gpu_prover(sequencer_url: &str, iterations: usize) {
     let zisk_bin = std::env::var("ZISK_PROVER_BIN")
         .unwrap_or_else(|_| "zksync-os-zisk-prover-service".to_string());
     let cargo_zisk =
@@ -1433,7 +1410,8 @@ async fn spawn_zisk_gpu_prover(sequencer_url: &str) {
         zisk_bin = %zisk_bin,
         cargo_zisk = %cargo_zisk,
         elf_path = %elf_path,
-        "Launching ZiSK GPU prover (--iterations 1)"
+        iterations,
+        "Launching ZiSK GPU prover"
     );
 
     let mut child = tokio::process::Command::new(&zisk_bin)
@@ -1448,7 +1426,7 @@ async fn spawn_zisk_gpu_prover(sequencer_url: &str) {
         .arg("--proving-key-plonk")
         .arg(&proving_key_plonk)
         .arg("--iterations")
-        .arg("1")
+        .arg(iterations.to_string())
         .spawn()
         .expect("failed to spawn ZiSK prover service");
 
