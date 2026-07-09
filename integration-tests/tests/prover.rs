@@ -18,9 +18,19 @@ mod real_prover_upgrade {
     use zksync_os_types::ProvingVersion;
 
     /// How long to allow a block to reach L1 finality with real (GPU)
-    /// proving in the loop: prover warmup (one-time SNARK precomputations,
-    /// minutes) + commit + FRI + SNARK wrap + prove tx + execute.
-    const REAL_PROOF_FINALITY_TIMEOUT: Duration = Duration::from_secs(1500);
+    /// proving in the loop: prover warmup (one-time SNARK precomputations —
+    /// observed up to ~25 minutes) + commit + FRI + SNARK wrap + prove tx +
+    /// execute.
+    const REAL_PROOF_FINALITY_TIMEOUT: Duration = Duration::from_secs(3600);
+
+    /// Kills the wrapped prover service when dropped, so a failing test does
+    /// not leak a GPU-holding orphan process.
+    struct KillOnDrop(tokio::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.start_kill();
+        }
+    }
 
     /// Peek a batch's FRI job to learn its VK hash. `None` once the batch is
     /// unknown to the job map (not sealed yet, or already proven).
@@ -79,7 +89,8 @@ mod real_prover_upgrade {
         // of the GPU's VRAM per process, so two services cannot coexist (a
         // concurrent warmup dies in the CUDA allocator). Start with v6; huge
         // iteration budget — it is killed at the upgrade boundary.
-        let mut airbender_v6 = spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await;
+        let mut airbender_v6 =
+            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await);
 
         // v30 traffic.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
@@ -147,10 +158,10 @@ mod real_prover_upgrade {
                         upgrade_batch,
                         "all pre-upgrade batches proven — swapping Airbender v6 -> v7"
                     );
-                    airbender_v6.kill().await.ok();
+                    airbender_v6.0.kill().await.ok();
                     let v7 =
                         spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000).await;
-                    return anyhow::Ok(v7);
+                    return anyhow::Ok(KillOnDrop(v7));
                 }
             }
         };
@@ -178,7 +189,7 @@ mod real_prover_upgrade {
             .await?;
 
         // Everything is proven and finalized — free the GPU for ZiSK.
-        airbender_v7.kill().await.ok();
+        airbender_v7.0.kill().await.ok();
 
         let total_batches = tester.prover_tester.last_proven_batch().await?;
         anyhow::ensure!(
