@@ -11,27 +11,14 @@ mod real_prover_upgrade {
     use alloy::providers::Provider;
     use alloy::rpc::types::TransactionRequest;
     use std::time::Duration;
+    use zksync_os_integration_tests::provider::ZksyncTestingProvider;
     use zksync_os_integration_tests::upgrade::UpgradeTester;
     use zksync_os_integration_tests::{CURRENT_TO_L1, run_zisk_gpu_prover, spawn_airbender_prover};
     use zksync_os_server::default_protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_V31_0};
-    use zksync_os_types::ProvingVersion;
 
-    /// Peek a batch's FRI job to learn its VK hash. `None` once the batch is
-    /// unknown to the job map (not sealed yet, or already consumed).
-    async fn peek_fri_vk(prover_api_url: &str, batch: u64) -> anyhow::Result<Option<String>> {
-        let response = reqwest::Client::new()
-            .get(format!("{prover_api_url}/prover-jobs/v1/FRI/{batch}/peek"))
-            .send()
-            .await?;
-        if response.status() == reqwest::StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        let payload: serde_json::Value = response.error_for_status()?.json().await?;
-        Ok(payload
-            .get("vk_hash")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned))
-    }
+    /// How long to allow a block to reach L1 finality with real (GPU)
+    /// proving in the loop: commit + FRI + SNARK wrap + prove tx + execute.
+    const REAL_PROOF_FINALITY_TIMEOUT: Duration = Duration::from_secs(900);
 
     /// The full multi-prover flow with REAL provers across a REAL v30->v31
     /// protocol upgrade on an L1-settling chain (there is no v31-on-L1
@@ -39,14 +26,18 @@ mod real_prover_upgrade {
     ///
     /// 1. boot the v30.2 chain with fake provers off and the ZiSK lane on
     ///    (ZiSK jobs are created at batch seal);
-    /// 2. drive v30 traffic, execute the minimal v30->v31 upgrade (no force
-    ///    deployments), drive v31 traffic;
-    /// 3. prove every batch for real: Airbender v6 service, then Airbender
-    ///    v7 service, then the ZiSK prover — strictly sequentially, all
-    ///    sharing one GPU;
-    /// 4. require the last batch verified on L1 (`BlocksVerification`) and
-    ///    every batch's ZiSK proof accepted by the server (commitment + VK
-    ///    checks at submit; the daemon exits 0 only on acceptance).
+    /// 2. run the real Airbender v6 and v7 services in the background — the
+    ///    upgrade flow *requires* live finalization before and after the
+    ///    boundary, and each service skips batches whose VK it doesn't
+    ///    serve (the skipped assignment times out back to pending);
+    /// 3. drive v30 traffic, execute the minimal v30->v31 upgrade (no force
+    ///    deployments), drive v31 traffic — `execute_default_upgrade`'s
+    ///    internal finality waits assert real pre-upgrade (V6) and
+    ///    upgrade-batch (V7) proofs verified on L1;
+    /// 4. once the last v31 block is finalized on L1, stop the Airbender
+    ///    services and run the ZiSK prover over every batch — one guest
+    ///    binary proves both v30 and v31 batches; the daemon exits 0 only
+    ///    after all submissions were accepted (commitment + VK checks).
     #[test_log::test(tokio::test)]
     async fn real_provers_across_v30_to_v31_upgrade_on_l1() -> anyhow::Result<()> {
         let env = CURRENT_TO_L1.environment().await?;
@@ -63,6 +54,11 @@ mod real_prover_upgrade {
         let prover_api_url = tester
             .prover_api_url()
             .expect("prover API must be bound for prover tests");
+        let urls = vec![prover_api_url.clone()];
+
+        // Background Airbender services for both protocol versions. Huge
+        // iteration budgets — they are killed once everything is finalized.
+        let mut airbender_v6 = spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await;
 
         // v30 traffic.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
@@ -77,9 +73,16 @@ mod real_prover_upgrade {
             .get_receipt()
             .await?;
 
+        // The v7 service joins before the upgrade so the upgrade batch (the
+        // first V7 batch) can finalize as `execute_default_upgrade` demands.
+        let mut airbender_v7 =
+            spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000).await;
+
         // The real v30 -> v31 protocol upgrade, minimal shape: version bump +
         // no-op delegate, no force deployments (the supplier path is the v31+
         // flow; a v30 chain must not use the legacy inconsistent payload).
+        // Its internal waits require — and thereby assert — real finalization
+        // on both sides of the upgrade boundary.
         let upgrade_tester = UpgradeTester::for_default_upgrade(&tester).await?;
         let protocol_upgrade = upgrade_tester
             .protocol_upgrade_builder()
@@ -97,9 +100,11 @@ mod real_prover_upgrade {
             )
             .await?;
 
-        // v31 traffic.
+        // v31 traffic, then require the last block finalized on L1 — i.e.
+        // its batch committed, REAL-proven, and executed.
+        let mut last_block = 0;
         for i in 0..2u64 {
-            tester
+            let receipt = tester
                 .l2_provider
                 .send_transaction(
                     TransactionRequest::default()
@@ -109,60 +114,27 @@ mod real_prover_upgrade {
                 .await?
                 .get_receipt()
                 .await?;
+            last_block = receipt.block_number.unwrap_or(last_block);
         }
-
-        // Wait for sealing to settle, then split batches by proving version
-        // via the FRI job map (jobs are untouched — no prover has run yet).
-        let mut vks: Vec<String> = Vec::new();
-        let mut quiet_rounds = 0;
-        while quiet_rounds < 3 {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            match peek_fri_vk(&prover_api_url, vks.len() as u64 + 1).await? {
-                Some(vk) => {
-                    vks.push(vk);
-                    quiet_rounds = 0;
-                }
-                None => quiet_rounds += 1,
-            }
-        }
-        let total_batches = vks.len() as u64;
-        let v6_batches = vks
-            .iter()
-            .take_while(|vk| vk.as_str() == ProvingVersion::V6.vk_hash())
-            .count();
-        let v7_batches = vks.len() - v6_batches;
-        tracing::info!(total_batches, v6_batches, v7_batches, "batch inventory");
-        assert!(v6_batches >= 1, "expected at least one pre-upgrade batch");
-        assert!(v7_batches >= 1, "expected at least one post-upgrade batch");
-        assert!(
-            vks[v6_batches..]
-                .iter()
-                .all(|vk| vk.as_str() == ProvingVersion::V7.vk_hash()),
-            "batches must switch V6 -> V7 exactly once at the upgrade boundary: {vks:?}"
-        );
-
-        // Prove everything, strictly sequentially on the single GPU:
-        // Airbender v6 -> Airbender v7 -> ZiSK (both versions, one guest).
-        let urls = vec![prover_api_url.clone()];
-        let status = spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, v6_batches)
-            .await
-            .wait()
-            .await?;
-        anyhow::ensure!(status.success(), "v6 Airbender prover failed: {status}");
-        let status = spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, v7_batches)
-            .await
-            .wait()
-            .await?;
-        anyhow::ensure!(status.success(), "v7 Airbender prover failed: {status}");
-
-        // Real proofs verified on L1 across the upgrade boundary.
         tester
-            .prover_tester
-            .wait_for_batch_proven(total_batches)
+            .l2_zk_provider
+            .wait_finalized_with_timeout(last_block, REAL_PROOF_FINALITY_TIMEOUT)
             .await?;
 
-        // ZiSK lane: one guest binary proves both v30 and v31 batches; the
-        // daemon exits 0 only after `total_batches` accepted submissions.
+        // Everything is proven and finalized — free the GPU for ZiSK.
+        airbender_v6.kill().await.ok();
+        airbender_v7.kill().await.ok();
+
+        let total_batches = tester.prover_tester.last_proven_batch().await?;
+        anyhow::ensure!(
+            total_batches >= 2,
+            "expected batches on both sides of the upgrade, got {total_batches}"
+        );
+        tracing::info!(total_batches, "all batches real-proven on L1 — starting ZiSK lane");
+
+        // ZiSK lane: jobs were created at batch seal and survive the
+        // Airbender-only sends; the daemon exits 0 only after `total_batches`
+        // accepted submissions (commitment + programVK validated per batch).
         run_zisk_gpu_prover(&prover_api_url, total_batches as usize).await;
 
         Ok(())
