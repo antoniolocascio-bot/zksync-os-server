@@ -29,6 +29,18 @@ alloy::sol!(
 );
 
 alloy::sol!(
+    /// Minimal stand-in for the v31 `SystemContext` (0x800b): stores the
+    /// settlement-layer chain id in slot 0 and emits the byte-exact
+    /// `SettlementLayerChainIdUpdated` event the STF's hook expects. Used
+    /// as the force-deployment payload in v30->v31 upgrade tests (the
+    /// genesis proxy+implementation pair needs storage slots that force
+    /// deployments cannot seed).
+    #[sol(rpc)]
+    SystemContextV31,
+    "test-contracts/out/SystemContextV31.sol/SystemContextV31.json"
+);
+
+alloy::sol!(
     /// Minimal event-compatible stand-in for the v31 `BytecodesSupplier`:
     /// on a v30-era L1 the real supplier is only deployed by the v31
     /// ecosystem upgrade, so upgrade tests etch this at the configured
