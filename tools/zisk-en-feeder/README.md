@@ -55,4 +55,4 @@ dir mounted read-only.
   (`executor::execute_and_commit_from_bincode`) and compare the returned
   commitment with the batch public input.
 - Full proving: the framed file is exactly `cargo-zisk prove -i` input; see
-  the `zksync-os-zisk-prover` README for the v0.18.0 invocation.
+  the `prover/` README in `zksync-os-zisk` for the v0.18.0 invocation.
