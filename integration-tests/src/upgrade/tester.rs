@@ -136,7 +136,7 @@ impl<'a> UpgradeTester<'a> {
                     .l2_zk_provider
                     .wait_finalized_with_timeout(
                         current_l2_block,
-                        crate::assert_traits::DEFAULT_TIMEOUT,
+                        crate::assert_traits::finality_timeout(),
                     )
                     .await?;
                 tracing::info!("Current L2 block is finalized, proceeding with patch upgrade");
@@ -169,7 +169,7 @@ impl<'a> UpgradeTester<'a> {
                 .l2_zk_provider
                 .wait_finalized_with_timeout(
                     tx.block_number.unwrap(),
-                    crate::assert_traits::DEFAULT_TIMEOUT,
+                    crate::assert_traits::finality_timeout(),
                 )
                 .await?;
         } else {
@@ -337,7 +337,7 @@ impl<'a> UpgradeTester<'a> {
         // The genesis transaction has to be in the first block, so we wait for block 1 to be finalized.
         self.tester
             .l2_zk_provider
-            .wait_finalized_with_timeout(1, crate::assert_traits::DEFAULT_TIMEOUT)
+            .wait_finalized_with_timeout(1, crate::assert_traits::finality_timeout())
             .await?;
         Ok(())
     }
@@ -357,7 +357,7 @@ impl<'a> UpgradeTester<'a> {
             .l2_zk_provider
             .wait_finalized_with_timeout(
                 block_before_upgrade,
-                crate::assert_traits::DEFAULT_TIMEOUT,
+                crate::assert_traits::finality_timeout(),
             )
             .await
             .context("Block before upgrade transaction was not finalized")?;
@@ -376,7 +376,7 @@ impl<'a> UpgradeTester<'a> {
             .l2_zk_provider
             .wait_finalized_with_timeout(
                 upgrade_block_number,
-                crate::assert_traits::DEFAULT_TIMEOUT,
+                crate::assert_traits::finality_timeout(),
             )
             .await
             .context("Block before upgrade transaction was not finalized")?;
