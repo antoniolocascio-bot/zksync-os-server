@@ -167,6 +167,24 @@ mod real_prover_upgrade {
                 .into_iter()
                 .collect();
 
+        // A v30-era L1 has no functional EVM BytecodesSupplier — production
+        // deploys it as part of the v31 ecosystem upgrade (protocol-ops
+        // `upgrade-prepare`). Mirror that by etching the event-compatible
+        // supplier at the configured address before publishing.
+        {
+            use alloy::providers::ext::AnvilApi;
+            let supplier_address = tester
+                .config()
+                .genesis_config
+                .bytecode_supplier_address
+                .expect("bytecode_supplier_address must be configured");
+            let code = zksync_os_integration_tests::contracts::BytecodesSupplierV31::DEPLOYED_BYTECODE.clone();
+            tester
+                .l1_provider()
+                .anvil_set_code(supplier_address, code)
+                .await?;
+        }
+
         let upgrade_tester = UpgradeTester::for_default_upgrade(&tester).await?;
         upgrade_tester
             .publish_bytecodes_to_l1_supplier([system_context_code])

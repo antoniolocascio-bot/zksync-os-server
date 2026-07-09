@@ -29,6 +29,16 @@ alloy::sol!(
 );
 
 alloy::sol!(
+    /// Minimal event-compatible stand-in for the v31 `BytecodesSupplier`:
+    /// on a v30-era L1 the real supplier is only deployed by the v31
+    /// ecosystem upgrade, so upgrade tests etch this at the configured
+    /// supplier address to exercise the production preimage flow.
+    #[sol(rpc)]
+    BytecodesSupplierV31,
+    "test-contracts/out/BytecodesSupplierV31.sol/BytecodesSupplierV31.json"
+);
+
+alloy::sol!(
     /// Simple ERC20 with permissionless mint.
     #[sol(rpc)]
     TestERC20,
