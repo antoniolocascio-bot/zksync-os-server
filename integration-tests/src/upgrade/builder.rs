@@ -29,6 +29,8 @@ pub struct ProtocolUpgradeBuilder {
     /// Timestamp after which upgrade can be executed
     /// If not provided, default value will be used (e.g. upgrade whenever)
     timestamp: U256,
+    /// Verifier to switch the chain to (zero = keep current).
+    verifier: Address,
     /// Whether to include bytecode hashes in `factory_deps` of the upgrade tx.
     /// When true, the server's `fetch_force_preimages` will look up bytecodes
     /// from the L1 `BytecodesSupplier`. When false, the server relies on
@@ -51,6 +53,7 @@ impl ProtocolUpgradeBuilder {
             force_deployments: None,
             delegate_to,
             timestamp: U256::ZERO,
+            verifier: Address::ZERO,
             include_factory_deps: false,
         }
     }
@@ -109,6 +112,14 @@ impl ProtocolUpgradeBuilder {
     /// Sets the timestamp after which the upgrade can be executed.
     pub fn with_timestamp(mut self, timestamp: U256) -> Self {
         self.timestamp = timestamp;
+        self
+    }
+
+    /// Sets the verifier to switch the chain to as part of the upgrade
+    /// (zero = keep the current one). Needed when the new protocol version's
+    /// proofs cannot verify against the previously registered verifier.
+    pub fn with_verifier(mut self, verifier: Address) -> Self {
+        self.verifier = verifier;
         self
     }
 
@@ -313,7 +324,7 @@ impl ProtocolUpgradeBuilder {
             bootloaderHash: Default::default(),
             defaultAccountHash: Default::default(),
             evmEmulatorHash: Default::default(),
-            verifier: Default::default(),
+            verifier: self.verifier,
             verifierParams: verifier_params,
             l1ContractsUpgradeCalldata: Default::default(),
             postUpgradeCalldata: Default::default(),

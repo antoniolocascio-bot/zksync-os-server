@@ -193,6 +193,10 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
             .into_iter()
             .collect();
 
+    // V7 proofs cannot pass the v30-era verifier; the upgrade switches
+    // the chain to the v31 verifier tree etched from the v31 fixture.
+    let v31_verifier = zksync_os_integration_tests::etch_v31_verifier_tree(&tester).await?;
+
     let upgrade_tester = UpgradeTester::for_default_upgrade(&tester).await?;
     upgrade_tester
         .publish_bytecodes_to_l1_supplier([system_context_code])
@@ -204,6 +208,7 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
         .with_force_deployments(force_deployments)
         .with_factory_deps()
         .with_timestamp(U256::from(1))
+        .with_verifier(v31_verifier)
         .build();
     // Every pre-upgrade batch must be finalized before the cut retires the
     // v30 commit encoding.
@@ -252,6 +257,13 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
         .l2_zk_provider
         .wait_finalized_with_timeout(tip, Duration::from_secs(180))
         .await?;
+    // The chain must now run the v31 verifier.
+    let active_verifier = upgrade_tester.diamond_proxy_sl.getVerifier().call().await?;
+    anyhow::ensure!(
+        active_verifier == v31_verifier,
+        "upgrade did not switch the verifier: {active_verifier} != {v31_verifier}"
+    );
+
     // Let the last batches seal and get captured.
     tokio::time::sleep(Duration::from_secs(8)).await;
     let _ = capture_stop_tx.send(());

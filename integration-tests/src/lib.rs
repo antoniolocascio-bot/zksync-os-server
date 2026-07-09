@@ -1303,6 +1303,62 @@ impl AnvilL1 {
 /// must be proven by different app binaries.
 ///
 /// Requires `COMPACT_CRS_FILE` (path to the SNARK trusted setup).
+/// Etch the v31 verifier contract tree from the committed v31 L1 fixture
+/// onto this test's anvil (code + storage; the contracts are
+/// fixture-stable and collision-free with the v30 state), returning the
+/// root verifier address for `ProtocolUpgradeBuilder::with_verifier`.
+/// Needed because V7 proofs cannot pass the v30-era verifier
+/// ("finalPairing: pairing failure"), and the production v31 upgrade
+/// switches the chain's verifier — which fake-proof tests never exercise.
+pub async fn etch_v31_verifier_tree(tester: &Tester) -> anyhow::Result<alloy::primitives::Address> {
+    use alloy::providers::ext::AnvilApi;
+    use std::io::Read;
+
+    const ROOT: &str = "0xabb42b8ea0e69a96bcd9a6d28d32cc013989da6d";
+    const TREE: [&str; 4] = [
+        ROOT,
+        "0xe67c013691474acc600a7181ef6ed69e3c48c149",
+        "0x1b8fda60301c81fc63c7742706c522fcf0d7251d",
+        "0x2abad275094bc97b58f79a468ac526274020c32f",
+    ];
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../local-chains/v31.0/l1-state.json.gz");
+    let mut raw = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(path)?).read_to_string(&mut raw)?;
+    let state: serde_json::Value = serde_json::from_str(&raw)?;
+    let accounts = &state["accounts"];
+
+    for address in TREE {
+        let account = &accounts[address];
+        anyhow::ensure!(
+            !account.is_null(),
+            "verifier contract {address} not found in the v31 L1 fixture — was it regenerated?"
+        );
+        let code = account["code"].as_str().unwrap_or("0x");
+        let addr: alloy::primitives::Address = address.parse()?;
+        tester
+            .l1_provider()
+            .anvil_set_code(addr, alloy::hex::decode(code)?.into())
+            .await?;
+        if let Some(storage) = account["storage"].as_object() {
+            for (slot, value) in storage {
+                tester
+                    .l1_provider()
+                    .anvil_set_storage_at(
+                        addr,
+                        slot.parse::<alloy::primitives::U256>()?,
+                        value
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("non-string storage value"))?
+                            .parse::<alloy::primitives::B256>()?,
+                    )
+                    .await?;
+            }
+        }
+    }
+    Ok(ROOT.parse()?)
+}
+
 #[cfg(feature = "prover-tests")]
 pub async fn spawn_airbender_prover(
     tester: &Tester,
