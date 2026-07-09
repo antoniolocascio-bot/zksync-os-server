@@ -9,10 +9,11 @@ mod real_prover_upgrade {
     use alloy::network::TransactionBuilder;
     use alloy::primitives::{Address, U256};
     use alloy::providers::Provider;
+    use alloy::sol_types::SolCall;
     use alloy::rpc::types::TransactionRequest;
     use std::time::Duration;
     use zksync_os_integration_tests::provider::ZksyncTestingProvider;
-    use zksync_os_integration_tests::upgrade::UpgradeTester;
+    use zksync_os_integration_tests::upgrade::{Action, CommitterFacetV31, FacetCut, UpgradeTester};
     use zksync_os_integration_tests::{CURRENT_TO_L1, run_zisk_gpu_prover, spawn_airbender_prover};
     use zksync_os_server::default_protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_V31_0};
     use zksync_os_types::ProvingVersion;
@@ -178,11 +179,27 @@ mod real_prover_upgrade {
             .l2_zk_provider
             .wait_finalized_with_timeout(tip, REAL_PROOF_FINALITY_TIMEOUT)
             .await?;
+        // The v30-era L1 Executor hard-codes ZKsync OS commits to encoding
+        // v3; v31 batches commit with encoding v4, so the upgrade must also
+        // replace the committer facet (mirrors `upgrade_to_v31_with_deployments`).
+        let l1_chain_id = tester.l1_provider().get_chain_id().await?;
+        let committer_facet =
+            CommitterFacetV31::deploy(tester.l1_provider().clone(), U256::from(l1_chain_id))
+                .await?;
+        let facet_cut = FacetCut {
+            facet: *committer_facet.address(),
+            action: Action::Replace,
+            isFreezable: true,
+            selectors: vec![alloy::primitives::FixedBytes(
+                CommitterFacetV31::commitBatchesSharedBridgeCall::SELECTOR,
+            )],
+        };
+
         let upgrade_fut = upgrade_tester.execute_default_upgrade_cut_first(
             &protocol_upgrade,
             U256::MAX,
             U256::from(1),
-            vec![],
+            vec![facet_cut],
         );
         let swap_fut = async {
             loop {

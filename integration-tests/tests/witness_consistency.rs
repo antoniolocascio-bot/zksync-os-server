@@ -19,13 +19,14 @@ use std::time::Duration;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolCall;
 use alloy::providers::ext::AnvilApi;
 use alloy::rpc::types::TransactionRequest;
 use base64::Engine;
 use zksync_os_integration_tests::CURRENT_TO_L1;
 use zksync_os_integration_tests::contracts::{BytecodesSupplierV31, SystemContextV31};
 use zksync_os_integration_tests::provider::ZksyncTestingProvider;
-use zksync_os_integration_tests::upgrade::UpgradeTester;
+use zksync_os_integration_tests::upgrade::{Action, CommitterFacetV31, FacetCut, UpgradeTester};
 use zksync_os_types::ProvingVersion;
 
 /// One batch's captured prover inputs.
@@ -211,8 +212,24 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
         .l2_zk_provider
         .wait_finalized_with_timeout(tip, Duration::from_secs(120))
         .await?;
+    let l1_chain_id = tester.l1_provider().get_chain_id().await?;
+    let committer_facet =
+        CommitterFacetV31::deploy(tester.l1_provider().clone(), U256::from(l1_chain_id)).await?;
+    let facet_cut = FacetCut {
+        facet: *committer_facet.address(),
+        action: Action::Replace,
+        isFreezable: true,
+        selectors: vec![alloy::primitives::FixedBytes(
+            CommitterFacetV31::commitBatchesSharedBridgeCall::SELECTOR,
+        )],
+    };
     upgrade_tester
-        .execute_default_upgrade_cut_first(&protocol_upgrade, U256::MAX, U256::from(1), vec![])
+        .execute_default_upgrade_cut_first(
+            &protocol_upgrade,
+            U256::MAX,
+            U256::from(1),
+            vec![facet_cut],
+        )
         .await?;
 
     // v31 traffic.
@@ -228,6 +245,13 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
             .get_receipt()
             .await?;
     }
+    // The v31 blocks must reach REAL L1 finality (commit accepted with the
+    // new encoding + proven + executed) — a commit rejection cannot pass.
+    let tip = tester.l2_provider.get_block_number().await?;
+    tester
+        .l2_zk_provider
+        .wait_finalized_with_timeout(tip, Duration::from_secs(180))
+        .await?;
     // Let the last batches seal and get captured.
     tokio::time::sleep(Duration::from_secs(8)).await;
     let _ = capture_stop_tx.send(());
