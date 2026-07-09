@@ -92,6 +92,10 @@ pub struct FriJobManager {
     proof_storage: ProofStorage,
     /// External cache for ZiSK batch data (optional, set when second_proof_system is enabled).
     zisk_data_cache: Option<Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>>,
+    /// ZiSK job manager (optional, set when second_proof_system is enabled).
+    /// ZiSK proving jobs are created here at batch seal, so the ZiSK lane
+    /// proves concurrently with the Airbender FRI + SNARK lane.
+    zisk_job_manager: Option<Arc<crate::prover_api::zisk_job_manager::ZiskJobManager>>,
 }
 
 impl FriJobManager {
@@ -111,6 +115,7 @@ impl FriJobManager {
             batches_with_proof_sender,
             proof_storage,
             zisk_data_cache: None,
+            zisk_job_manager: None,
         }
     }
 
@@ -119,14 +124,40 @@ impl FriJobManager {
         self.zisk_data_cache = Some(cache);
     }
 
+    /// Set the ZiSK job manager (call before adding jobs when second_proof_system is enabled).
+    pub fn set_zisk_job_manager(
+        &mut self,
+        manager: Arc<crate::prover_api::zisk_job_manager::ZiskJobManager>,
+    ) {
+        self.zisk_job_manager = Some(manager);
+    }
+
     /// Adds a pending job to the queue.
     /// Awaits if the queue is full (ProverJobMap.max_assigned_batch_range).
-    /// If the ProverInput carries ZiSK data and a cache is configured, stores it.
+    /// If the ProverInput carries ZiSK data and a cache is configured, stores
+    /// it and creates the ZiSK proving job right away — ZiSK provers start on
+    /// the batch at seal, in parallel with the Airbender FRI/SNARK lane; the
+    /// Airbender SNARK submission is only the multi-proof rendezvous point.
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<ProverInput>) {
         if let (Some(cache), Some(zisk_bytes)) = (&self.zisk_data_cache, batch_envelope.data.zisk_data()) {
             let batch_number = batch_envelope.batch_number();
             tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "caching ZiSK data for multi-proof");
             cache.insert(batch_number, zisk_bytes.to_vec()).await;
+            if let Some(zjm) = &self.zisk_job_manager {
+                // A full ZiSK queue is plain backpressure here: the data stays
+                // in the cache and the SNARK-arrival fallback re-creates the
+                // job once slots free up.
+                let _ = zjm
+                    .add_job(
+                        batch_number,
+                        crate::prover_api::zisk_job_manager::ZiskJobData {
+                            zisk_data: zisk_bytes.to_vec(),
+                            batch_metadata: batch_envelope.batch.clone(),
+                            added_at: std::time::Instant::now(),
+                        },
+                    )
+                    .await;
+            }
         }
         self.jobs.add_job(batch_envelope).await
     }

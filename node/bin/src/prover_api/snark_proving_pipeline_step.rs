@@ -32,55 +32,41 @@ impl SnarkProvingPipelineStep {
         last_proved_batch_number: u64,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
-    ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
-        Self::new_with_zisk_cache(
+    ) -> (Self, Arc<SnarkJobManager>) {
+        Self::new_with_zisk(
             max_fris_per_snark,
             last_proved_batch_number,
             assignment_timeout,
             max_assigned_batch_range,
             None,
+            None,
             false,
             None,
-            None,
-            0,
-            crate::batcher::batch_builder::ZiskChainConfig {
-                fri_proof_verification_enabled: false,
-                max_tx_gas_limit: 0,
-            },
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_zisk_cache(
+    pub fn new_with_zisk(
         max_fris_per_snark: usize,
         last_proved_batch_number: u64,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
         zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
+        zisk_job_manager: Option<Arc<super::zisk_job_manager::ZiskJobManager>>,
         require_multi_proof: bool,
         multi_proof_wait_timeout: Option<Duration>,
-        zisk_program_vk: Option<alloy::primitives::B256>,
-        chain_id: u64,
-        zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig,
-    ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
+    ) -> (Self, Arc<SnarkJobManager>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
         let mut sjm = SnarkJobManager::new(
-            proof_commands_sender.clone(),
+            proof_commands_sender,
             max_fris_per_snark,
             assignment_timeout,
             max_assigned_batch_range,
         );
 
-        let zisk_job_manager = if let Some(cache) = zisk_data_cache {
+        if let (Some(cache), Some(zjm)) = (zisk_data_cache, zisk_job_manager) {
             sjm.set_zisk_data_cache(cache.clone());
-            let zjm = Arc::new(super::zisk_job_manager::ZiskJobManager::new(
-                proof_commands_sender,
-                assignment_timeout,
-                zisk_program_vk,
-                chain_id,
-                zisk_chain_config,
-            ));
 
             // Periodic gauge refresh: queue/cache ages must advance while the
             // lane is idle — a stalled pipeline is exactly what they alert on.
@@ -95,7 +81,7 @@ impl SnarkProvingPipelineStep {
                     }
                 });
             }
-            sjm.set_zisk_job_manager(zjm.clone());
+            sjm.set_zisk_job_manager(zjm);
             if require_multi_proof {
                 sjm.set_require_multi_proof(true);
                 sjm.set_multi_proof_wait_timeout(multi_proof_wait_timeout);
@@ -106,10 +92,7 @@ impl SnarkProvingPipelineStep {
             } else {
                 tracing::info!("ZiSK job manager enabled (multi-proof optional)");
             }
-            Some(zjm)
-        } else {
-            None
-        };
+        }
 
         let snark_job_manager = Arc::new(sjm);
 
@@ -119,7 +102,7 @@ impl SnarkProvingPipelineStep {
             proof_commands_receiver,
         };
 
-        (result, snark_job_manager, zisk_job_manager)
+        (result, snark_job_manager)
     }
 }
 

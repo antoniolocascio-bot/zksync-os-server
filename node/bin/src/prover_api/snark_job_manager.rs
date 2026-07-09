@@ -2,14 +2,14 @@ use crate::prover_api::fri_job_manager::FriJob;
 use crate::prover_api::metrics::{ProverStage, ProverType, ZISK_LANE_METRICS};
 use crate::prover_api::prover_job_map::ProverJobMap;
 use crate::prover_api::zisk_data_cache::ZiskDataCache;
-use crate::prover_api::zisk_job_manager::{ZiskJobData, ZiskJobManager};
+use crate::prover_api::zisk_job_manager::{ZiskBatchStatus, ZiskJobData, ZiskJobManager};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Permit;
 use tokio::sync::mpsc::error::TrySendError;
 use zksync_os_batch_types::batcher_model::{
-    FriProof, RealSnarkProof, SignedBatchEnvelope, SnarkProof,
+    FriProof, MultiProofSnarkProof, RealSnarkProof, SignedBatchEnvelope, SnarkProof,
 };
 use zksync_os_batcher_metrics::BatchExecutionStage;
 use zksync_os_l1_sender::commands::prove::ProofCommand;
@@ -26,9 +26,14 @@ use zksync_os_types::ProvingVersion;
 /// `SnarkJobManager` aims to assign real prover jobs to real SNARK provers -
 ///     but if jobs are not picked within a timeout (`max_batch_age`), it releases it to a fake prover
 ///
-/// When an Airbender SNARK is submitted and ZiSK data exists for the batch,
-/// the batch is routed to `ZiskJobManager` for multi-proof composition.
-/// Otherwise, the Airbender-only proof is sent downstream immediately.
+/// The Airbender SNARK submission is the multi-proof rendezvous point: ZiSK
+/// proving starts at batch seal (`FriJobManager::add_job` creates the ZiSK
+/// job), and when the Airbender SNARK arrives here the batch's completed
+/// ZiSK proof — if it has already landed — is taken from `ZiskJobManager`
+/// and composed into a MultiProof on the spot. Under `require_multi_proof`
+/// a missing ZiSK proof blocks the submission (job re-offered) for only the
+/// residual proving time; otherwise the Airbender-only proof is sent
+/// downstream immediately.
 pub struct SnarkJobManager {
     jobs: ProverJobMap<FriProof>,
     // outbound
@@ -92,11 +97,6 @@ impl SnarkJobManager {
         self.zisk_job_manager = Some(zjm);
     }
 
-    /// Get a reference to the downstream proof command sender.
-    /// Used by ZiskJobManager to share the same downstream channel.
-    pub fn prove_sender(&self) -> &mpsc::Sender<ProofCommand> {
-        &self.prove_batches_sender
-    }
 
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<FriProof>) {
         self.jobs.add_job(batch_envelope).await
@@ -161,12 +161,13 @@ impl SnarkJobManager {
             "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
         );
 
-        // Check ZiSK data availability. For multi-batch ranges we only support
-        // ZiSK proving when the range is exactly one batch (enforced at
+        // ZiSK multi-proof applies to single-batch ranges only (enforced at
         // startup via `max_fris_per_snark = 1` when the second proof system
-        // is on; the branch below is defensive).
-        let has_zisk = if let Some(ref cache) = self.zisk_data_cache {
-            if batch_from != batch_to {
+        // is on; the branch below is defensive). The 2.7 aggregator guest
+        // relaxes this later with a dedicated ZiSK aggregation job stage.
+        let zisk_lane = match self.zisk_job_manager.as_ref() {
+            Some(zjm) if batch_from == batch_to => Some(zjm),
+            Some(_) => {
                 // Multi-batch range: ZiSK proving not supported, send Airbender-only.
                 // Log a warning so operators know multi-proof is skipped.
                 tracing::warn!(
@@ -174,20 +175,19 @@ impl SnarkJobManager {
                     batch_to,
                     "multi-batch SNARK range — ZiSK proving skipped (not yet supported for ranges)"
                 );
-                false
-            } else {
-                cache.contains(batch_from).await
+                None
             }
-        } else {
-            false
+            None => None,
         };
-
         // Multi-proof policy is decided BEFORE any job is consumed, so a
         // blocked submission leaves the SNARK job in place: the assignment
-        // times out and the batch is re-offered until its ZiSK path clears
-        // (block-until-proof). After `multi_proof_wait_timeout` (when set),
-        // the batch is allowed through Airbender-only with a loud signal.
-        let multi_proof_expected = self.require_multi_proof && self.zisk_data_cache.is_some();
+        // times out and the batch is re-offered until its ZiSK proof lands
+        // (block-until-proof). ZiSK proving starts at batch seal, so this
+        // wait covers only the residual proving time — not a full serial
+        // run behind the Airbender lane. After `multi_proof_wait_timeout`
+        // (when set), the batch is allowed through Airbender-only with a
+        // loud signal.
+        let multi_proof_expected = self.require_multi_proof && zisk_lane.is_some();
         let wait_expired = || async {
             match self.multi_proof_wait_timeout {
                 None => false,
@@ -198,15 +198,54 @@ impl SnarkJobManager {
                     .is_some_and(|age| age >= timeout),
             }
         };
-        if multi_proof_expected && batch_from == batch_to {
-            let blocked_reason = if !has_zisk {
-                Some("no ZiSK input available for the batch (evicted or not regenerated)")
-            } else if let Some(zjm) = self.zisk_job_manager.as_ref()
-                && !zjm.has_capacity().await
-            {
-                Some("ZiSK job queue is full (provers offline or behind)")
-            } else {
-                None
+        if let Some(zjm) = zisk_lane
+            && multi_proof_expected
+        {
+            let blocked_reason = match zjm.batch_status(batch_from).await {
+                ZiskBatchStatus::Completed => None,
+                ZiskBatchStatus::InFlight => {
+                    Some("ZiSK proof not yet submitted (job pending or assigned)")
+                }
+                ZiskBatchStatus::Unknown => {
+                    // Seal-time job creation was skipped (queue was full) or
+                    // lost (restart) — re-create the job from the cached
+                    // input so a prover can pick it up.
+                    if !zjm.has_capacity().await {
+                        Some("ZiSK job queue is full (provers offline or behind)")
+                    } else {
+                        let cache = self
+                            .zisk_data_cache
+                            .as_ref()
+                            .expect("ZiSK job manager implies a data cache");
+                        match cache.remove(batch_from).await {
+                            Some(zisk_data) => {
+                                tracing::warn!(
+                                    batch = batch_from,
+                                    "ZiSK job missing at SNARK arrival — re-created from cached input"
+                                );
+                                if let Err(rejected) = zjm
+                                    .add_job(
+                                        batch_from,
+                                        ZiskJobData {
+                                            zisk_data,
+                                            batch_metadata: batch_metadata.clone(),
+                                            added_at: std::time::Instant::now(),
+                                        },
+                                    )
+                                    .await
+                                {
+                                    // Raced to full — put the input back for
+                                    // the next re-offer of this batch.
+                                    cache.insert(batch_from, rejected.zisk_data).await;
+                                }
+                                Some("ZiSK job re-created from cached input — waiting for the proof")
+                            }
+                            None => Some(
+                                "no ZiSK input available for the batch (evicted or not regenerated)",
+                            ),
+                        }
+                    }
+                }
             };
             if let Some(reason) = blocked_reason {
                 if wait_expired().await {
@@ -257,66 +296,41 @@ impl SnarkJobManager {
             .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
             .collect();
 
-        if has_zisk {
-            let Some(zjm) = self.zisk_job_manager.as_ref() else {
-                tracing::error!(
-                    "ZiSK data exists but ZiskJobManager not initialized — sending Airbender-only"
-                );
-                return self.send_airbender_only(permit, consumed_batches_proven, payload, proving_version);
-            };
-            let cache = self.zisk_data_cache.as_ref().expect("checked above");
-            // Atomic remove — avoids TOCTOU race between contains() and remove().
-            let Some(zisk_data) = cache.remove(batch_from).await else {
-                tracing::warn!(
-                    batch = batch_from,
-                    "ZiSK data consumed by concurrent submit or expired, sending Airbender-only"
-                );
-                return self.send_airbender_only(permit, consumed_batches_proven, payload, proving_version);
-            };
-
-            tracing::info!(
-                batch = batch_from,
-                era_proof_bytes = payload.len(),
-                zisk_data_bytes = zisk_data.len(),
-                "Airbender SNARK received, routing to ZiSK job manager"
-            );
-
-            match zjm
-                .add_job(
-                    batch_from,
-                    ZiskJobData {
-                        zisk_data,
-                        era_proof: payload,
-                        proving_execution_version: proving_version as u32,
-                        batches: consumed_batches_proven,
-                        added_at: std::time::Instant::now(),
-                    },
-                )
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(rejected) => {
-                    // Queue filled up between the capacity pre-check and here —
-                    // fall back to Airbender-only using the recovered data
-                    // (under require_multi_proof the pre-check above already
-                    // rejected without consuming; this race window is benign).
-                    tracing::warn!(
-                        batch = batch_from,
-                        "ZiSK job queue full, sending Airbender-only proof"
-                    );
-                    permit.send(ProofCommand::new(
-                        rejected.batches,
-                        SnarkProof::Real(RealSnarkProof::V2 {
-                            proof: rejected.era_proof,
-                            proving_execution_version: rejected.proving_execution_version,
-                        }),
-                    ));
-                    Ok(())
+        // Multi-proof rendezvous: the batch's ZiSK proof has been in flight
+        // since batch seal — if it already landed, compose the MultiProof
+        // now. Otherwise this submission was allowed through as
+        // Airbender-only: no ZiSK expectation for the batch, optional mode,
+        // or degraded after the wait timeout.
+        if let Some(zjm) = zisk_lane {
+            if let Some(completed) = zjm.take_completed(batch_from).await {
+                if let Some(cache) = self.zisk_data_cache.as_ref() {
+                    cache.remove(batch_from).await;
                 }
+                tracing::info!(
+                    batch = batch_from,
+                    era_proof_bytes = payload.len(),
+                    zisk_proof_bytes = completed.proof.len(),
+                    "Airbender SNARK received, composing Airbender + ZiSK multi-proof"
+                );
+                permit.send(ProofCommand::new(
+                    consumed_batches_proven,
+                    SnarkProof::MultiProof(MultiProofSnarkProof {
+                        era_proof: payload,
+                        zisk_proof: completed.proof,
+                        zisk_public_values: completed.public_values,
+                        proving_execution_version: proving_version as u32,
+                    }),
+                ));
+                return Ok(());
             }
-        } else {
-            self.send_airbender_only(permit, consumed_batches_proven, payload, proving_version)
+            // The batch goes downstream without a ZiSK proof — a proof
+            // landing later can never be composed (batches are processed in
+            // order), so drop any parked proofs up to here. In-flight jobs
+            // are left alone: their submit-time validation is still the
+            // shadow-mode divergence signal.
+            zjm.discard_completed_up_to(batch_to).await;
         }
+        self.send_airbender_only(permit, consumed_batches_proven, payload, proving_version)
     }
 
     /// Send an Airbender-only SNARK proof downstream via a reserved permit.
@@ -403,6 +417,13 @@ impl SnarkJobManager {
                 .map(|batch| batch.with_stage(BatchExecutionStage::SnarkProvedFake))
                 .collect();
 
+            // Fake SNARKs can never be composed into a MultiProof — drop the
+            // batches' ZiSK lane state (jobs created at seal, parked proofs)
+            // so fake-prover environments don't accumulate orphans.
+            if let Some(zjm) = self.zisk_job_manager.as_ref() {
+                zjm.discard_batches(batch_from, batch_to).await;
+            }
+
             permit.send(ProofCommand::new(
                 batches_with_fake_proofs,
                 SnarkProof::Fake,
@@ -461,8 +482,18 @@ impl FakeSnarkProver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batcher::batch_builder::ZiskChainConfig;
     use crate::prover_api::test_util::create_test_batch_envelope;
+    use crate::prover_api::zisk_proof_constants::{
+        ZISK_PUBLIC_VALUES_BYTES, ZISK_SNARK_PROOF_BYTES,
+    };
     use zksync_os_types::ProtocolSemanticVersion;
+
+    const TEST_CHAIN_ID: u64 = 270;
+    const TEST_CHAIN_CONFIG: ZiskChainConfig = ZiskChainConfig {
+        fri_proof_verification_enabled: false,
+        max_tx_gas_limit: 1 << 24,
+    };
 
     fn envelope(batch: u64) -> SignedBatchEnvelope<FriProof> {
         let mut e = create_test_batch_envelope(batch, FriProof::Fake);
@@ -473,16 +504,59 @@ mod tests {
     async fn manager_with_job(
         require: bool,
         wait_timeout: Option<Duration>,
-    ) -> (SnarkJobManager, mpsc::Receiver<ProofCommand>, ProvingVersion) {
+    ) -> (
+        SnarkJobManager,
+        Arc<ZiskJobManager>,
+        mpsc::Receiver<ProofCommand>,
+        ProvingVersion,
+    ) {
         let (tx, rx) = mpsc::channel(4);
         let mut sjm = SnarkJobManager::new(tx, 1, Duration::from_secs(60), 10);
+        let zjm = Arc::new(ZiskJobManager::new(
+            Duration::from_secs(60),
+            None,
+            TEST_CHAIN_ID,
+            TEST_CHAIN_CONFIG,
+        ));
         sjm.set_zisk_data_cache(Arc::new(ZiskDataCache::new()));
+        sjm.set_zisk_job_manager(zjm.clone());
         sjm.set_require_multi_proof(require);
         sjm.set_multi_proof_wait_timeout(wait_timeout);
         let envelope = envelope(1);
         let proving_version = envelope.batch.proving_version().expect("proving version");
         sjm.add_job(envelope).await;
-        (sjm, rx, proving_version)
+        (sjm, zjm, rx, proving_version)
+    }
+
+    /// Run the batch's ZiSK job through the manager so a validated proof is
+    /// parked in `completed` — the state the rendezvous composes from.
+    async fn park_zisk_proof(zjm: &ZiskJobManager, batch: u64) {
+        let batch_metadata = envelope(batch).batch;
+        let stored = batch_metadata.batch_info.clone().into_stored();
+        let prev = &batch_metadata.previous_stored_batch_info;
+        let commitment = crate::prover_api::zisk_proof_verifier::expected_zisk_public_input(
+            &prev.state_commitment,
+            &stored,
+            TEST_CHAIN_ID,
+            TEST_CHAIN_CONFIG,
+        );
+        let mut public_values = vec![0u8; ZISK_PUBLIC_VALUES_BYTES];
+        public_values[32..64].copy_from_slice(commitment.as_slice());
+
+        zjm.add_job(
+            batch,
+            ZiskJobData {
+                zisk_data: vec![0xAB; 16],
+                batch_metadata,
+                added_at: std::time::Instant::now(),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("add_job rejected"));
+        zjm.pick_next_job("zisk-prover").await.expect("job available");
+        zjm.submit_proof(batch, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "zisk-prover")
+            .await
+            .expect("zisk proof accepted");
     }
 
     /// With multi-proof required and no ZiSK input for the batch, the
@@ -490,7 +564,7 @@ mod tests {
     /// stays in the map and is re-offered instead of being dropped.
     #[tokio::test]
     async fn blocked_submit_keeps_the_job() {
-        let (sjm, _rx, proving_version) = manager_with_job(true, None).await;
+        let (sjm, _zjm, _rx, proving_version) = manager_with_job(true, None).await;
 
         let err = sjm
             .submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
@@ -503,11 +577,60 @@ mod tests {
         );
     }
 
+    /// With multi-proof required and the batch's ZiSK proof still in flight
+    /// (job pending), the submission blocks without consuming the job.
+    #[tokio::test]
+    async fn blocked_while_zisk_proof_in_flight() {
+        let (sjm, zjm, _rx, proving_version) = manager_with_job(true, None).await;
+        zjm.add_job(
+            1,
+            ZiskJobData {
+                zisk_data: vec![0xAB; 16],
+                batch_metadata: envelope(1).batch,
+                added_at: std::time::Instant::now(),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("add_job rejected"));
+
+        let err = sjm
+            .submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
+            .await
+            .expect_err("must be blocked while the proof is in flight");
+        assert!(err.to_string().contains("not yet submitted"), "{err}");
+        assert!(sjm.jobs.get_job_batch_metadata(1).await.is_some());
+    }
+
+    /// The rendezvous: with the batch's validated ZiSK proof parked, the
+    /// Airbender submission composes and sends the MultiProof immediately.
+    #[tokio::test]
+    async fn completed_zisk_proof_composes_multi_proof() {
+        let (sjm, zjm, mut rx, proving_version) = manager_with_job(true, None).await;
+        park_zisk_proof(&zjm, 1).await;
+
+        sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
+            .await
+            .expect("submission with a parked ZiSK proof must pass");
+        let cmd = rx.try_recv().expect("MultiProof command sent downstream");
+        let (_batches, proof) = cmd.into_parts();
+        match proof {
+            SnarkProof::MultiProof(mp) => {
+                assert_eq!(mp.era_proof, vec![0xAA; 8]);
+                assert_eq!(mp.zisk_proof.len(), ZISK_SNARK_PROOF_BYTES);
+            }
+            other => panic!("expected MultiProof, got {other:?}"),
+        }
+        assert!(
+            zjm.take_completed(1).await.is_none(),
+            "the parked proof must be consumed by composition"
+        );
+    }
+
     /// Once the wait timeout expires, the same submission degrades to
     /// Airbender-only instead of blocking forever.
     #[tokio::test]
     async fn wait_timeout_degrades_to_single_proof() {
-        let (sjm, mut rx, proving_version) = manager_with_job(true, Some(Duration::ZERO)).await;
+        let (sjm, _zjm, mut rx, proving_version) = manager_with_job(true, Some(Duration::ZERO)).await;
 
         sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
             .await
@@ -520,14 +643,47 @@ mod tests {
         );
     }
 
-    /// Without the multi-proof requirement nothing blocks.
+    /// Without the multi-proof requirement nothing blocks, and a ZiSK proof
+    /// landing for an already-sent batch is discarded (never composable).
     #[tokio::test]
     async fn optional_multi_proof_sends_airbender_only() {
-        let (sjm, mut rx, proving_version) = manager_with_job(false, None).await;
+        let (sjm, zjm, mut rx, proving_version) = manager_with_job(false, None).await;
+        park_zisk_proof(&zjm, 1).await;
+        // Simulate an even earlier straggler that also can't be composed.
+        sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
+            .await
+            .expect("optional mode must pass through");
+        let cmd = rx.try_recv().expect("command sent downstream");
+        let (_batches, proof) = cmd.into_parts();
+        assert!(
+            matches!(proof, SnarkProof::MultiProof(_)),
+            "a parked proof is still composed opportunistically in optional mode"
+        );
+    }
+
+    /// Optional mode with no parked proof: the batch goes Airbender-only and
+    /// a proof parked afterwards for that batch is swept by the next send.
+    #[tokio::test]
+    async fn optional_mode_sweeps_stale_parked_proofs() {
+        let (sjm, zjm, mut rx, proving_version) = manager_with_job(false, None).await;
 
         sjm.submit_proof(1, 1, proving_version, vec![0xAA; 8], "prover-1".into())
             .await
             .expect("optional mode must pass through");
-        rx.try_recv().expect("Airbender-only command sent downstream");
+        let cmd = rx.try_recv().expect("Airbender-only command sent downstream");
+        let (_batches, proof) = cmd.into_parts();
+        assert!(matches!(proof, SnarkProof::Real(_)));
+
+        // A late proof for the already-sent batch parks, then the next
+        // Airbender-only send (batch 2) sweeps it as never-composable.
+        park_zisk_proof(&zjm, 1).await;
+        sjm.add_job(envelope(2)).await;
+        sjm.submit_proof(2, 2, proving_version, vec![0xBB; 8], "prover-1".into())
+            .await
+            .expect("optional mode must pass through");
+        assert!(
+            zjm.take_completed(1).await.is_none(),
+            "stale parked proof must be swept once its batch went Airbender-only"
+        );
     }
 }

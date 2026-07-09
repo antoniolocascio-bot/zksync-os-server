@@ -3,9 +3,9 @@
 //! when a daemon disappears mid-job.
 //!
 //! Runs the real axum router over a seeded `ZiskJobManager`. This lives here
-//! rather than in the full-node integration suite because `/ZiSK/pick` jobs
-//! are only created by *real* Airbender SNARK submissions (the fake-SNARK
-//! pass bypasses the multi-proof gate), which would require real proving.
+//! rather than in the full-node integration suite because the fake-SNARK
+//! pass discards ZiSK jobs when it consumes their batches, so exercising
+//! `/ZiSK/pick` deterministically requires seeding the manager directly.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,7 +51,6 @@ async fn zisk_fleet_pick_and_reassignment_over_http() {
 
     let (fri_tx, _fri_rx) = mpsc::channel(8);
     let (snark_tx, _snark_rx) = mpsc::channel(8);
-    let (prove_tx, _prove_rx) = mpsc::channel(8);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let proof_storage = ProofStorage::new(ProofStorageConfig {
@@ -75,7 +74,6 @@ async fn zisk_fleet_pick_and_reassignment_over_http() {
         10,
     ));
     let zisk_job_manager = Arc::new(ZiskJobManager::new(
-        prove_tx,
         ASSIGNMENT_TIMEOUT,
         None,
         270,
@@ -91,9 +89,7 @@ async fn zisk_fleet_pick_and_reassignment_over_http() {
             7,
             ZiskJobData {
                 zisk_data: zisk_data.clone(),
-                era_proof: vec![0xEE; 8],
-                proving_execution_version: 1,
-                batches: vec![create_test_batch_envelope(7, FriProof::Fake)],
+                batch_metadata: create_test_batch_envelope(7, FriProof::Fake).batch,
                 added_at: std::time::Instant::now(),
             },
         )

@@ -167,10 +167,13 @@ pub struct ZiskLaneMetrics {
     pub jobs_pending: Gauge<u64>,
     /// ZiSK jobs assigned to provers, awaiting proof submission.
     pub jobs_assigned: Gauge<u64>,
+    /// Validated ZiSK proofs parked awaiting their Airbender SNARK for
+    /// multi-proof composition (the rendezvous buffer).
+    pub proofs_awaiting_snark: Gauge<u64>,
     /// Age of the oldest ZiSK job (pending or assigned) in seconds.
     pub oldest_job_age_seconds: Gauge<u64>,
-    /// Time from ZiSK job creation (Airbender SNARK arrival) to an accepted
-    /// ZiSK proof submission.
+    /// Time from ZiSK job creation (batch seal) to an accepted ZiSK proof
+    /// submission.
     #[metrics(unit = Unit::Seconds, buckets = Buckets::LATENCIES)]
     pub time_to_submit: Histogram<Duration>,
     /// Wall-clock of the in-process guest re-execution per batch when
