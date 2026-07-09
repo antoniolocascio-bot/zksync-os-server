@@ -32,6 +32,35 @@ mod real_prover_upgrade {
         }
     }
 
+    /// The v31 SystemContext implementation bytecode, extracted from the v31
+    /// genesis: it is the unique initial contract whose code contains the
+    /// `setSettlementLayerChainId(uint256)` selector (0x040203e6).
+    fn v31_system_context_bytecode() -> anyhow::Result<alloy::primitives::Bytes> {
+        let genesis_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../local-chains/v31.0/genesis.json"
+        );
+        let genesis: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(genesis_path)?)?;
+        let contracts = genesis["initial_contracts"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("initial_contracts missing in v31 genesis"))?;
+        let mut matches = contracts.iter().filter_map(|entry| {
+            let code = entry.get(1)?.as_str()?;
+            code.to_lowercase()
+                .contains("040203e6")
+                .then(|| code.to_owned())
+        });
+        let code = matches
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no contract with the SL setter in v31 genesis"))?;
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "multiple contracts with the SL setter selector — extraction is ambiguous"
+        );
+        Ok(alloy::hex::decode(&code)?.into())
+    }
+
     /// Peek a batch's FRI job to learn its VK hash. `None` once the batch is
     /// unknown to the job map (not sealed yet, or already proven).
     async fn peek_fri_vk(prover_api_url: &str, batch: u64) -> anyhow::Result<Option<String>> {
@@ -113,20 +142,41 @@ mod real_prover_upgrade {
             .wait_finalized_with_timeout(1, REAL_PROOF_FINALITY_TIMEOUT)
             .await?;
 
-        // The real v30 -> v31 protocol upgrade, minimal shape: version bump +
-        // no-op delegate, no force deployments (the supplier path is the v31+
-        // flow; a v30 chain must not use the legacy inconsistent payload).
-        // Its internal waits require — and thereby assert — real finalization
-        // on both sides of the upgrade boundary. Run it concurrently with the
-        // prover swap: once the upgrade batch (first V7 job) appears and all
-        // earlier batches are proven, v6 is retired and v7 takes the GPU; the
-        // upgrade's post-boundary finality wait rides the v7 warmup (set
-        // TEST_FINALITY_TIMEOUT_SECS generously).
+        // The real v30 -> v31 protocol upgrade. Unlike a bare version bump,
+        // it must FORCE-DEPLOY the v31 SystemContext (0x800b): the sequencer
+        // appends a `SetSLChainId` system tx to the first v31 block, and
+        // without that contract the call no-ops silently — the STF then
+        // commits `settlement_layer_chain_id = 0` while the batcher and the
+        // L1 Committer (which requires `slChainId == block.chainid`) commit
+        // the real one, making every v31 batch unprovable. The bytecode is
+        // taken from the v31 genesis (the implementation behind the 0x800b
+        // proxy — deployed directly, since a test chain needs no proxy) and
+        // delivered via the L1 BytecodesSupplier, the production v31 path.
+        //
+        // The upgrade's internal waits require — and thereby assert — real
+        // finalization on both sides of the boundary. Run it concurrently
+        // with the prover swap: once the upgrade batch (first V7 job)
+        // appears and all earlier batches are proven, v6 is retired and v7
+        // takes the GPU; the upgrade's post-boundary finality wait rides the
+        // v7 warmup (set TEST_FINALITY_TIMEOUT_SECS generously).
+        let system_context_code = v31_system_context_bytecode()?;
+        let system_context_address: Address =
+            "0x000000000000000000000000000000000000800b".parse()?;
+        let force_deployments: std::collections::BTreeMap<Address, alloy::primitives::Bytes> =
+            [(system_context_address, system_context_code.clone())]
+                .into_iter()
+                .collect();
+
         let upgrade_tester = UpgradeTester::for_default_upgrade(&tester).await?;
+        upgrade_tester
+            .publish_bytecodes_to_l1_supplier([system_context_code])
+            .await?;
         let protocol_upgrade = upgrade_tester
             .protocol_upgrade_builder()
             .await?
             .bump_minor(1)
+            .with_force_deployments(force_deployments)
+            .with_factory_deps()
             .with_timestamp(U256::from(1))
             .build();
 
