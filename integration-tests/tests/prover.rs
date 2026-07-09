@@ -274,6 +274,70 @@ mod real_prover_upgrade {
 
         Ok(())
     }
+
+    /// ZiSK lane in isolation: boot the chain with all provers off, seal a
+    /// couple of batches, and run the real GPU daemon over them — pickup,
+    /// prove, proof-file parse, submission, and the server's commitment +
+    /// programVK validation, without the ~35-minute Airbender/upgrade flow.
+    /// Finality never advances here (nothing serves FRI jobs), which is
+    /// fine: batch sealing and ZiSK job creation are upstream of proving.
+    #[test_log::test(tokio::test)]
+    async fn zisk_lane_on_sealed_batches() -> anyhow::Result<()> {
+        let env = CURRENT_TO_L1.environment().await?;
+        let mut config = env.default_config().await?;
+        // Fakes stay off: a fake FRI/SNARK pass would finalize and discard
+        // the sealed batches' ZiSK jobs before the daemon picks them.
+        config.prover_api_config.fake_fri_provers.enabled = false;
+        config.prover_api_config.fake_snark_provers.enabled = false;
+        config.prover_api_config.max_fris_per_snark = 1;
+        config.prover_input_generator_config.second_proof_system = true;
+        if let Ok(vk) = std::env::var("ZISK_PROGRAM_VK") {
+            config.prover_api_config.zisk_program_vk = Some(vk.parse()?);
+        }
+        let tester = env.launch_without_provers(config).await?;
+        let prover_api_url = tester
+            .prover_api_url()
+            .expect("prover API must be bound for prover tests");
+
+        let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
+        let batches = 2u64;
+        for batch in 1..=batches {
+            tester
+                .l2_provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .with_to(recipient)
+                        .with_value(U256::from(batch)),
+                )
+                .await?
+                .get_receipt()
+                .await?;
+            // Wait for the batch to seal: its ZiSK job appears in the map.
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                let status = reqwest::Client::new()
+                    .get(format!(
+                        "{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek"
+                    ))
+                    .send()
+                    .await?
+                    .status();
+                if status == reqwest::StatusCode::OK {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "batch {batch} ZiSK job did not appear within 120s (status {status})"
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        // Clean daemon exit == every proof was accepted by the server.
+        run_zisk_gpu_prover(&prover_api_url, batches as usize).await;
+
+        Ok(())
+    }
 }
 
 #[test_multisetup([CURRENT_TO_L1, NEXT_TO_GATEWAY])]
