@@ -24,6 +24,7 @@ use alloy::rpc::types::TransactionRequest;
 use base64::Engine;
 use zksync_os_integration_tests::CURRENT_TO_L1;
 use zksync_os_integration_tests::contracts::{BytecodesSupplierV31, SystemContextV31};
+use zksync_os_integration_tests::provider::ZksyncTestingProvider;
 use zksync_os_integration_tests::upgrade::UpgradeTester;
 use zksync_os_types::ProvingVersion;
 
@@ -203,8 +204,15 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
         .with_factory_deps()
         .with_timestamp(U256::from(1))
         .build();
+    // Every pre-upgrade batch must be finalized before the cut retires the
+    // v30 commit encoding.
+    let tip = tester.l2_provider.get_block_number().await?;
+    tester
+        .l2_zk_provider
+        .wait_finalized_with_timeout(tip, Duration::from_secs(120))
+        .await?;
     upgrade_tester
-        .execute_default_upgrade(&protocol_upgrade, U256::MAX, U256::from(1), false, vec![])
+        .execute_default_upgrade_cut_first(&protocol_upgrade, U256::MAX, U256::from(1), vec![])
         .await?;
 
     // v31 traffic.

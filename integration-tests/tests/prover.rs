@@ -171,11 +171,17 @@ mod real_prover_upgrade {
             .with_timestamp(U256::from(1))
             .build();
 
-        let upgrade_fut = upgrade_tester.execute_default_upgrade(
+        // Every pre-upgrade batch must be finalized before the cut retires
+        // the v30 commit encoding.
+        let tip = tester.l2_provider.get_block_number().await?;
+        tester
+            .l2_zk_provider
+            .wait_finalized_with_timeout(tip, REAL_PROOF_FINALITY_TIMEOUT)
+            .await?;
+        let upgrade_fut = upgrade_tester.execute_default_upgrade_cut_first(
             &protocol_upgrade,
             U256::MAX,
             U256::from(1),
-            false,
             vec![],
         );
         let swap_fut = async {
