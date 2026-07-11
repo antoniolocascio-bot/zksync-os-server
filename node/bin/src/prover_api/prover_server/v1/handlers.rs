@@ -461,6 +461,84 @@ pub(super) async fn submit_zisk_proof(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Pick the next ZiSK AGGREGATION job (plan 2.7): a contiguous range of
+/// completed per-batch ZiSK proofs to collapse into one aggregator-guest
+/// proof. Mirrors `/SNARK/pick` semantics (range job, timeout-based
+/// reassignment).
+pub(super) async fn pick_zisk_aggregation_job(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(ref ajm) = state.zisk_aggregation_job_manager else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ZiSK aggregation not enabled",
+        )
+            .into_response();
+    };
+
+    match ajm.pick_next_job(&query.id).await {
+        Some(job) => Json(super::models::ZiskAggregationJobPayload {
+            from_batch_number: job.from_batch,
+            to_batch_number: job.to_batch,
+            proofs: job
+                .proofs
+                .into_iter()
+                .map(
+                    |(batch_number, proof)| super::models::ZiskAggregationBatchProof {
+                        batch_number,
+                        proof: general_purpose::STANDARD.encode(&proof.proof),
+                        public_values: general_purpose::STANDARD.encode(&proof.public_values),
+                    },
+                )
+                .collect(),
+        })
+        .into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// Submit an aggregated ZiSK range proof. Validated against the buffered
+/// per-batch public values (the aggregator guest's binding digest) and
+/// recorded; L1 submission is out of scope until era-contracts task 8.
+pub(super) async fn submit_zisk_aggregation_proof(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+    Json(payload): Json<super::models::ZiskAggregationProofPayload>,
+) -> Result<Response, (StatusCode, String)> {
+    let Some(ref ajm) = state.zisk_aggregation_job_manager else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ZiSK aggregation not enabled".into(),
+        ));
+    };
+
+    let proof = general_purpose::STANDARD
+        .decode(&payload.proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid proof base64: {e}")))?;
+    let public_values = general_purpose::STANDARD
+        .decode(&payload.public_values)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid public_values base64: {e}")))?;
+
+    use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationSubmitError;
+    match ajm
+        .submit_proof(
+            payload.from_batch_number,
+            payload.to_batch_number,
+            proof,
+            public_values,
+            &query.id,
+        )
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(err @ ZiskAggregationSubmitError::UnknownRange { .. }) => {
+            Err((StatusCode::NOT_FOUND, format!("{err}")))
+        }
+        Err(err) => Err((StatusCode::BAD_REQUEST, format!("{err}"))),
+    }
+}
+
 /// Get detailed information about a failed FRI proof for debugging.
 /// Returns the most recent failed proof for the given batch number.
 pub(super) async fn get_failed_fri_proof(

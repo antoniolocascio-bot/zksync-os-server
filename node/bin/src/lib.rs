@@ -1286,6 +1286,29 @@ async fn run_main_node_pipeline(
         ))
     });
 
+    // ZiSK aggregation stage (plan 2.7 scaffolding, default OFF): accepted
+    // per-batch proofs are copied into this manager's buffer, contiguous
+    // ranges become /ZiSK-AGG jobs, and accepted aggregated proofs are
+    // validated + recorded (L1 wiring lands with era-contracts task 8).
+    let zisk_aggregation_job_manager = zisk_job_manager.as_ref().and_then(|zjm| {
+        let agg_config = &config.prover_api_config.zisk_aggregation;
+        if !agg_config.enabled {
+            return None;
+        }
+        let agg = Arc::new(
+            crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager::new(
+                agg_config.range_size,
+                agg_config.job_timeout,
+            ),
+        );
+        zjm.set_aggregation_sink(agg.clone());
+        tracing::info!(
+            range_size = agg_config.range_size,
+            "ZiSK aggregation stage enabled (scaffolding: aggregated proofs are recorded, not sent to L1)"
+        );
+        Some(agg)
+    });
+
     let (fri_proving_step, fri_job_manager) = FriProvingPipelineStep::new(
         proof_storage.clone(),
         node_state_on_startup.l1_state.last_proved_batch,
@@ -1337,6 +1360,7 @@ async fn run_main_node_pipeline(
                 fri_job_manager.clone(),
                 snark_job_manager.clone(),
                 zisk_job_manager.clone(),
+                zisk_aggregation_job_manager.clone(),
                 proof_storage.clone(),
                 prover_listener,
                 shutdown,

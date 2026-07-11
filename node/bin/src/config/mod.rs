@@ -1602,6 +1602,37 @@ pub struct ProverApiConfig {
     /// Stop accepting transactions when the prover pipeline falls this many batches behind
     /// its upstream. Applied to both FRI and SNARK job managers.
     pub max_batch_diff_to_upstream: Option<u64>,
+
+    /// ZiSK aggregation stage (plan 2.7): collapse a range of per-batch
+    /// ZiSK proofs into one aggregator-guest proof for L1.
+    #[config(nest)]
+    pub zisk_aggregation: ZiskAggregationConfig,
+}
+
+/// ZiSK aggregation stage (plan 2.7, scaffolding until era-contracts task
+/// 8 wires the aggregated proof to L1). Mirrors the Airbender FRI→SNARK
+/// split: per-batch ZiSK proofs keep their pick/submit flow, and an
+/// aggregation job consumes a range of completed per-batch proofs via the
+/// `/ZiSK-AGG/{pick,submit}` endpoints.
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
+#[config(derive(Default))]
+pub struct ZiskAggregationConfig {
+    /// Whether the aggregation stage is enabled. Requires
+    /// `second_proof_system`. Scaffolding: accepted aggregated proofs are
+    /// only validated and recorded, never sent to L1.
+    #[config(default_t = false)]
+    pub enabled: bool,
+
+    /// Number of consecutive batches per aggregation range. Ranges are
+    /// strictly sequential; a range forms once all its per-batch proofs
+    /// are in. (Step-budgeted dynamic ranges arrive with the real
+    /// aggregator rollout — see plan 2.7.)
+    #[config(default_t = 4)]
+    pub range_size: usize,
+
+    /// Timeout after which an aggregation job is offered to another prover.
+    #[config(default_t = Duration::from_secs(600))]
+    pub job_timeout: Duration,
 }
 
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]

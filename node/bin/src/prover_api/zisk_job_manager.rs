@@ -119,6 +119,13 @@ pub struct ZiskJobManager {
     /// counted (`zisk_lane_vk_drift`) — the prover runs a different guest
     /// build. Unset: the reported VK is only logged.
     expected_program_vk: Option<B256>,
+    /// When set (aggregation stage enabled), every accepted per-batch
+    /// proof is COPIED into the aggregation job manager's input buffer,
+    /// and discards are forwarded so broken ranges are dropped. The
+    /// per-batch `completed` map and its MultiProof rendezvous are
+    /// unaffected. See `zisk_aggregation_job_manager.rs` (plan 2.7).
+    aggregation_sink:
+        std::sync::Mutex<Option<std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>>>,
     /// Chain id + chain config: preimage of the `chain_config_hash` word in
     /// the guest's batch public input, needed to compute the expected value.
     chain_id: u64,
@@ -141,9 +148,26 @@ impl ZiskJobManager {
             assignment_timeout,
             halt_on_mismatch: std::sync::Mutex::new(None),
             expected_program_vk,
+            aggregation_sink: std::sync::Mutex::new(None),
             chain_id,
             chain_config,
         }
+    }
+
+    /// Enable the aggregation stage: accepted per-batch proofs are copied
+    /// into `sink`'s input buffer, and discards are forwarded to it.
+    pub fn set_aggregation_sink(
+        &self,
+        sink: std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>,
+    ) {
+        *self.aggregation_sink.lock().expect("aggregation sink lock") = Some(sink);
+    }
+
+    fn aggregation_sink(
+        &self,
+    ) -> Option<std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>>
+    {
+        self.aggregation_sink.lock().expect("aggregation sink lock").clone()
     }
 
     /// Refresh the queue-depth/age gauges. Called under the state lock after
@@ -373,6 +397,13 @@ impl ZiskJobManager {
             "ZiSK proof accepted, awaiting Airbender SNARK for multi-proof composition"
         );
 
+        // Aggregation stage (when enabled): buffer a copy as range input.
+        // The parked original below stays the MultiProof rendezvous.
+        if let Some(sink) = self.aggregation_sink() {
+            sink.on_proof_completed(batch_number, proof.clone(), public_values.clone())
+                .await;
+        }
+
         {
             let mut state = self.state.lock().await;
             state.completed.insert(
@@ -407,6 +438,11 @@ impl ZiskJobManager {
     /// jobs are deliberately left alone — their submit-time validation still
     /// provides the shadow-mode divergence signal.
     pub async fn discard_completed_up_to(&self, batch_to: u64) {
+        // Batches sent without their proof can never join an aggregation
+        // range either — drop the copies and any range they broke.
+        if let Some(sink) = self.aggregation_sink() {
+            sink.discard_up_to(batch_to).await;
+        }
         let mut state = self.state.lock().await;
         let stale: Vec<u64> = state
             .completed
@@ -432,6 +468,11 @@ impl ZiskJobManager {
     /// batches consumed without a real Airbender SNARK (fake-prover
     /// environments, pre-V6 replay) don't leave orphaned jobs behind.
     pub async fn discard_batches(&self, batch_from: u64, batch_to: u64) {
+        // The fake-SNARK pass consumes the lowest in-flight batches, so the
+        // aggregation lane treats this as an up-to cut as well.
+        if let Some(sink) = self.aggregation_sink() {
+            sink.discard_up_to(batch_to).await;
+        }
         let mut state = self.state.lock().await;
         let mut discarded = 0usize;
         for batch in batch_from..=batch_to {
@@ -628,6 +669,62 @@ mod tests {
         assert!(
             !manager.has_pending_jobs().await,
             "halting mode must not requeue the mismatching job"
+        );
+    }
+
+    /// With an aggregation sink attached, an accepted proof is COPIED into
+    /// the aggregation input buffer while the parked original still serves
+    /// the SNARK rendezvous — enabling the stage must not disturb the
+    /// existing MultiProof flow.
+    #[tokio::test]
+    async fn accepted_proof_feeds_aggregation_sink() {
+        use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager;
+
+        let manager = manager(None);
+        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(1, Duration::from_secs(60)));
+        manager.set_aggregation_sink(agg.clone());
+
+        let data = job_data(7, vec![0xAB; 32]);
+        let public_values = matching_public_values(&data);
+        manager.add_job(7, data).await.unwrap_or_else(|_| panic!("add rejected"));
+        manager.pick_next_job("prover-1").await.expect("job available");
+        manager
+            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values.clone(), "prover-1")
+            .await
+            .expect("accepted");
+
+        // Range size 1: the copy immediately forms an aggregation job.
+        let job = agg.pick_next_job("agg-1").await.expect("aggregation job formed");
+        assert_eq!((job.from_batch, job.to_batch), (7, 7));
+        assert_eq!(job.proofs[0].1.public_values, public_values);
+        // The rendezvous parking is untouched by the copy.
+        let completed = manager.take_completed(7).await.expect("still parked");
+        assert_eq!(completed.public_values, public_values);
+    }
+
+    /// Discards forward to the aggregation sink so its buffered copies and
+    /// broken ranges are dropped alongside the per-batch state.
+    #[tokio::test]
+    async fn discards_forward_to_aggregation_sink() {
+        use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager;
+
+        let manager = manager(None);
+        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(1, Duration::from_secs(60)));
+        manager.set_aggregation_sink(agg.clone());
+
+        let data = job_data(7, vec![0xAB; 32]);
+        let public_values = matching_public_values(&data);
+        manager.add_job(7, data).await.unwrap_or_else(|_| panic!("add rejected"));
+        manager.pick_next_job("prover-1").await.expect("job available");
+        manager
+            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "prover-1")
+            .await
+            .expect("accepted");
+
+        manager.discard_batches(7, 7).await;
+        assert!(
+            agg.pick_next_job("agg-1").await.is_none(),
+            "discarded batch must not form an aggregation range"
         );
     }
 

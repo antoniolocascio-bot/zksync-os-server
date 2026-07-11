@@ -100,6 +100,7 @@ async fn zisk_fleet_pick_and_reassignment_over_http() {
         fri_job_manager,
         snark_job_manager,
         zisk_job_manager: Some(zisk_job_manager),
+        zisk_aggregation_job_manager: None,
         proof_storage,
     };
     let app = axum::Router::new()
