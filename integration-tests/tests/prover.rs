@@ -338,6 +338,83 @@ mod real_prover_upgrade {
 
         Ok(())
     }
+
+    /// Capture N sealed batches' ZiSK `BatchInput`s to disk, without proving.
+    /// Feeds offline proving flows (e.g. minting `vadcop_final` proofs for
+    /// range aggregation) with a coherent sequence of real chain batches.
+    /// Env: `CAPTURE_BATCHES` (default 4), `CAPTURE_DIR` (default
+    /// /tmp/zisk-batch-inputs). Writes `batch-N.bin` (raw bincode) and
+    /// `batch-N.input.bin` (cargo-zisk framing: [len u64 LE][data][pad→8]).
+    #[test_log::test(tokio::test)]
+    async fn capture_sealed_batch_inputs() -> anyhow::Result<()> {
+        let n: u64 = std::env::var("CAPTURE_BATCHES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let dir = std::env::var("CAPTURE_DIR")
+            .unwrap_or_else(|_| "/tmp/zisk-batch-inputs".to_string());
+        std::fs::create_dir_all(&dir)?;
+
+        let env = CURRENT_TO_L1.environment().await?;
+        let mut config = env.default_config().await?;
+        config.prover_api_config.fake_fri_provers.enabled = false;
+        config.prover_api_config.fake_snark_provers.enabled = false;
+        config.prover_api_config.max_fris_per_snark = 1;
+        config.prover_input_generator_config.second_proof_system = true;
+        let tester = env.launch_without_provers(config).await?;
+        let prover_api_url = tester
+            .prover_api_url()
+            .expect("prover API must be bound for prover tests");
+
+        let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
+        for batch in 1..=n {
+            tester
+                .l2_provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .with_to(recipient)
+                        .with_value(U256::from(batch)),
+                )
+                .await?
+                .get_receipt()
+                .await?;
+            // Wait for the batch's ZiSK job, then capture its input.
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let zisk_data = loop {
+                let response = reqwest::Client::new()
+                    .get(format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek"))
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::OK {
+                    let payload: serde_json::Value = response.json().await?;
+                    let b64 = payload
+                        .get("zisk_data")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("batch {batch}: no zisk_data"))?
+                        .to_owned();
+                    use base64::Engine;
+                    break base64::engine::general_purpose::STANDARD.decode(b64)?;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "batch {batch} ZiSK job did not appear within 120s"
+                );
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            };
+
+            std::fs::write(format!("{dir}/batch-{batch}.bin"), &zisk_data)?;
+            let mut framed = (zisk_data.len() as u64).to_le_bytes().to_vec();
+            framed.extend_from_slice(&zisk_data);
+            while framed.len() % 8 != 0 {
+                framed.push(0);
+            }
+            std::fs::write(format!("{dir}/batch-{batch}.input.bin"), &framed)?;
+            tracing::info!(batch, bytes = zisk_data.len(), "captured ZiSK batch input");
+        }
+
+        tracing::info!(n, dir = %dir, "all batch inputs captured");
+        Ok(())
+    }
 }
 
 #[test_multisetup([CURRENT_TO_L1, NEXT_TO_GATEWAY])]
