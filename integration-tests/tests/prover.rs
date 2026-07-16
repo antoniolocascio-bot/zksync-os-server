@@ -379,6 +379,15 @@ mod real_prover_upgrade {
         let mut airbender =
             KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await);
 
+        // The service's FRI device pool sizes itself to ALL free VRAM at
+        // creation, while the SNARK wrapper's ProverContext allocates
+        // separately with no reserved headroom — whichever allocates first
+        // wins, and the FRI pool only wins races (it is created on the
+        // first picked job). Hold traffic until the wrapper context exists
+        // so the pool sizes itself around it; on a 32 GB card the reverse
+        // order fails with ErrorMemoryAllocation in the SNARK warmup.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
         for i in 1..=BATCHES {
             tester
