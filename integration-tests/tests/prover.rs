@@ -14,7 +14,7 @@ mod real_prover_upgrade {
     use std::time::Duration;
     use zksync_os_integration_tests::provider::ZksyncTestingProvider;
     use zksync_os_integration_tests::upgrade::{Action, CommitterFacetV31, FacetCut, UpgradeTester};
-    use zksync_os_integration_tests::{CURRENT_TO_L1, run_zisk_gpu_prover, run_zisk_gpu_prover_aggregated, spawn_airbender_prover};
+    use zksync_os_integration_tests::{CURRENT_TO_L1, SettlementLayer, TestCase, run_zisk_gpu_prover, run_zisk_gpu_prover_aggregated, spawn_airbender_prover};
     use zksync_os_server::default_protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_V31_0};
     use zksync_os_types::ProvingVersion;
 
@@ -354,7 +354,16 @@ mod real_prover_upgrade {
     async fn two_lane_multibatch_e2e() -> anyhow::Result<()> {
         const BATCHES: u64 = 4;
 
-        let env = CURRENT_TO_L1.environment().await?;
+        // v31 lane: prover-service v0.8.0 ships its SNARK precomputations and
+        // caches one GPU context sized for reuse, so the whole two-lane run
+        // fits a 32 GB card. v0.7.1 (the v30 lane) recomputes the SNARK setup
+        // at startup and cannot initialize its GPU context on 32 GB.
+        let env = TestCase {
+            protocol_version: PROTOCOL_VERSION_V31_0,
+            settlement_layer: SettlementLayer::L1,
+        }
+        .environment()
+        .await?;
         let mut config = env.default_config().await?;
         config.prover_api_config.fake_fri_provers.enabled = false;
         config.prover_api_config.fake_snark_provers.enabled = false;
@@ -377,16 +386,7 @@ mod real_prover_upgrade {
         // Airbender first (single GPU: shivini claims all VRAM). One SNARK
         // covers all four batches.
         let mut airbender =
-            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await);
-
-        // The service's FRI device pool sizes itself to ALL free VRAM at
-        // creation, while the SNARK wrapper's ProverContext allocates
-        // separately with no reserved headroom — whichever allocates first
-        // wins, and the FRI pool only wins races (it is created on the
-        // first picked job). Hold traffic until the wrapper context exists
-        // so the pool sizes itself around it; on a 32 GB card the reverse
-        // order fails with ErrorMemoryAllocation in the SNARK warmup.
-        tokio::time::sleep(Duration::from_secs(90)).await;
+            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000).await);
 
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
         for i in 1..=BATCHES {
