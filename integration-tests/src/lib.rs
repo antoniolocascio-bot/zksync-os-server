@@ -1449,6 +1449,67 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
 /// - `ZISK_ELF` — path to the ZiSK guest ELF
 /// - `ZISK_PK` — path to ZiSK STARK proving key directory
 /// - `ZISK_SK` — path to ZiSK PLONK proving key directory
+/// Aggregated-mode variant of [run_zisk_gpu_prover]: the daemon proves each
+/// batch to a vadcop_final STARK, submits the stream, aggregates ranges in
+/// the aggregator guest (`ZISK_AGG_ELF`), and submits one PLONK range proof
+/// per Airbender SNARK range. `iterations` counts accepted submissions
+/// (per-batch + range); clean exit is the assertion.
+#[cfg(feature = "gpu-prover-tests")]
+pub async fn run_zisk_gpu_prover_aggregated(sequencer_url: &str, iterations: usize) {
+    let zisk_bin = std::env::var("ZISK_PROVER_BIN")
+        .unwrap_or_else(|_| "zksync-os-zisk-prover-service".to_string());
+    let cargo_zisk =
+        std::env::var("ZISK_BINARY").unwrap_or_else(|_| "cargo-zisk".to_string());
+    let elf_path = std::env::var("ZISK_ELF")
+        .expect("ZISK_ELF must be set for gpu-prover-tests (path to ZiSK guest ELF)");
+    let agg_elf_path = std::env::var("ZISK_AGG_ELF")
+        .expect("ZISK_AGG_ELF must be set (path to the aggregator guest ELF)");
+    let proving_key = std::env::var("ZISK_PK")
+        .unwrap_or_else(|_| format!("{}/.zisk/provingKey", std::env::var("HOME").unwrap()));
+    let proving_key_plonk = std::env::var("ZISK_SK")
+        .unwrap_or_else(|_| format!("{}/.zisk/provingKeySnark", std::env::var("HOME").unwrap()));
+
+    tracing::info!(
+        zisk_bin = %zisk_bin,
+        elf_path = %elf_path,
+        agg_elf_path = %agg_elf_path,
+        iterations,
+        "Launching ZiSK GPU prover (aggregated mode)"
+    );
+
+    let mut child = tokio::process::Command::new(&zisk_bin)
+        .arg("--sequencer-url")
+        .arg(sequencer_url)
+        .arg("--zisk-binary")
+        .arg(&cargo_zisk)
+        .arg("--elf-path")
+        .arg(&elf_path)
+        .arg("--proving-key")
+        .arg(&proving_key)
+        .arg("--proving-key-plonk")
+        .arg(&proving_key_plonk)
+        .arg("--aggregation")
+        .arg("--aggregator-elf")
+        .arg(&agg_elf_path)
+        .arg("--iterations")
+        .arg(iterations.to_string())
+        .spawn()
+        .expect("failed to spawn ZiSK prover service (aggregated)");
+
+    let code = child
+        .wait()
+        .await
+        .expect("failed to wait for ZiSK prover service");
+    if code.success() {
+        tracing::info!("ZiSK GPU prover service (aggregated) finished running");
+    } else {
+        panic!(
+            "ZiSK GPU prover service (aggregated) terminated with exit code {}",
+            code
+        );
+    }
+}
+
 #[cfg(feature = "gpu-prover-tests")]
 pub async fn run_zisk_gpu_prover(sequencer_url: &str, iterations: usize) {
     let zisk_bin = std::env::var("ZISK_PROVER_BIN")

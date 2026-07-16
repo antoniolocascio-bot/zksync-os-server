@@ -14,7 +14,7 @@ mod real_prover_upgrade {
     use std::time::Duration;
     use zksync_os_integration_tests::provider::ZksyncTestingProvider;
     use zksync_os_integration_tests::upgrade::{Action, CommitterFacetV31, FacetCut, UpgradeTester};
-    use zksync_os_integration_tests::{CURRENT_TO_L1, run_zisk_gpu_prover, spawn_airbender_prover};
+    use zksync_os_integration_tests::{CURRENT_TO_L1, run_zisk_gpu_prover, run_zisk_gpu_prover_aggregated, spawn_airbender_prover};
     use zksync_os_server::default_protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_V31_0};
     use zksync_os_types::ProvingVersion;
 
@@ -335,6 +335,79 @@ mod real_prover_upgrade {
 
         // Clean daemon exit == every proof was accepted by the server.
         run_zisk_gpu_prover(&prover_api_url, batches as usize).await;
+
+        Ok(())
+    }
+
+    /// The full two-lane multi-batch flow: Airbender proves a 4-batch SNARK
+    /// range (max_fris_per_snark = 4) to real L1 finality, then the ZiSK
+    /// daemon in aggregated mode proves each batch to a vadcop_final,
+    /// aggregates the range in the aggregator guest, and submits one range
+    /// proof — accepted only if its binding digest matches the server's
+    /// recomputation over the same batch range (single GPU: lanes run
+    /// sequentially).
+    ///
+    /// Env: ZISK_AGG_ELF (aggregator guest ELF path) + the usual
+    /// gpu-prover-tests set; ZISK_PROGRAM_VK / ZISK_AGG_PROGRAM_VK arm the
+    /// per-lane VK tripwires.
+    #[test_log::test(tokio::test)]
+    async fn two_lane_multibatch_e2e() -> anyhow::Result<()> {
+        const BATCHES: u64 = 4;
+
+        let env = CURRENT_TO_L1.environment().await?;
+        let mut config = env.default_config().await?;
+        config.prover_api_config.fake_fri_provers.enabled = false;
+        config.prover_api_config.fake_snark_provers.enabled = false;
+        config.prover_api_config.max_fris_per_snark = BATCHES as usize;
+        config.prover_input_generator_config.second_proof_system = true;
+        config.prover_api_config.zisk_aggregation.enabled = true;
+        config.prover_api_config.zisk_aggregation.range_size = BATCHES as usize;
+        if let Ok(vk) = std::env::var("ZISK_PROGRAM_VK") {
+            config.prover_api_config.zisk_program_vk = Some(vk.parse()?);
+        }
+        if let Ok(vk) = std::env::var("ZISK_AGG_PROGRAM_VK") {
+            config.prover_api_config.zisk_aggregation.program_vk = Some(vk.parse()?);
+        }
+        let tester = env.launch_without_provers(config).await?;
+        let prover_api_url = tester
+            .prover_api_url()
+            .expect("prover API must be bound for prover tests");
+        let urls = vec![prover_api_url.clone()];
+
+        // Airbender first (single GPU: shivini claims all VRAM). One SNARK
+        // covers all four batches.
+        let mut airbender =
+            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await);
+
+        let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
+        for i in 1..=BATCHES {
+            tester
+                .l2_provider
+                .send_transaction(
+                    TransactionRequest::default()
+                        .with_to(recipient)
+                        .with_value(U256::from(i)),
+                )
+                .await?
+                .get_receipt()
+                .await?;
+        }
+
+        // Real finality of the last block = the 4-FRI SNARK verified on L1
+        // (absorbs the one-time prover warmup).
+        let last_block = tester.l2_provider.get_block_number().await?;
+        tester
+            .l2_zk_provider
+            .wait_finalized_with_timeout(last_block, REAL_PROOF_FINALITY_TIMEOUT)
+            .await?;
+        airbender.0.kill().await.ok();
+        tracing::info!("4-batch Airbender SNARK finalized on L1 — starting aggregated ZiSK lane");
+
+        // ZiSK aggregated lane: 4 per-batch vadcop_final submissions + 1
+        // range proof = 5 accepted submissions for a clean exit. The range
+        // was noted at the SNARK pick/submit gate, so the aggregation job
+        // becomes available once all four inputs are buffered.
+        run_zisk_gpu_prover_aggregated(&prover_api_url, (BATCHES + 1) as usize).await;
 
         Ok(())
     }
