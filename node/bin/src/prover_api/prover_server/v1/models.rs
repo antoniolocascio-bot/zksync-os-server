@@ -44,33 +44,35 @@ pub(super) struct ZiskBatchDataPayload {
     pub zisk_data: String,
 }
 
-/// Payload for submitting a ZiSK SNARK proof.
+/// Payload for submitting a per-batch ZiSK proof.
+///
+/// Per-batch PLONK mode: `proof` is the 768-byte wrapped SNARK and
+/// `public_values` the 320-byte wire layout. Aggregated mode: `proof` is
+/// the raw `vadcop_final` proof stream (~330 KiB, it carries its own
+/// publics) and `public_values` must be empty.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ZiskProofPayload {
     pub batch_number: u64,
-    /// Base64-encoded ZiSK SNARK proof (768 bytes).
+    /// Base64-encoded proof (see above for the per-mode shape).
     pub proof: String,
-    /// Base64-encoded ZiSK public values (256 bytes).
+    /// Base64-encoded ZiSK public values (320 bytes in PLONK mode; empty
+    /// in aggregated mode).
+    #[serde(default)]
     pub public_values: String,
 }
 
-/// One per-batch entry inside a ZiSK aggregation job payload.
-///
-/// SCAFFOLDING NOTE: today this carries the per-batch PLONK-wrapped proof
-/// the server holds; the aggregator guest consumes the pre-wrap
-/// `vadcop_final` streams, which the daemon will retain/submit when the
-/// aggregation lane goes live (plan 2.7).
+/// One per-batch entry inside a ZiSK aggregation job payload: the raw
+/// `vadcop_final` proof stream the server buffered for that batch — the
+/// exact input the aggregator guest verifies.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ZiskAggregationBatchProof {
     pub batch_number: u64,
-    /// Base64-encoded per-batch ZiSK SNARK proof (768 bytes).
+    /// Base64-encoded per-batch `vadcop_final` proof stream (~330 KiB).
     pub proof: String,
-    /// Base64-encoded per-batch ZiSK public values (320 bytes).
-    pub public_values: String,
 }
 
 /// Response for the ZiSK aggregation pick endpoint: a contiguous range of
-/// completed per-batch proofs, in batch order.
+/// buffered per-batch `vadcop_final` streams, in batch order.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct ZiskAggregationJobPayload {
     pub from_batch_number: u64,

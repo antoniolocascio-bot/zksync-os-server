@@ -1603,36 +1603,45 @@ pub struct ProverApiConfig {
     /// its upstream. Applied to both FRI and SNARK job managers.
     pub max_batch_diff_to_upstream: Option<u64>,
 
-    /// ZiSK aggregation stage (plan 2.7): collapse a range of per-batch
-    /// ZiSK proofs into one aggregator-guest proof for L1.
+    /// ZiSK aggregation stage: collapse a range of per-batch ZiSK proofs
+    /// into one aggregator-guest proof for L1.
     #[config(nest)]
     pub zisk_aggregation: ZiskAggregationConfig,
 }
 
-/// ZiSK aggregation stage (plan 2.7, scaffolding until era-contracts task
-/// 8 wires the aggregated proof to L1). Mirrors the Airbender FRI→SNARK
-/// split: per-batch ZiSK proofs keep their pick/submit flow, and an
-/// aggregation job consumes a range of completed per-batch proofs via the
-/// `/ZiSK-AGG/{pick,submit}` endpoints.
+/// ZiSK aggregation stage. Mirrors the Airbender FRI→SNARK split: the
+/// per-batch pick/submit flow stays, but the daemon submits `vadcop_final`
+/// proof streams instead of PLONK-wrapped SNARKs, and an aggregation job
+/// (`/ZiSK-AGG/{pick,submit}`) collapses the streams of one Airbender
+/// SNARK range into a single range proof — the ZiSK half of that range's
+/// MultiProof. Requires `second_proof_system`, daemons running with
+/// `--aggregation`, and `max_fris_per_snark == range_size` (aggregation
+/// ranges are exactly the Airbender SNARK job ranges).
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
 #[config(derive(Default))]
 pub struct ZiskAggregationConfig {
-    /// Whether the aggregation stage is enabled. Requires
-    /// `second_proof_system`. Scaffolding: accepted aggregated proofs are
-    /// only validated and recorded, never sent to L1.
+    /// Whether the aggregation stage is enabled.
     #[config(default_t = false)]
     pub enabled: bool,
 
-    /// Number of consecutive batches per aggregation range. Ranges are
-    /// strictly sequential; a range forms once all its per-batch proofs
-    /// are in. (Step-budgeted dynamic ranges arrive with the real
-    /// aggregator rollout — see plan 2.7.)
+    /// Maximum number of consecutive batches per aggregation range. Must
+    /// equal `prover_api.max_fris_per_snark`; a range covers exactly the
+    /// batches of its Airbender SNARK job (usually `range_size`, fewer
+    /// when the SNARK lane picked a partial range).
     #[config(default_t = 4)]
     pub range_size: usize,
 
     /// Timeout after which an aggregation job is offered to another prover.
     #[config(default_t = Duration::from_secs(600))]
     pub job_timeout: Duration,
+
+    /// Expected AGGREGATOR guest program VK: the first 32 bytes of an
+    /// aggregated proof's public values, fixed by the aggregator-guest
+    /// build (`zksync-os-zisk/guest-aggregator/GUEST_PROGRAM_VK`). When
+    /// set, a submission with a different VK is rejected and counted
+    /// (`zisk_lane_aggregated_vk_drift`). Unset: the reported VK is only
+    /// logged on each submit.
+    pub program_vk: Option<B256>,
 }
 
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]

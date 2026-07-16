@@ -387,25 +387,19 @@ pub(super) async fn peek_zisk_data(
     State(state): State<AppState>,
 ) -> Response {
     match state.fri_job_manager.peek_batch_data(batch_number).await {
-        Some((vk_hash, prover_input)) => {
-            match prover_input.zisk_data() {
-                Some(zisk_bytes) => {
-                    Json(ZiskBatchDataPayload {
-                        batch_number,
-                        vk_hash: vk_hash.to_string(),
-                        zisk_data: general_purpose::STANDARD.encode(zisk_bytes),
-                    })
-                    .into_response()
-                }
-                None => {
-                    (
-                        StatusCode::NOT_FOUND,
-                        format!("Batch {batch_number} has no ZiSK data (second_proof_system not enabled?)"),
-                    )
-                        .into_response()
-                }
-            }
-        }
+        Some((vk_hash, prover_input)) => match prover_input.zisk_data() {
+            Some(zisk_bytes) => Json(ZiskBatchDataPayload {
+                batch_number,
+                vk_hash: vk_hash.to_string(),
+                zisk_data: general_purpose::STANDARD.encode(zisk_bytes),
+            })
+            .into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                format!("Batch {batch_number} has no ZiSK data (second_proof_system not enabled?)"),
+            )
+                .into_response(),
+        },
         None => {
             // Also check proof storage for completed batches
             StatusCode::NO_CONTENT.into_response()
@@ -424,35 +418,47 @@ pub(super) async fn pick_zisk_job(
     };
 
     match zjm.pick_next_job(&query.id).await {
-        Some(job) => {
-            Json(ZiskBatchDataPayload {
-                batch_number: job.batch_number,
-                vk_hash: job.vk_hash,
-                zisk_data: general_purpose::STANDARD.encode(&job.zisk_data),
-            })
-            .into_response()
-        }
+        Some(job) => Json(ZiskBatchDataPayload {
+            batch_number: job.batch_number,
+            vk_hash: job.vk_hash,
+            zisk_data: general_purpose::STANDARD.encode(&job.zisk_data),
+        })
+        .into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
-/// Submit a ZiSK SNARK proof. Pairs with the cached Airbender SNARK
-/// to produce a MultiProof for L1 verification.
+/// Submit a per-batch ZiSK proof: the PLONK-wrapped SNARK (per-batch mode,
+/// composed with the Airbender SNARK into a MultiProof) or the raw
+/// `vadcop_final` stream (aggregated mode, buffered as aggregation input).
 pub(super) async fn submit_zisk_proof(
     Query(query): Query<ProverQuery>,
     State(state): State<AppState>,
     Json(payload): Json<super::models::ZiskProofPayload>,
 ) -> Result<Response, (StatusCode, String)> {
     let Some(ref zjm) = state.zisk_job_manager else {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "ZiSK proving not enabled".into()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ZiSK proving not enabled".into(),
+        ));
     };
 
     let proof = general_purpose::STANDARD
         .decode(&payload.proof)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid proof base64: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid proof base64: {e}"),
+            )
+        })?;
     let public_values = general_purpose::STANDARD
         .decode(&payload.public_values)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid public_values base64: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid public_values base64: {e}"),
+            )
+        })?;
 
     zjm.submit_proof(payload.batch_number, proof, public_values, &query.id)
         .await
@@ -461,10 +467,10 @@ pub(super) async fn submit_zisk_proof(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Pick the next ZiSK AGGREGATION job (plan 2.7): a contiguous range of
-/// completed per-batch ZiSK proofs to collapse into one aggregator-guest
-/// proof. Mirrors `/SNARK/pick` semantics (range job, timeout-based
-/// reassignment).
+/// Pick the next ZiSK AGGREGATION job: the buffered per-batch
+/// `vadcop_final` streams of one Airbender SNARK range, to collapse into
+/// one aggregator-guest proof. Mirrors `/SNARK/pick` semantics (range job,
+/// timeout-based reassignment).
 pub(super) async fn pick_zisk_aggregation_job(
     Query(query): Query<ProverQuery>,
     State(state): State<AppState>,
@@ -482,13 +488,12 @@ pub(super) async fn pick_zisk_aggregation_job(
             from_batch_number: job.from_batch,
             to_batch_number: job.to_batch,
             proofs: job
-                .proofs
+                .streams
                 .into_iter()
                 .map(
-                    |(batch_number, proof)| super::models::ZiskAggregationBatchProof {
+                    |(batch_number, stream)| super::models::ZiskAggregationBatchProof {
                         batch_number,
-                        proof: general_purpose::STANDARD.encode(&proof.proof),
-                        public_values: general_purpose::STANDARD.encode(&proof.public_values),
+                        proof: general_purpose::STANDARD.encode(&stream),
                     },
                 )
                 .collect(),
@@ -498,9 +503,10 @@ pub(super) async fn pick_zisk_aggregation_job(
     }
 }
 
-/// Submit an aggregated ZiSK range proof. Validated against the buffered
-/// per-batch public values (the aggregator guest's binding digest) and
-/// recorded; L1 submission is out of scope until era-contracts task 8.
+/// Submit an aggregated ZiSK range proof. Validated (aggregator program-VK
+/// tripwire + the binding digest recomputed from the buffered per-batch
+/// streams) and parked until the Airbender SNARK of the same range
+/// composes the MultiProof.
 pub(super) async fn submit_zisk_aggregation_proof(
     Query(query): Query<ProverQuery>,
     State(state): State<AppState>,
@@ -515,10 +521,20 @@ pub(super) async fn submit_zisk_aggregation_proof(
 
     let proof = general_purpose::STANDARD
         .decode(&payload.proof)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid proof base64: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid proof base64: {e}"),
+            )
+        })?;
     let public_values = general_purpose::STANDARD
         .decode(&payload.public_values)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid public_values base64: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid public_values base64: {e}"),
+            )
+        })?;
 
     use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationSubmitError;
     match ajm

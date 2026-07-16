@@ -1,4 +1,4 @@
-//! Job manager for ZiSK SNARK proof generation.
+//! Job manager for per-batch ZiSK proof generation.
 //!
 //! Mirrors `FriJobManager` in architecture:
 //! - Batches enter via `add_job` **when the batch is sealed** (the FRI job
@@ -7,19 +7,34 @@
 //!   instead of serialized behind it.
 //! - External provers pick jobs via `pick_next_job` (with timeout-based
 //!   reassignment) and submit proofs via `submit_proof`.
-//! - An accepted proof is validated (sizes, program-VK tripwire, batch
-//!   commitment) and parked in the `completed` map. The Airbender SNARK
-//!   submission path (`SnarkJobManager`) is the rendezvous point: it takes
-//!   the completed ZiSK proof via `take_completed` and composes the
-//!   MultiProof — whichever proof arrives last triggers the downstream send.
+//! - An accepted proof is validated (shape, program-VK tripwire, batch
+//!   commitment) and parked in the `completed` map.
+//!
+//! The manager runs in one of two modes, fixed at startup:
+//!
+//! - **Per-batch PLONK mode** (aggregation disabled): the daemon submits a
+//!   768-byte PLONK-wrapped SNARK + 320-byte public values per batch. The
+//!   Airbender SNARK submission path (`SnarkJobManager`) is the rendezvous
+//!   point: it takes the completed ZiSK proof via `take_completed` and
+//!   composes the MultiProof — whichever proof arrives last triggers the
+//!   downstream send.
+//! - **Aggregated mode** (aggregation enabled, marked by the attached
+//!   aggregation sink): the daemon submits the raw `vadcop_final` proof
+//!   stream (~330 KiB) instead. The validated stream is buffered in the
+//!   aggregation manager as range input AND parked here mode-tagged (for
+//!   idempotence and lane status); the MultiProof rendezvous then pairs
+//!   the Airbender range SNARK with the aggregated range proof, not with
+//!   per-batch proofs.
 //!
 //! This manager never sends downstream itself; composition and the send
 //! permit live in `SnarkJobManager`.
 
 use crate::batcher::batch_builder::ZiskChainConfig;
 use crate::prover_api::metrics::ZISK_LANE_METRICS;
-use alloy::primitives::B256;
+use crate::prover_api::zisk_aggregation_job_manager::AggregationInput;
 use crate::prover_api::zisk_proof_constants::{ZISK_PUBLIC_VALUES_BYTES, ZISK_SNARK_PROOF_BYTES};
+use crate::prover_api::zisk_vadcop_stream::{ZISK_VADCOP_STREAM_BYTES, parse_vadcop_final_stream};
+use alloy::primitives::B256;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -46,10 +61,20 @@ pub struct ZiskJobData {
     pub added_at: std::time::Instant,
 }
 
-/// A validated ZiSK proof parked until its Airbender SNARK arrives.
-pub struct CompletedZiskProof {
-    pub proof: Vec<u8>,
-    pub public_values: Vec<u8>,
+/// A validated per-batch ZiSK proof parked in the `completed` map,
+/// mode-tagged by what the daemon submitted.
+pub enum CompletedZiskProof {
+    /// Per-batch PLONK mode: the 768-byte SNARK + 320-byte public values,
+    /// ready for single-batch MultiProof composition.
+    Plonk {
+        proof: Vec<u8>,
+        public_values: Vec<u8>,
+    },
+    /// Aggregated mode: the raw `vadcop_final` proof stream. Composition
+    /// happens at range level via the aggregation manager (which buffered
+    /// its own copy as range input); this entry marks the batch completed
+    /// so job re-creation stays idempotent and lane status is accurate.
+    VadcopFinal { stream: Vec<u8> },
 }
 
 /// Where a batch currently is in the ZiSK lane.
@@ -75,11 +100,17 @@ pub struct ZiskJob {
 pub enum ZiskSubmitError {
     #[error("unknown batch {0}")]
     UnknownJob(u64),
-    #[error("invalid proof size: {got} bytes, expected {expected}")]
-    InvalidProofSize { got: usize, expected: usize },
+    #[error("invalid proof size: {got} bytes, expected {expected}{hint}")]
+    InvalidProofSize {
+        got: usize,
+        expected: usize,
+        hint: &'static str,
+    },
     #[error("invalid public values size: {got} bytes, expected {expected}")]
     InvalidPublicValuesSize { got: usize, expected: usize },
-    #[error("batch commitment mismatch: ZiSK public values first 32 bytes do not match batch commitment")]
+    #[error("malformed vadcop_final proof stream: {0}")]
+    MalformedProof(String),
+    #[error("batch commitment mismatch: ZiSK proof public values do not match batch commitment")]
     CommitmentMismatch,
     #[error("program VK mismatch: prover reported {reported}, server expects {expected}")]
     VkDrift { reported: B256, expected: B256 },
@@ -89,7 +120,8 @@ pub enum ZiskSubmitError {
 struct ZiskJobState {
     pending: HashMap<u64, ZiskJobData>,
     assigned: HashMap<u64, (String, std::time::Instant, ZiskJobData)>,
-    /// Validated proofs awaiting their Airbender SNARK (the rendezvous).
+    /// Validated proofs awaiting composition (per-batch rendezvous in PLONK
+    /// mode; completion markers in aggregated mode).
     completed: HashMap<u64, CompletedZiskProof>,
 }
 
@@ -114,18 +146,18 @@ pub struct ZiskJobManager {
     /// task listening on this channel (a mismatch means one proof system is
     /// wrong — a security event). Unset: log + count + retry.
     halt_on_mismatch: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
-    /// Expected ZiSK program VK (first 32 bytes of the proof's public
-    /// values). When set, a submission with a different VK is rejected and
-    /// counted (`zisk_lane_vk_drift`) — the prover runs a different guest
-    /// build. Unset: the reported VK is only logged.
+    /// Expected ZiSK program VK of the STF guest build. When set, a
+    /// submission with a different VK is rejected and counted
+    /// (`zisk_lane_vk_drift`) — the prover runs a different guest build.
+    /// Unset: the reported VK is only logged.
     expected_program_vk: Option<B256>,
-    /// When set (aggregation stage enabled), every accepted per-batch
-    /// proof is COPIED into the aggregation job manager's input buffer,
-    /// and discards are forwarded so broken ranges are dropped. The
-    /// per-batch `completed` map and its MultiProof rendezvous are
-    /// unaffected. See `zisk_aggregation_job_manager.rs` (plan 2.7).
-    aggregation_sink:
-        std::sync::Mutex<Option<std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>>>,
+    /// When set, the lane runs in AGGREGATED mode: per-batch submissions
+    /// are `vadcop_final` streams, every accepted one is buffered in the
+    /// aggregation manager as range input, and discards are forwarded so
+    /// broken ranges are dropped. See `zisk_aggregation_job_manager.rs`.
+    aggregation_sink: std::sync::Mutex<
+        Option<std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>>,
+    >,
     /// Chain id + chain config: preimage of the `chain_config_hash` word in
     /// the guest's batch public input, needed to compute the expected value.
     chain_id: u64,
@@ -154,8 +186,9 @@ impl ZiskJobManager {
         }
     }
 
-    /// Enable the aggregation stage: accepted per-batch proofs are copied
-    /// into `sink`'s input buffer, and discards are forwarded to it.
+    /// Switch the lane to aggregated mode: per-batch submissions become
+    /// `vadcop_final` streams, accepted ones are buffered in `sink` as
+    /// range input, and discards are forwarded to it.
     pub fn set_aggregation_sink(
         &self,
         sink: std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>,
@@ -167,14 +200,21 @@ impl ZiskJobManager {
         &self,
     ) -> Option<std::sync::Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>>
     {
-        self.aggregation_sink.lock().expect("aggregation sink lock").clone()
+        self.aggregation_sink
+            .lock()
+            .expect("aggregation sink lock")
+            .clone()
     }
 
     /// Refresh the queue-depth/age gauges. Called under the state lock after
     /// every mutation, and periodically so ages advance while idle.
     fn record_queue_gauges(state: &ZiskJobState) {
-        ZISK_LANE_METRICS.jobs_pending.set(state.pending.len() as u64);
-        ZISK_LANE_METRICS.jobs_assigned.set(state.assigned.len() as u64);
+        ZISK_LANE_METRICS
+            .jobs_pending
+            .set(state.pending.len() as u64);
+        ZISK_LANE_METRICS
+            .jobs_assigned
+            .set(state.assigned.len() as u64);
         ZISK_LANE_METRICS
             .proofs_awaiting_snark
             .set(state.completed.len() as u64);
@@ -224,7 +264,11 @@ impl ZiskJobManager {
     /// pending, assigned, or completed is left untouched (`Ok`). A full
     /// queue returns the data to the caller — at batch seal this is plain
     /// backpressure (the SNARK-arrival fallback re-creates the job later).
-    pub async fn add_job(&self, batch_number: u64, job_data: ZiskJobData) -> Result<(), ZiskJobData> {
+    pub async fn add_job(
+        &self,
+        batch_number: u64,
+        job_data: ZiskJobData,
+    ) -> Result<(), ZiskJobData> {
         let mut state = self.state.lock().await;
         if state.knows(batch_number) {
             tracing::debug!(batch = batch_number, "ZiSK job already known, skipping add");
@@ -258,14 +302,21 @@ impl ZiskJobManager {
         let mut state = self.state.lock().await;
 
         // Return timed-out assigned jobs to pending.
-        let timed_out: Vec<u64> = state.assigned
+        let timed_out: Vec<u64> = state
+            .assigned
             .iter()
-            .filter(|(_, (_, assigned_at, _))| now.duration_since(*assigned_at) >= self.assignment_timeout)
+            .filter(|(_, (_, assigned_at, _))| {
+                now.duration_since(*assigned_at) >= self.assignment_timeout
+            })
             .map(|(&batch, _)| batch)
             .collect();
         for batch in timed_out {
             if let Some((old_prover, _, data)) = state.assigned.remove(&batch) {
-                tracing::warn!(batch, old_prover, "ZiSK job timed out, returning to pending");
+                tracing::warn!(
+                    batch,
+                    old_prover,
+                    "ZiSK job timed out, returning to pending"
+                );
                 state.pending.insert(batch, data);
             }
         }
@@ -284,14 +335,12 @@ impl ZiskJobManager {
             });
 
         let zisk_data = job_data.zisk_data.clone();
-        state.assigned.insert(batch_number, (prover_id.to_string(), now, job_data));
+        state
+            .assigned
+            .insert(batch_number, (prover_id.to_string(), now, job_data));
         Self::record_queue_gauges(&state);
 
-        tracing::info!(
-            batch = batch_number,
-            prover_id,
-            "ZiSK job assigned"
-        );
+        tracing::info!(batch = batch_number, prover_id, "ZiSK job assigned");
 
         Some(ZiskJob {
             batch_number,
@@ -300,12 +349,17 @@ impl ZiskJobManager {
         })
     }
 
-    /// Submit a ZiSK SNARK proof for a batch.
+    /// Submit a per-batch ZiSK proof.
     ///
-    /// Validates proof sizes, the program-VK tripwire, and the batch
+    /// PLONK mode: `proof` is the 768-byte SNARK, `public_values` the
+    /// 320-byte wire layout. Aggregated mode: `proof` is the raw
+    /// `vadcop_final` stream and `public_values` must be empty (the stream
+    /// carries its publics).
+    ///
+    /// Validates the shape, the program-VK tripwire, and the batch
     /// commitment against the metadata captured at job creation, then parks
-    /// the proof in the `completed` map for the Airbender SNARK submission
-    /// path to compose the MultiProof (`take_completed`).
+    /// the proof in the `completed` map (and, in aggregated mode, buffers
+    /// it in the aggregation manager as range input).
     pub async fn submit_proof(
         &self,
         batch_number: u64,
@@ -313,25 +367,53 @@ impl ZiskJobManager {
         public_values: Vec<u8>,
         prover_id: &str,
     ) -> Result<(), ZiskSubmitError> {
-        // Validate sizes.
-        if proof.len() != ZISK_SNARK_PROOF_BYTES {
-            return Err(ZiskSubmitError::InvalidProofSize {
-                got: proof.len(),
-                expected: ZISK_SNARK_PROOF_BYTES,
-            });
-        }
-        if public_values.len() != ZISK_PUBLIC_VALUES_BYTES {
-            return Err(ZiskSubmitError::InvalidPublicValuesSize {
-                got: public_values.len(),
-                expected: ZISK_PUBLIC_VALUES_BYTES,
-            });
-        }
+        let sink = self.aggregation_sink();
 
-        // Program VK tripwire: the first 32 bytes of the public values
-        // are the ZiSK program VK. Drift means the prover runs a different
+        // Mode-dependent shape validation and public-data extraction.
+        let (reported_vk, commitment, vadcop_publics) = if sink.is_some() {
+            if proof.len() != ZISK_VADCOP_STREAM_BYTES {
+                return Err(ZiskSubmitError::InvalidProofSize {
+                    got: proof.len(),
+                    expected: ZISK_VADCOP_STREAM_BYTES,
+                    hint: " (aggregated mode expects the raw vadcop_final stream; \
+                           run the daemon with --aggregation)",
+                });
+            }
+            if !public_values.is_empty() {
+                return Err(ZiskSubmitError::InvalidPublicValuesSize {
+                    got: public_values.len(),
+                    expected: 0,
+                });
+            }
+            let parsed =
+                parse_vadcop_final_stream(&proof).map_err(ZiskSubmitError::MalformedProof)?;
+            (parsed.program_vk, parsed.commitment, Some(parsed))
+        } else {
+            if proof.len() != ZISK_SNARK_PROOF_BYTES {
+                return Err(ZiskSubmitError::InvalidProofSize {
+                    got: proof.len(),
+                    expected: ZISK_SNARK_PROOF_BYTES,
+                    hint: " (per-batch PLONK mode expects the wrapped SNARK; \
+                           is the daemon running with --aggregation against a \
+                           server that has zisk_aggregation disabled?)",
+                });
+            }
+            if public_values.len() != ZISK_PUBLIC_VALUES_BYTES {
+                return Err(ZiskSubmitError::InvalidPublicValuesSize {
+                    got: public_values.len(),
+                    expected: ZISK_PUBLIC_VALUES_BYTES,
+                });
+            }
+            (
+                B256::from_slice(&public_values[..32]),
+                B256::from_slice(&public_values[32..64]),
+                None,
+            )
+        };
+
+        // Program VK tripwire: drift means the prover runs a different
         // guest build — reject before touching the job, so it stays assigned
         // and times out back to pending for another prover.
-        let reported_vk = B256::from_slice(&public_values[..32]);
         if let Some(expected) = self.expected_program_vk {
             if reported_vk != expected {
                 ZISK_LANE_METRICS.vk_drift.inc();
@@ -362,21 +444,30 @@ impl ZiskJobManager {
             data
         };
 
-        // Validate batch commitment against the metadata captured at seal.
+        // Validate the batch commitment against the metadata captured at
+        // seal, using the guest lib's own hash functions.
         let stored = job_data.batch_metadata.batch_info.clone().into_stored();
         let prev = &job_data.batch_metadata.previous_stored_batch_info;
-        if let Err(msg) = crate::prover_api::zisk_proof_verifier::verify_zisk_snark_public_values(
-            &prev.state_commitment,
-            &stored,
-            self.chain_id,
-            self.chain_config,
-            &public_values,
-        ) {
+        let expected_commitment =
+            crate::prover_api::zisk_proof_verifier::expected_zisk_public_input(
+                &prev.state_commitment,
+                &stored,
+                self.chain_id,
+                self.chain_config,
+            );
+        if commitment != expected_commitment {
             // The headline divergence alarm (one proof system is wrong):
             // always count + log; policy decides continue vs halt.
+            let msg =
+                format!("commitment mismatch: ZiSK={commitment}, expected={expected_commitment}");
             ZISK_LANE_METRICS.commitment_mismatches.inc();
             tracing::error!(batch = batch_number, "{msg}");
-            if let Some(halt) = self.halt_on_mismatch.lock().expect("halt sender lock").take() {
+            if let Some(halt) = self
+                .halt_on_mismatch
+                .lock()
+                .expect("halt sender lock")
+                .take()
+            {
                 let _ = halt.send(format!(
                     "ZiSK commitment mismatch on batch {batch_number}: {msg}"
                 ));
@@ -394,34 +485,49 @@ impl ZiskJobManager {
             batch = batch_number,
             prover_id,
             zisk_proof_bytes = proof.len(),
-            "ZiSK proof accepted, awaiting Airbender SNARK for multi-proof composition"
+            aggregated = vadcop_publics.is_some(),
+            "ZiSK proof accepted"
         );
 
-        // Aggregation stage (when enabled): buffer a copy as range input.
-        // The parked original below stays the MultiProof rendezvous.
-        if let Some(sink) = self.aggregation_sink() {
-            sink.on_proof_completed(batch_number, proof.clone(), public_values.clone())
-                .await;
+        // Aggregated mode: buffer a copy as range input for the
+        // aggregation manager; the mode-tagged entry parked below keeps
+        // the lane status and job idempotence intact.
+        if let (Some(sink), Some(parsed)) = (&sink, &vadcop_publics) {
+            sink.on_proof_completed(
+                batch_number,
+                AggregationInput {
+                    stream: proof.clone(),
+                    program_vk: parsed.program_vk,
+                    vadcop_vk: parsed.vadcop_vk,
+                    commitment: parsed.commitment,
+                },
+            )
+            .await;
         }
 
+        let completed = match vadcop_publics {
+            Some(_) => CompletedZiskProof::VadcopFinal { stream: proof },
+            None => CompletedZiskProof::Plonk {
+                proof,
+                public_values,
+            },
+        };
         {
             let mut state = self.state.lock().await;
-            state.completed.insert(
-                batch_number,
-                CompletedZiskProof {
-                    proof,
-                    public_values,
-                },
-            );
+            state.completed.insert(batch_number, completed);
             Self::record_queue_gauges(&state);
         }
 
-        ZISK_LANE_METRICS.time_to_submit.observe(job_data.added_at.elapsed());
+        ZISK_LANE_METRICS
+            .time_to_submit
+            .observe(job_data.added_at.elapsed());
         Ok(())
     }
 
     /// Take the validated proof for a batch, if one is parked. Called by the
-    /// Airbender SNARK submission path to compose the MultiProof.
+    /// Airbender SNARK submission path to compose the MultiProof (per-batch
+    /// PLONK mode only; aggregated mode composes at range level via the
+    /// aggregation manager).
     pub async fn take_completed(&self, batch_number: u64) -> Option<CompletedZiskProof> {
         let mut state = self.state.lock().await;
         let proof = state.completed.remove(&batch_number);
@@ -432,14 +538,14 @@ impl ZiskJobManager {
     }
 
     /// Drop parked proofs for batches at or below `batch_to`. Called when a
-    /// batch is sent downstream without its ZiSK proof (optional mode, or
+    /// batch is consumed downstream (composed multi-proof, optional mode, or
     /// degraded after the wait timeout): batches are processed in order, so
     /// a proof for an already-sent batch can never be composed. In-flight
     /// jobs are deliberately left alone — their submit-time validation still
     /// provides the shadow-mode divergence signal.
     pub async fn discard_completed_up_to(&self, batch_to: u64) {
-        // Batches sent without their proof can never join an aggregation
-        // range either — drop the copies and any range they broke.
+        // Batches sent downstream can never join an aggregation range
+        // either — drop the buffered inputs and any range they overlapped.
         if let Some(sink) = self.aggregation_sink() {
             sink.discard_up_to(batch_to).await;
         }
@@ -459,7 +565,7 @@ impl ZiskJobManager {
         tracing::info!(
             batch_to,
             discarded = stale.len(),
-            "discarded parked ZiSK proofs for batches already sent without multi-proof"
+            "discarded parked ZiSK proofs for batches already sent downstream"
         );
         Self::record_queue_gauges(&state);
     }
@@ -497,6 +603,7 @@ impl ZiskJobManager {
 mod tests {
     use super::*;
     use crate::prover_api::test_util::create_test_batch_envelope;
+    use crate::prover_api::zisk_vadcop_stream::test_stream::synthetic_stream;
     use zksync_os_batch_types::batcher_model::FriProof;
 
     fn job_data(batch_number: u64, zisk_data: Vec<u8>) -> ZiskJobData {
@@ -519,24 +626,39 @@ mod tests {
     };
 
     fn manager(expected_vk: Option<B256>) -> ZiskJobManager {
-        ZiskJobManager::new(Duration::from_secs(60), expected_vk, TEST_CHAIN_ID, TEST_CHAIN_CONFIG)
+        ZiskJobManager::new(
+            Duration::from_secs(60),
+            expected_vk,
+            TEST_CHAIN_ID,
+            TEST_CHAIN_CONFIG,
+        )
+    }
+
+    fn expected_commitment(data: &ZiskJobData) -> B256 {
+        let stored = data.batch_metadata.batch_info.clone().into_stored();
+        let prev = &data.batch_metadata.previous_stored_batch_info;
+        crate::prover_api::zisk_proof_verifier::expected_zisk_public_input(
+            &prev.state_commitment,
+            &stored,
+            TEST_CHAIN_ID,
+            TEST_CHAIN_CONFIG,
+        )
     }
 
     /// Public values whose commitment word matches the job's batch metadata
     /// (computed with the shared expected-PI helper, i.e. the guest lib's own
     /// hash functions), so `submit_proof` gets past commitment verification.
     fn matching_public_values(data: &ZiskJobData) -> Vec<u8> {
-        let stored = data.batch_metadata.batch_info.clone().into_stored();
-        let prev = &data.batch_metadata.previous_stored_batch_info;
-        let commitment = crate::prover_api::zisk_proof_verifier::expected_zisk_public_input(
-            &prev.state_commitment,
-            &stored,
-            TEST_CHAIN_ID,
-            TEST_CHAIN_CONFIG,
-        );
+        let commitment = expected_commitment(data);
         let mut public_values = vec![0u8; ZISK_PUBLIC_VALUES_BYTES];
         public_values[32..64].copy_from_slice(commitment.as_slice());
         public_values
+    }
+
+    /// A `vadcop_final` stream whose commitment matches the job's batch
+    /// metadata, for aggregated-mode submissions.
+    fn matching_vadcop_stream(data: &ZiskJobData) -> Vec<u8> {
+        synthetic_stream([1, 2, 3, 4], [5, 6, 7, 8], expected_commitment(data).0)
     }
 
     /// The seal-to-rendezvous happy path: an accepted proof parks in
@@ -555,20 +677,38 @@ mod tests {
             .unwrap_or_else(|_| panic!("add_job rejected"));
         assert_eq!(manager.batch_status(7).await, ZiskBatchStatus::InFlight);
 
-        let picked = manager.pick_next_job("prover-1").await.expect("job available");
+        let picked = manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
         assert_eq!(picked.batch_number, 7);
         assert_eq!(picked.zisk_data, zisk_data);
         assert_eq!(manager.batch_status(7).await, ZiskBatchStatus::InFlight);
 
         manager
-            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values.clone(), "prover-1")
+            .submit_proof(
+                7,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                public_values.clone(),
+                "prover-1",
+            )
             .await
             .expect("valid submission accepted");
         assert_eq!(manager.batch_status(7).await, ZiskBatchStatus::Completed);
 
         let completed = manager.take_completed(7).await.expect("proof parked");
-        assert_eq!(completed.public_values, public_values);
-        assert!(manager.take_completed(7).await.is_none(), "taken exactly once");
+        match completed {
+            CompletedZiskProof::Plonk {
+                public_values: pv, ..
+            } => {
+                assert_eq!(pv, public_values)
+            }
+            CompletedZiskProof::VadcopFinal { .. } => panic!("PLONK mode parks Plonk payloads"),
+        }
+        assert!(
+            manager.take_completed(7).await.is_none(),
+            "taken exactly once"
+        );
         assert_eq!(manager.batch_status(7).await, ZiskBatchStatus::Unknown);
     }
 
@@ -581,13 +721,19 @@ mod tests {
 
         let data = job_data(7, vec![0xAB; 32]);
         let public_values = matching_public_values(&data);
-        manager.add_job(7, data).await.unwrap_or_else(|_| panic!("add rejected"));
+        manager
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add rejected"));
         // Pending: re-add is a no-op.
         manager
             .add_job(7, job_data(7, vec![0xCD; 8]))
             .await
             .unwrap_or_else(|_| panic!("idempotent re-add"));
-        let picked = manager.pick_next_job("prover-1").await.expect("job available");
+        let picked = manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
         assert_eq!(picked.zisk_data, vec![0xAB; 32], "original data kept");
         // Assigned: re-add is a no-op (no second pickable job appears).
         manager
@@ -597,7 +743,12 @@ mod tests {
         assert!(manager.pick_next_job("prover-2").await.is_none());
         // Completed: re-add is a no-op (the parked proof is not clobbered).
         manager
-            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "prover-1")
+            .submit_proof(
+                7,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                public_values,
+                "prover-1",
+            )
             .await
             .expect("accepted");
         manager
@@ -616,9 +767,15 @@ mod tests {
 
         let data8 = job_data(8, vec![2; 8]);
         let pv8 = matching_public_values(&data8);
-        manager.add_job(7, job_data(7, vec![1; 8])).await.unwrap_or_else(|_| panic!());
+        manager
+            .add_job(7, job_data(7, vec![1; 8]))
+            .await
+            .unwrap_or_else(|_| panic!());
         manager.add_job(8, data8).await.unwrap_or_else(|_| panic!());
-        manager.add_job(9, job_data(9, vec![3; 8])).await.unwrap_or_else(|_| panic!());
+        manager
+            .add_job(9, job_data(9, vec![3; 8]))
+            .await
+            .unwrap_or_else(|_| panic!());
         // 7 stays pending; 8 goes to completed; 9 assigned.
         // (pick order is by batch number: 7 first.)
         let picked = manager.pick_next_job("prover-1").await.expect("job");
@@ -650,7 +807,10 @@ mod tests {
             .add_job(7, job_data(7, vec![0xAB; 32]))
             .await
             .unwrap_or_else(|_| panic!("add_job rejected"));
-        manager.pick_next_job("prover-1").await.expect("job available");
+        manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
 
         // Garbage public values -> commitment mismatch.
         let err = manager
@@ -672,60 +832,159 @@ mod tests {
         );
     }
 
-    /// With an aggregation sink attached, an accepted proof is COPIED into
-    /// the aggregation input buffer while the parked original still serves
-    /// the SNARK rendezvous — enabling the stage must not disturb the
-    /// existing MultiProof flow.
+    /// Aggregated mode: an accepted `vadcop_final` stream is buffered in
+    /// the aggregation manager as range input AND parked here as a
+    /// mode-tagged completion marker; the aggregation job carries the
+    /// stream once its SNARK range is noted.
     #[tokio::test]
-    async fn accepted_proof_feeds_aggregation_sink() {
+    async fn aggregated_mode_accepts_stream_and_feeds_sink() {
         use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager;
 
         let manager = manager(None);
-        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(1, Duration::from_secs(60)));
+        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(
+            1,
+            Duration::from_secs(60),
+            None,
+        ));
         manager.set_aggregation_sink(agg.clone());
 
         let data = job_data(7, vec![0xAB; 32]);
-        let public_values = matching_public_values(&data);
-        manager.add_job(7, data).await.unwrap_or_else(|_| panic!("add rejected"));
-        manager.pick_next_job("prover-1").await.expect("job available");
+        let stream = matching_vadcop_stream(&data);
         manager
-            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values.clone(), "prover-1")
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add rejected"));
+        manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
+        manager
+            .submit_proof(7, stream.clone(), vec![], "prover-1")
             .await
             .expect("accepted");
 
-        // Range size 1: the copy immediately forms an aggregation job.
-        let job = agg.pick_next_job("agg-1").await.expect("aggregation job formed");
+        assert_eq!(manager.batch_status(7).await, ZiskBatchStatus::Completed);
+        assert!(agg.has_input(7).await, "stream buffered as range input");
+
+        agg.note_snark_range(7, 7).await;
+        let job = agg
+            .pick_next_job("agg-1")
+            .await
+            .expect("aggregation job formed");
         assert_eq!((job.from_batch, job.to_batch), (7, 7));
-        assert_eq!(job.proofs[0].1.public_values, public_values);
-        // The rendezvous parking is untouched by the copy.
-        let completed = manager.take_completed(7).await.expect("still parked");
-        assert_eq!(completed.public_values, public_values);
+        assert_eq!(job.streams[0].1, stream);
+
+        // The parked marker is mode-tagged with the stream.
+        match manager.take_completed(7).await.expect("parked") {
+            CompletedZiskProof::VadcopFinal { stream: parked } => assert_eq!(parked, stream),
+            CompletedZiskProof::Plonk { .. } => panic!("aggregated mode parks VadcopFinal"),
+        }
     }
 
-    /// Discards forward to the aggregation sink so its buffered copies and
-    /// broken ranges are dropped alongside the per-batch state.
+    /// Aggregated mode rejects PLONK-shaped submissions (and vice versa)
+    /// with a size error, and rejects malformed streams before touching
+    /// the job.
+    #[tokio::test]
+    async fn aggregated_mode_rejects_wrong_shapes() {
+        use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager;
+
+        let manager = manager(None);
+        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(
+            1,
+            Duration::from_secs(60),
+            None,
+        ));
+        manager.set_aggregation_sink(agg.clone());
+
+        let data = job_data(7, vec![0xAB; 32]);
+        let stream = matching_vadcop_stream(&data);
+        manager
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add rejected"));
+        manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
+
+        // A 768-byte PLONK proof is a mode mismatch.
+        let err = manager
+            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], vec![], "prover-1")
+            .await
+            .expect_err("plonk-sized proof rejected in aggregated mode");
+        assert!(
+            matches!(err, ZiskSubmitError::InvalidProofSize { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--aggregation"), "{err}");
+
+        // Non-empty public values are a protocol error in aggregated mode.
+        let err = manager
+            .submit_proof(
+                7,
+                stream.clone(),
+                vec![0; ZISK_PUBLIC_VALUES_BYTES],
+                "prover-1",
+            )
+            .await
+            .expect_err("non-empty publics rejected");
+        assert!(matches!(
+            err,
+            ZiskSubmitError::InvalidPublicValuesSize { .. }
+        ));
+
+        // A right-sized but malformed stream (minimal flag) is rejected.
+        let mut minimal = stream.clone();
+        minimal[0] = 1;
+        let err = manager
+            .submit_proof(7, minimal, vec![], "prover-1")
+            .await
+            .expect_err("malformed stream rejected");
+        assert!(matches!(err, ZiskSubmitError::MalformedProof(_)), "{err}");
+
+        // The job survived all rejections: a valid submission still lands.
+        manager
+            .submit_proof(7, stream, vec![], "prover-1")
+            .await
+            .expect("valid stream accepted");
+    }
+
+    /// Discards forward to the aggregation sink so its buffered inputs and
+    /// tracked ranges are dropped alongside the per-batch state.
     #[tokio::test]
     async fn discards_forward_to_aggregation_sink() {
         use crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager;
 
         let manager = manager(None);
-        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(1, Duration::from_secs(60)));
+        let agg = std::sync::Arc::new(ZiskAggregationJobManager::new(
+            1,
+            Duration::from_secs(60),
+            None,
+        ));
         manager.set_aggregation_sink(agg.clone());
 
         let data = job_data(7, vec![0xAB; 32]);
-        let public_values = matching_public_values(&data);
-        manager.add_job(7, data).await.unwrap_or_else(|_| panic!("add rejected"));
-        manager.pick_next_job("prover-1").await.expect("job available");
+        let stream = matching_vadcop_stream(&data);
         manager
-            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "prover-1")
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add rejected"));
+        manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
+        manager
+            .submit_proof(7, stream, vec![], "prover-1")
             .await
             .expect("accepted");
+        agg.note_snark_range(7, 7).await;
 
         manager.discard_batches(7, 7).await;
         assert!(
             agg.pick_next_job("agg-1").await.is_none(),
             "discarded batch must not form an aggregation range"
         );
+        assert!(!agg.has_input(7).await);
     }
 
     /// With an expected program VK configured, a submission whose public
@@ -742,7 +1001,10 @@ mod tests {
             .add_job(7, data)
             .await
             .unwrap_or_else(|_| panic!("add_job rejected"));
-        manager.pick_next_job("prover-1").await.expect("job available");
+        manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
 
         // Wrong program VK in bytes 0..32 -> drift rejection.
         public_values[..32].copy_from_slice(B256::repeat_byte(0x13).as_slice());
@@ -761,7 +1023,12 @@ mod tests {
         // expected VK from the same assignment goes through.
         public_values[..32].copy_from_slice(expected_vk.as_slice());
         manager
-            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], public_values, "prover-1")
+            .submit_proof(
+                7,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                public_values,
+                "prover-1",
+            )
             .await
             .expect("corrected submission succeeds");
         assert_eq!(

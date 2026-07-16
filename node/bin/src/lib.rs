@@ -1256,15 +1256,35 @@ async fn run_main_node_pipeline(
         None
     };
 
-    // Until a multi-batch ZiSK guest exists, one SNARK covers exactly one
-    // batch: a wider range could not be paired with a ZiSK proof and would
-    // either stall (require_multi_proof) or silently degrade to
-    // Airbender-only. Enforce the constraint at startup instead.
+    // The ZiSK lane must be able to cover every Airbender SNARK range with
+    // one ZiSK proof, or ranges would either stall (require_multi_proof) or
+    // silently degrade to Airbender-only. Enforce the pairing at startup:
+    // - aggregation disabled: per-batch PLONK proofs cover exactly one
+    //   batch, so one SNARK covers exactly one batch;
+    // - aggregation enabled: aggregation ranges are keyed to the SNARK job
+    //   ranges, whose width is bounded by max_fris_per_snark — the two
+    //   settings must agree.
     if zisk_data_cache.is_some() {
-        assert_eq!(
-            config.prover_api_config.max_fris_per_snark, 1,
-            "second_proof_system requires prover_api.max_fris_per_snark = 1: multi-batch \
-             SNARK ranges cannot be covered by the single-batch ZiSK guest",
+        let agg_config = &config.prover_api_config.zisk_aggregation;
+        if agg_config.enabled {
+            assert_eq!(
+                config.prover_api_config.max_fris_per_snark, agg_config.range_size,
+                "zisk_aggregation.enabled requires prover_api.max_fris_per_snark == \
+                 zisk_aggregation.range_size: the aggregated ZiSK range proof must cover \
+                 exactly the batch range of its Airbender SNARK",
+            );
+        } else {
+            assert_eq!(
+                config.prover_api_config.max_fris_per_snark, 1,
+                "second_proof_system without zisk_aggregation requires \
+                 prover_api.max_fris_per_snark = 1: multi-batch SNARK ranges cannot be \
+                 covered by the single-batch ZiSK guest",
+            );
+        }
+    } else {
+        assert!(
+            !config.prover_api_config.zisk_aggregation.enabled,
+            "zisk_aggregation.enabled requires prover_input_generator.second_proof_system",
         );
     }
 
@@ -1286,10 +1306,11 @@ async fn run_main_node_pipeline(
         ))
     });
 
-    // ZiSK aggregation stage (plan 2.7 scaffolding, default OFF): accepted
-    // per-batch proofs are copied into this manager's buffer, contiguous
-    // ranges become /ZiSK-AGG jobs, and accepted aggregated proofs are
-    // validated + recorded (L1 wiring lands with era-contracts task 8).
+    // ZiSK aggregation stage (default OFF): in aggregated mode the daemon
+    // submits per-batch vadcop_final streams, this manager collapses each
+    // Airbender SNARK range of them into one /ZiSK-AGG job, and the
+    // accepted aggregated range proof pairs with the Airbender range SNARK
+    // in the MultiProof rendezvous.
     let zisk_aggregation_job_manager = zisk_job_manager.as_ref().and_then(|zjm| {
         let agg_config = &config.prover_api_config.zisk_aggregation;
         if !agg_config.enabled {
@@ -1299,12 +1320,14 @@ async fn run_main_node_pipeline(
             crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager::new(
                 agg_config.range_size,
                 agg_config.job_timeout,
+                agg_config.program_vk,
             ),
         );
         zjm.set_aggregation_sink(agg.clone());
         tracing::info!(
             range_size = agg_config.range_size,
-            "ZiSK aggregation stage enabled (scaffolding: aggregated proofs are recorded, not sent to L1)"
+            aggregator_program_vk = ?agg_config.program_vk,
+            "ZiSK aggregation stage enabled (per-batch vadcop_final streams, range proofs on L1)"
         );
         Some(agg)
     });
@@ -1325,6 +1348,7 @@ async fn run_main_node_pipeline(
         config.prover_api_config.max_assigned_batch_range,
         zisk_data_cache,
         zisk_job_manager.clone(),
+        zisk_aggregation_job_manager.clone(),
         config.prover_input_generator_config.multi_proof_verifier,
         config.prover_api_config.multi_proof_wait_timeout,
     );

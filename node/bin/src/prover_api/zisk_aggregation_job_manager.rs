@@ -1,75 +1,92 @@
-//! Job-manager SCAFFOLDING for the ZiSK AGGREGATION stage (plan 2.7).
+//! Job manager for the ZiSK AGGREGATION stage.
 //!
 //! Mirrors the Airbender FRI→SNARK split on the ZiSK lane: per-batch ZiSK
-//! proofs keep the existing pick/submit flow (`ZiskJobManager`), and an
-//! aggregation job consumes a RANGE of contiguous completed per-batch
-//! proofs to produce one range proof for L1 — the aggregator guest, which
-//! verifies N `vadcop_final` proofs and chains their batch commitments
-//! (`zksync-os-zisk/guest-aggregator`).
+//! proving keeps the existing pick/submit flow (`ZiskJobManager`) but — in
+//! aggregated mode — produces `vadcop_final` proof streams instead of
+//! PLONK-wrapped SNARKs. This manager buffers those streams and collapses a
+//! RANGE of them into one aggregation job: the aggregator guest
+//! (`zksync-os-zisk/guest-aggregator`) verifies the N streams in-zkVM and
+//! commits the L1 binding digest over their chained batch public inputs.
 //!
-//! Scaffolding boundaries (all deliberate, revisited with era-contracts
-//! task 8):
-//! - Inputs are fed as COPIES of accepted per-batch proofs
-//!   (`ZiskJobManager::submit_proof` → [`Self::on_proof_completed`]); the
-//!   per-batch `completed` map and its MultiProof rendezvous are untouched,
-//!   so enabling this stage cannot disturb the existing L1 flow.
-//! - The payload hands out the per-batch PLONK-wrapped proofs the server
-//!   holds today. The real aggregator guest consumes the pre-wrap
-//!   `vadcop_final` streams (~328 KiB each), which the daemon currently
-//!   discards after wrapping — extending the daemon to retain/submit them
-//!   is part of the aggregator rollout, not this scaffolding.
-//! - An accepted aggregated proof is validated (sizes + the aggregator
-//!   guest's binding-digest math over the buffered per-batch public
-//!   values) and then only recorded/logged; nothing is sent downstream.
+//! # Range identity
 //!
-//! Range formation: ranges are `[from..from + range_size - 1]`, strictly
-//! sequential. The first range starts at the lowest buffered batch at the
-//! moment a full contiguous run exists; each accepted (or discarded) range
-//! advances the floor. Per-batch proofs arriving below the floor — e.g. a
-//! slow prover finishing after its neighbours already formed a range — are
-//! dropped: their batches can no longer join any future range.
+//! Aggregation ranges are exactly the batch ranges the Airbender SNARK
+//! jobs cover — never independently counted. `SnarkJobManager` calls
+//! [`Self::note_snark_range`] when it assigns a real SNARK range (early
+//! start) and again on SNARK submission (authoritative), so the MultiProof
+//! rendezvous can pair one Airbender range SNARK with one ZiSK range proof
+//! of the same `[from..to]`. Because a timed-out SNARK range may be
+//! re-picked with different bounds, several overlapping ranges can be
+//! tracked at once; whichever the Airbender submission settles on wins,
+//! and [`Self::take_completed`] retires everything it overlaps. Buffered
+//! per-batch inputs are shared by overlapping ranges and live until a
+//! range consumes them (rendezvous) or a discard passes them.
+//!
+//! An accepted aggregated proof is validated — sizes, the aggregator
+//! guest's program-VK tripwire, and the binding digest recomputed from the
+//! buffered per-batch streams — and parked in `completed` until the
+//! Airbender SNARK for the same range takes it (`SnarkJobManager` is the
+//! rendezvous point, exactly like the per-batch flow).
 
 use alloy::primitives::{B256, keccak256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use crate::prover_api::metrics::ZISK_LANE_METRICS;
 use crate::prover_api::zisk_proof_constants::{ZISK_PUBLIC_VALUES_BYTES, ZISK_SNARK_PROOF_BYTES};
 
-/// Cap on buffered per-batch inputs (each ~1.1 KiB today, ~330 KiB once
-/// the payload switches to vadcop_final streams). When full, new arrivals
-/// are dropped with a warning — aggregation is best-effort scaffolding.
+/// Cap on buffered per-batch inputs (~330 KiB each). When full, new
+/// arrivals are dropped with a warning; the SNARK-side wait timeout is the
+/// operator backstop if aggregation provers stay offline.
 const MAX_BUFFERED_INPUTS: usize = 64;
 
-/// Accepted aggregated proofs kept for inspection (`take_recorded`).
-const MAX_RECORDED: usize = 16;
+/// Completed aggregated proofs parked for the rendezvous. Ranges are
+/// consumed in order by the Airbender lane, so more than a couple parked
+/// ranges means the Airbender lane is stuck — cap and complain.
+const MAX_COMPLETED: usize = 16;
 
-/// Offsets inside a 320-byte per-batch public-values blob:
-/// `programVK(32, u64 words BE) ‖ publics(256) ‖ vadcopVK(32, u64 words BE)`;
-/// the batch commitment is publics bytes [0..32], i.e. blob bytes [32..64].
-const PV_PROGRAM_VK: std::ops::Range<usize> = 0..32;
-const PV_COMMITMENT: std::ops::Range<usize> = 32..64;
-const PV_VADCOP_VK: std::ops::Range<usize> = 288..320;
-
-/// A copy of an accepted per-batch ZiSK proof, buffered as aggregation input.
+/// One buffered per-batch aggregation input: the validated `vadcop_final`
+/// stream plus the values extracted/validated at per-batch submission.
 #[derive(Clone)]
-pub struct PerBatchProof {
-    pub proof: Vec<u8>,
-    pub public_values: Vec<u8>,
+pub struct AggregationInput {
+    /// The full serialized proof stream the aggregator guest verifies.
+    pub stream: Vec<u8>,
+    /// Inner STF guest program VK (32-byte big-endian wire form).
+    pub program_vk: B256,
+    /// vadcop-final VK / rootCVadcopFinal (32-byte big-endian wire form).
+    pub vadcop_vk: B256,
+    /// The batch commitment the stream's publics carry — already validated
+    /// against the batch metadata by `ZiskJobManager::submit_proof`.
+    pub commitment: B256,
 }
 
-/// An aggregation job handed to a prover: the N per-batch proofs of a
-/// contiguous range, in batch order.
+/// An aggregation job handed to a prover: the N `vadcop_final` streams of
+/// a contiguous range, in batch order.
 pub struct ZiskAggregationJob {
     pub from_batch: u64,
     pub to_batch: u64,
-    pub proofs: Vec<(u64, PerBatchProof)>,
+    pub streams: Vec<(u64, Vec<u8>)>,
 }
 
-/// An accepted aggregated range proof (recorded only — L1 wiring is task 8).
-pub struct RecordedAggregatedProof {
+/// A validated aggregated range proof parked until its Airbender SNARK
+/// arrives (the same 768-byte SNARK + 320-byte public-values wire shape as
+/// a per-batch proof; the binding digest sits at `public_values[32..64]`).
+pub struct CompletedAggregatedProof {
     pub proof: Vec<u8>,
     pub public_values: Vec<u8>,
+}
+
+/// Where a range currently is in the aggregation lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZiskAggregationRangeStatus {
+    /// A validated aggregated proof is parked, ready for composition.
+    Completed,
+    /// The range is tracked: inputs are being collected, or an aggregation
+    /// job is formed/assigned — a proof is on its way.
+    InFlight,
+    /// The range is not tracked.
+    Unknown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,61 +97,229 @@ pub enum ZiskAggregationSubmitError {
     InvalidProofSize { got: usize, expected: usize },
     #[error("invalid public values size: {got} bytes, expected {expected}")]
     InvalidPublicValuesSize { got: usize, expected: usize },
-    #[error("aggregated commitment mismatch: {0}")]
-    CommitmentMismatch(String),
+    #[error(
+        "aggregator program VK mismatch: prover reported {reported}, server expects {expected}"
+    )]
+    VkDrift { reported: B256, expected: B256 },
+    #[error("aggregated binding digest mismatch: {0}")]
+    DigestMismatch(String),
 }
 
 struct State {
-    /// Buffered per-batch proofs, keyed by batch number.
-    inputs: BTreeMap<u64, PerBatchProof>,
-    /// First batch of the next range to form. `None` until the first range
-    /// forms (then: lowest buffered batch at formation time).
-    next_from: Option<u64>,
-    /// Formed ranges awaiting (re)assignment.
+    /// Buffered per-batch inputs, keyed by batch number. Retained until a
+    /// completed range is taken (rendezvous) or a discard passes them, so
+    /// overlapping re-keyed ranges can reuse them.
+    inputs: BTreeMap<u64, AggregationInput>,
+    /// SNARK-derived ranges whose inputs are still incomplete.
+    targets: BTreeSet<(u64, u64)>,
+    /// Formed ranges (all inputs buffered) awaiting (re)assignment.
     pickable: VecDeque<(u64, u64)>,
-    /// Assigned ranges: (prover id, assigned at). Inputs stay buffered
-    /// while assigned so a timed-out range is re-served identically.
+    /// Assigned ranges: (prover id, assigned at).
     assigned: HashMap<(u64, u64), (String, Instant)>,
-    /// Accepted aggregated proofs, newest last, bounded by `MAX_RECORDED`.
-    recorded: BTreeMap<(u64, u64), RecordedAggregatedProof>,
+    /// Validated aggregated proofs awaiting their Airbender SNARK.
+    completed: BTreeMap<(u64, u64), CompletedAggregatedProof>,
+    /// Batches at or below this can never join a range: they were either
+    /// consumed by a taken range or sent downstream without aggregation.
+    floor: u64,
+}
+
+impl State {
+    fn knows_range(&self, range: (u64, u64)) -> bool {
+        self.targets.contains(&range)
+            || self.pickable.contains(&range)
+            || self.assigned.contains_key(&range)
+            || self.completed.contains_key(&range)
+    }
+
+    /// Move every target whose inputs are all buffered into the pickable
+    /// queue, in range order.
+    fn form_ready_ranges(&mut self) {
+        let ready: Vec<(u64, u64)> = self
+            .targets
+            .iter()
+            .copied()
+            .filter(|&(from, to)| (from..=to).all(|b| self.inputs.contains_key(&b)))
+            .collect();
+        for range in ready {
+            self.targets.remove(&range);
+            tracing::info!(
+                from = range.0,
+                to = range.1,
+                "ZiSK aggregation range formed"
+            );
+            self.pickable.push_back(range);
+        }
+    }
+
+    /// Drop all tracking for ranges starting at or below `batch_to` and
+    /// all inputs at or below it, and advance the floor. Ranges straddling
+    /// the cut are dropped whole (they can never rendezvous), but their
+    /// above-the-cut inputs stay: re-keyed ranges may reuse them.
+    fn retire_up_to(&mut self, batch_to: u64, reason: &str) {
+        let stale = |&(from, _): &(u64, u64)| from <= batch_to;
+        for range in self
+            .targets
+            .iter()
+            .copied()
+            .filter(stale)
+            .collect::<Vec<_>>()
+        {
+            self.targets.remove(&range);
+            tracing::info!(
+                from = range.0,
+                to = range.1,
+                reason,
+                "ZiSK aggregation range dropped"
+            );
+        }
+        let dropped_pickable: Vec<(u64, u64)> =
+            self.pickable.iter().copied().filter(stale).collect();
+        for range in dropped_pickable {
+            self.pickable.retain(|r| r != &range);
+            tracing::info!(
+                from = range.0,
+                to = range.1,
+                reason,
+                "ZiSK aggregation range dropped"
+            );
+        }
+        for range in self
+            .assigned
+            .keys()
+            .copied()
+            .filter(stale)
+            .collect::<Vec<_>>()
+        {
+            self.assigned.remove(&range);
+            tracing::info!(
+                from = range.0,
+                to = range.1,
+                reason,
+                "ZiSK aggregation range dropped"
+            );
+        }
+        for range in self
+            .completed
+            .keys()
+            .copied()
+            .filter(stale)
+            .collect::<Vec<_>>()
+        {
+            self.completed.remove(&range);
+            tracing::info!(
+                from = range.0,
+                to = range.1,
+                reason,
+                "parked aggregated ZiSK proof dropped"
+            );
+        }
+        let stale_inputs: Vec<u64> = self.inputs.range(..=batch_to).map(|(&b, _)| b).collect();
+        for b in stale_inputs {
+            self.inputs.remove(&b);
+        }
+        self.floor = self.floor.max(batch_to);
+    }
+
+    fn record_gauges(&self) {
+        ZISK_LANE_METRICS
+            .aggregation_inputs_buffered
+            .set(self.inputs.len() as u64);
+        ZISK_LANE_METRICS
+            .aggregated_proofs_awaiting_snark
+            .set(self.completed.len() as u64);
+    }
 }
 
 /// Manages ZiSK aggregation jobs with the same pick/submit assignment
 /// model as the other prover stages.
 pub struct ZiskAggregationJobManager {
     state: Mutex<State>,
+    /// Upper bound on range width; equals `prover_api.max_fris_per_snark`
+    /// (enforced at startup), so wider SNARK ranges cannot exist.
     range_size: u64,
     assignment_timeout: Duration,
+    /// Expected AGGREGATOR guest program VK (`public_values[0..32]` of an
+    /// aggregated proof). When set, a submission with a different VK is
+    /// rejected and counted — the prover runs a different aggregator
+    /// build. Unset: the reported VK is only logged.
+    expected_program_vk: Option<B256>,
 }
 
 impl ZiskAggregationJobManager {
-    pub fn new(range_size: usize, assignment_timeout: Duration) -> Self {
+    pub fn new(
+        range_size: usize,
+        assignment_timeout: Duration,
+        expected_program_vk: Option<B256>,
+    ) -> Self {
         assert!(range_size >= 1, "zisk_aggregation.range_size must be >= 1");
         Self {
             state: Mutex::new(State {
                 inputs: BTreeMap::new(),
-                next_from: None,
+                targets: BTreeSet::new(),
                 pickable: VecDeque::new(),
                 assigned: HashMap::new(),
-                recorded: BTreeMap::new(),
+                completed: BTreeMap::new(),
+                floor: 0,
             }),
             range_size: range_size as u64,
             assignment_timeout,
+            expected_program_vk,
         }
     }
 
-    /// Feed one accepted per-batch ZiSK proof (called by
-    /// `ZiskJobManager::submit_proof` with a copy; validation already done
-    /// there). Idempotent per batch; arrivals below the range floor or
-    /// beyond the buffer cap are dropped.
-    pub async fn on_proof_completed(&self, batch_number: u64, proof: Vec<u8>, public_values: Vec<u8>) {
+    /// Register a batch range covered by an Airbender SNARK job. Called by
+    /// `SnarkJobManager` at real-job pick time (so aggregation proving
+    /// starts while the Airbender SNARK is still being computed) and again
+    /// at SNARK submission (authoritative). Idempotent per range; ranges
+    /// entirely at or below the floor are ignored.
+    pub async fn note_snark_range(&self, from_batch: u64, to_batch: u64) {
+        if from_batch > to_batch {
+            tracing::error!(
+                from = from_batch,
+                to = to_batch,
+                "invalid SNARK range ignored"
+            );
+            return;
+        }
+        let width = to_batch - from_batch + 1;
+        if width > self.range_size {
+            // Startup enforces max_fris_per_snark == range_size, so this is
+            // a config/logic slip — track the range anyway (correctness of
+            // the rendezvous over the size hint).
+            tracing::warn!(
+                from = from_batch,
+                to = to_batch,
+                range_size = self.range_size,
+                "SNARK range wider than zisk_aggregation.range_size"
+            );
+        }
         let mut state = self.state.lock().await;
-        if let Some(next_from) = state.next_from
-            && batch_number < next_from
-        {
+        if to_batch <= state.floor {
+            return;
+        }
+        let range = (from_batch, to_batch);
+        if state.knows_range(range) {
+            return;
+        }
+        tracing::info!(
+            from = from_batch,
+            to = to_batch,
+            "ZiSK aggregation range registered"
+        );
+        state.targets.insert(range);
+        state.form_ready_ranges();
+    }
+
+    /// Feed one accepted per-batch `vadcop_final` proof (called by
+    /// `ZiskJobManager::submit_proof`; stream shape, program VK, and batch
+    /// commitment were already validated there). Idempotent per batch;
+    /// arrivals at or below the floor or beyond the buffer cap are dropped.
+    pub async fn on_proof_completed(&self, batch_number: u64, input: AggregationInput) {
+        let mut state = self.state.lock().await;
+        if batch_number <= state.floor {
             tracing::warn!(
                 batch = batch_number,
-                next_from,
+                floor = state.floor,
                 "ZiSK aggregation: proof arrived below the range floor — batch can no longer join a range, dropping"
             );
             return;
@@ -151,11 +336,34 @@ impl ZiskAggregationJobManager {
             return;
         }
         tracing::debug!(batch = batch_number, "ZiSK aggregation input buffered");
-        state.inputs.insert(batch_number, PerBatchProof { proof, public_values });
+        state.inputs.insert(batch_number, input);
+        state.form_ready_ranges();
+        state.record_gauges();
     }
 
-    /// Pick the next aggregation job: first re-offer timed-out assignments,
-    /// then try to form one new range from contiguous buffered inputs.
+    /// Whether a per-batch input is buffered for `batch_number`.
+    pub async fn has_input(&self, batch_number: u64) -> bool {
+        self.state.lock().await.inputs.contains_key(&batch_number)
+    }
+
+    /// Where a range currently is in the aggregation lane.
+    pub async fn range_status(&self, from_batch: u64, to_batch: u64) -> ZiskAggregationRangeStatus {
+        let state = self.state.lock().await;
+        let range = (from_batch, to_batch);
+        if state.completed.contains_key(&range) {
+            ZiskAggregationRangeStatus::Completed
+        } else if state.targets.contains(&range)
+            || state.pickable.contains(&range)
+            || state.assigned.contains_key(&range)
+        {
+            ZiskAggregationRangeStatus::InFlight
+        } else {
+            ZiskAggregationRangeStatus::Unknown
+        }
+    }
+
+    /// Pick the next aggregation job: first re-offer timed-out
+    /// assignments, then the oldest formed range.
     pub async fn pick_next_job(&self, prover_id: &str) -> Option<ZiskAggregationJob> {
         let now = Instant::now();
         let mut state = self.state.lock().await;
@@ -179,39 +387,41 @@ impl ZiskAggregationJobManager {
             }
         }
 
-        // Form at most one new range: [from..from+K-1] where `from` is the
-        // floor (or the lowest buffered batch before the first formation)
-        // and every batch of the range is buffered.
-        if state.pickable.is_empty() {
-            let from = state.next_from.or_else(|| state.inputs.keys().next().copied())?;
-            let to = from + self.range_size - 1;
-            if (from..=to).all(|b| state.inputs.contains_key(&b)) {
-                tracing::info!(from, to, "ZiSK aggregation range formed");
-                state.pickable.push_back((from, to));
-                state.next_from = Some(to + 1);
-            }
-        }
+        state.form_ready_ranges();
 
         let (from, to) = state.pickable.pop_front()?;
-        let proofs: Vec<(u64, PerBatchProof)> = (from..=to)
-            .map(|b| {
-                let input = state
-                    .inputs
-                    .get(&b)
-                    .expect("formed range implies buffered inputs; discards drop overlapping ranges")
-                    .clone();
-                (b, input)
-            })
+        let streams: Option<Vec<(u64, Vec<u8>)>> = (from..=to)
+            .map(|b| state.inputs.get(&b).map(|i| (b, i.stream.clone())))
             .collect();
-        state.assigned.insert((from, to), (prover_id.to_string(), now));
+        let Some(streams) = streams else {
+            // Cannot happen: formation requires all inputs, and every path
+            // that drops inputs also drops the ranges over them. Fail the
+            // pick loudly instead of handing out a broken job.
+            tracing::error!(
+                from,
+                to,
+                "formed aggregation range lost its inputs — dropping"
+            );
+            return None;
+        };
+        state
+            .assigned
+            .insert((from, to), (prover_id.to_string(), now));
         tracing::info!(from, to, prover_id, "ZiSK aggregation job assigned");
-        Some(ZiskAggregationJob { from_batch: from, to_batch: to, proofs })
+        Some(ZiskAggregationJob {
+            from_batch: from,
+            to_batch: to,
+            streams,
+        })
     }
 
-    /// Submit an aggregated range proof. Validates sizes and that the
-    /// proof's committed value equals the aggregator guest's binding
-    /// digest over the buffered per-batch public values, then records it.
-    /// L1 submission is explicitly out of scope until era-contracts task 8.
+    /// Submit an aggregated range proof.
+    ///
+    /// Validates sizes, the aggregator-guest program-VK tripwire, and that
+    /// the proof's committed digest (`public_values[32..64]`) equals the
+    /// binding digest recomputed from the buffered per-batch streams, then
+    /// parks the proof in `completed` for the Airbender SNARK submission
+    /// path to compose the MultiProof (`take_completed`).
     pub async fn submit_proof(
         &self,
         from_batch: u64,
@@ -233,6 +443,34 @@ impl ZiskAggregationJobManager {
             });
         }
 
+        // Aggregator program VK tripwire — reject before touching the job,
+        // so it stays assigned and times out back to the queue.
+        let reported_vk = B256::from_slice(&public_values[..32]);
+        if let Some(expected) = self.expected_program_vk {
+            if reported_vk != expected {
+                ZISK_LANE_METRICS.aggregated_vk_drift.inc();
+                tracing::error!(
+                    from = from_batch,
+                    to = to_batch,
+                    prover_id,
+                    %reported_vk,
+                    %expected,
+                    "aggregator program VK drift — prover is running a different aggregator guest build"
+                );
+                return Err(ZiskAggregationSubmitError::VkDrift {
+                    reported: reported_vk,
+                    expected,
+                });
+            }
+        } else {
+            tracing::info!(
+                from = from_batch,
+                to = to_batch,
+                %reported_vk,
+                "aggregator program VK reported (no expected VK configured)"
+            );
+        }
+
         let mut state = self.state.lock().await;
         let range = (from_batch, to_batch);
         if state.assigned.remove(&range).is_none() {
@@ -242,181 +480,160 @@ impl ZiskAggregationJobManager {
             });
         }
 
-        // The guest binds (inner program VK, vadcop VK, rolling commitment
-        // keccak) into its single committed word — recompute it from the
-        // per-batch public values this manager buffered.
-        let per_batch_pvs: Vec<&[u8]> = match (from_batch..=to_batch)
-            .map(|b| state.inputs.get(&b).map(|i| i.public_values.as_slice()))
+        // Recompute the binding digest from the per-batch inputs this
+        // manager buffered (their commitments were validated against the
+        // batch metadata at per-batch submission).
+        let inputs: Vec<&AggregationInput> = match (from_batch..=to_batch)
+            .map(|b| state.inputs.get(&b))
             .collect::<Option<Vec<_>>>()
         {
-            Some(pvs) => pvs,
+            Some(inputs) => inputs,
             None => {
-                // Cannot happen while discards drop overlapping ranges;
-                // defensive so a logic slip fails loudly, not silently.
+                // Assigned ranges always have their inputs (see
+                // `pick_next_job`); defensive so a logic slip fails loudly.
                 return Err(ZiskAggregationSubmitError::UnknownRange {
                     from: from_batch,
                     to: to_batch,
                 });
             }
         };
-        let expected = match expected_aggregated_commitment(&per_batch_pvs) {
+        let expected = match expected_aggregated_public_input(&inputs) {
             Ok(digest) => digest,
             Err(msg) => {
                 state.pickable.push_back(range);
-                return Err(ZiskAggregationSubmitError::CommitmentMismatch(msg));
+                return Err(ZiskAggregationSubmitError::DigestMismatch(msg));
             }
         };
-        let got = B256::from_slice(&public_values[PV_COMMITMENT]);
+        let got = B256::from_slice(&public_values[32..64]);
         if got != expected {
+            ZISK_LANE_METRICS.aggregated_digest_mismatches.inc();
             tracing::error!(
                 from = from_batch,
                 to = to_batch,
                 prover_id,
                 %got,
                 %expected,
-                "aggregated ZiSK proof commitment mismatch — requeueing range"
+                "aggregated ZiSK proof binding-digest mismatch — requeueing range"
             );
             state.pickable.push_back(range);
-            return Err(ZiskAggregationSubmitError::CommitmentMismatch(format!(
+            return Err(ZiskAggregationSubmitError::DigestMismatch(format!(
                 "committed digest {got} does not match expected {expected}"
             )));
         }
 
-        for b in from_batch..=to_batch {
-            state.inputs.remove(&b);
-        }
         tracing::info!(
             from = from_batch,
             to = to_batch,
             prover_id,
-            aggregated_program_vk = %B256::from_slice(&public_values[PV_PROGRAM_VK]),
-            commitment = %got,
-            "aggregated ZiSK proof accepted and recorded (L1 wiring pending — era-contracts task 8)"
+            aggregator_program_vk = %reported_vk,
+            digest = %got,
+            "aggregated ZiSK proof accepted, awaiting Airbender SNARK for multi-proof composition"
         );
-        state.recorded.insert(range, RecordedAggregatedProof { proof, public_values });
-        while state.recorded.len() > MAX_RECORDED {
-            let oldest = *state.recorded.keys().next().expect("non-empty");
-            state.recorded.remove(&oldest);
+        ZISK_LANE_METRICS.aggregated_proofs_accepted.inc();
+        state.completed.insert(
+            range,
+            CompletedAggregatedProof {
+                proof,
+                public_values,
+            },
+        );
+        while state.completed.len() > MAX_COMPLETED {
+            let oldest = *state.completed.keys().next().expect("non-empty");
+            state.completed.remove(&oldest);
+            tracing::error!(
+                from = oldest.0,
+                to = oldest.1,
+                "too many aggregated proofs awaiting their Airbender SNARK — dropping the oldest (Airbender lane stuck?)"
+            );
         }
+        state.record_gauges();
         Ok(())
     }
 
-    /// Take a recorded aggregated proof (tests + future L1 wiring).
-    pub async fn take_recorded(&self, from_batch: u64, to_batch: u64) -> Option<RecordedAggregatedProof> {
-        self.state.lock().await.recorded.remove(&(from_batch, to_batch))
+    /// Take the validated aggregated proof for a range, if one is parked.
+    /// Called by the Airbender SNARK submission path to compose the
+    /// MultiProof. On success the consumed batches' inputs and every
+    /// tracked range they overlap are retired, and the floor advances.
+    pub async fn take_completed(
+        &self,
+        from_batch: u64,
+        to_batch: u64,
+    ) -> Option<CompletedAggregatedProof> {
+        let mut state = self.state.lock().await;
+        let taken = state.completed.remove(&(from_batch, to_batch))?;
+        state.retire_up_to(to_batch, "batches consumed by a composed multi-proof");
+        state.record_gauges();
+        Some(taken)
     }
 
     /// Drop aggregation state for batches at or below `batch_to`: called
-    /// when those batches were consumed without a (multi-)proof (fake-SNARK
-    /// pass, degraded sends) — they can never join a range anymore. Formed
-    /// or assigned ranges overlapping the cut are dropped whole, including
-    /// their above-the-cut inputs (a broken range never completes), and the
-    /// floor advances past the cut.
+    /// when those batches were sent downstream without a multi-proof
+    /// (shadow mode, degraded sends, fake-SNARK pass) — they can never
+    /// join a rendezvous anymore. Ranges straddling the cut are dropped
+    /// whole; inputs above the cut stay for future re-keyed ranges.
     pub async fn discard_up_to(&self, batch_to: u64) {
         let mut state = self.state.lock().await;
-
-        let broken: Vec<(u64, u64)> = state
-            .pickable
-            .iter()
-            .copied()
-            .chain(state.assigned.keys().copied())
-            .filter(|&(from, _)| from <= batch_to)
-            .collect();
-        for (from, to) in &broken {
-            state.pickable.retain(|r| r != &(*from, *to));
-            state.assigned.remove(&(*from, *to));
-            for b in *from..=*to {
-                state.inputs.remove(&b);
-            }
-            // Undo the formation's floor advance: the range never completed,
-            // so the floor rolls back to its start before the cut applies.
-            // (Broken ranges sit above every ACCEPTED range, whose floor
-            // advance must stick — ranges are strictly sequential.)
-            if let Some(next_from) = state.next_from
-                && *from < next_from
-            {
-                state.next_from = Some(*from);
-            }
-            tracing::info!(
-                from,
-                to,
-                batch_to,
-                "ZiSK aggregation range dropped — overlaps batches sent without aggregation"
-            );
-        }
-
-        let stale: Vec<u64> = state.inputs.range(..=batch_to).map(|(&b, _)| b).collect();
-        for b in stale {
-            state.inputs.remove(&b);
-        }
-        if let Some(next_from) = state.next_from
-            && next_from <= batch_to
-        {
-            state.next_from = Some(batch_to + 1);
-        }
+        state.retire_up_to(batch_to, "batches sent downstream without aggregation");
+        state.record_gauges();
     }
 }
 
-/// The aggregator guest's binding digest, recomputed server-side from the
-/// per-batch 320-byte public-values blobs of a range (in batch order):
+/// The aggregated range proof's expected public input — the aggregator
+/// guest's binding digest, recomputed server-side from the buffered
+/// per-batch inputs of a range (in batch order):
 ///
 /// ```text
-/// keccak256(inner_program_vk LE ‖ inner_vadcop_vk LE ‖ rolling)
-/// rolling = fold(keccak256, [0u8; 32], commitment_1 .. commitment_N)
+/// digest    = keccak256(innerProgramVK ‖ rootCVadcopFinal ‖ chainedPI)
+/// chainedPI = _computeZKsyncOSHash(0, PI):   result = PI[0]
+///             then per input: result = keccak256(result ‖ PI[i]) >> 32
+/// PI[i]     = uint256(commitment_i) >> 32   (224-bit, big-endian words)
 /// ```
 ///
-/// The wire blobs carry the VK words BIG-endian; the guest hashes them as
-/// 8-byte LITTLE-endian words, so each 8-byte word is reversed here. All
-/// batches must share one inner (program VK, vadcop VK) pair — the guest
-/// enforces the same rule.
-///
-/// Must match `Aggregator::finalize` in
-/// `zksync-os-zisk/guest-aggregator/src/lib.rs`; the shared test vector
-/// (`shared_vector_digest_matches_guest`) pins the two together.
-pub fn expected_aggregated_commitment(per_batch_public_values: &[&[u8]]) -> Result<B256, String> {
-    if per_batch_public_values.is_empty() {
+/// Both VKs enter in their 32-byte big-endian wire forms. All batches must
+/// share one inner (program VK, vadcop VK) pair — the guest enforces the
+/// same rule. Must match `Aggregator::finalize` in
+/// `zksync-os-zisk/guest-aggregator/src/lib.rs`; the cross-stack vector
+/// (`guest-aggregator/BINDING_VECTOR.md`) pins the two together via
+/// `binding_digest_matches_cross_stack_vector` below.
+pub fn expected_aggregated_public_input(inputs: &[&AggregationInput]) -> Result<B256, String> {
+    let Some((first, rest)) = inputs.split_first() else {
         return Err("empty range".into());
-    }
-    let mut rolling = [0u8; 32];
-    let first = per_batch_public_values[0];
-    for (i, pv) in per_batch_public_values.iter().enumerate() {
-        if pv.len() != ZISK_PUBLIC_VALUES_BYTES {
+    };
+
+    let mut chained = shr32(&first.commitment);
+    for (i, input) in rest.iter().enumerate() {
+        if input.program_vk != first.program_vk {
             return Err(format!(
-                "batch #{i} public values are {} bytes, expected {ZISK_PUBLIC_VALUES_BYTES}",
-                pv.len()
+                "batch #{} inner program VK differs within the range",
+                i + 1
             ));
         }
-        if pv[PV_PROGRAM_VK] != first[PV_PROGRAM_VK] {
-            return Err(format!("batch #{i} inner program VK differs within the range"));
-        }
-        if pv[PV_VADCOP_VK] != first[PV_VADCOP_VK] {
-            return Err(format!("batch #{i} inner vadcop VK differs within the range"));
+        if input.vadcop_vk != first.vadcop_vk {
+            return Err(format!(
+                "batch #{} inner vadcop VK differs within the range",
+                i + 1
+            ));
         }
         let mut preimage = [0u8; 64];
-        preimage[..32].copy_from_slice(&rolling);
-        preimage[32..].copy_from_slice(&pv[PV_COMMITMENT]);
-        rolling = keccak256(preimage).0;
+        preimage[..32].copy_from_slice(chained.as_slice());
+        preimage[32..].copy_from_slice(shr32(&input.commitment).as_slice());
+        chained = shr32(&keccak256(preimage));
     }
 
     let mut binding = [0u8; 96];
-    for (be_word, le_out) in first[PV_PROGRAM_VK]
-        .chunks_exact(8)
-        .zip(binding[..32].chunks_exact_mut(8))
-    {
-        for (i, b) in be_word.iter().rev().enumerate() {
-            le_out[i] = *b;
-        }
-    }
-    for (be_word, le_out) in first[PV_VADCOP_VK]
-        .chunks_exact(8)
-        .zip(binding[32..64].chunks_exact_mut(8))
-    {
-        for (i, b) in be_word.iter().rev().enumerate() {
-            le_out[i] = *b;
-        }
-    }
-    binding[64..].copy_from_slice(&rolling);
+    binding[..32].copy_from_slice(first.program_vk.as_slice());
+    binding[32..64].copy_from_slice(first.vadcop_vk.as_slice());
+    binding[64..].copy_from_slice(chained.as_slice());
     Ok(keccak256(binding))
+}
+
+/// A 32-byte big-endian uint256 right-shifted 32 bits — the contracts'
+/// 224-bit public-input truncation, applied to per-batch public inputs and
+/// to every chain step.
+fn shr32(word: &B256) -> B256 {
+    let mut out = [0u8; 32];
+    out[4..].copy_from_slice(&word.as_slice()[..28]);
+    B256::from(out)
 }
 
 #[cfg(test)]
@@ -426,247 +643,421 @@ mod tests {
     const K: usize = 4;
 
     fn manager() -> ZiskAggregationJobManager {
-        ZiskAggregationJobManager::new(K, Duration::from_secs(60))
+        ZiskAggregationJobManager::new(K, Duration::from_secs(60), None)
     }
 
-    /// A 320-byte per-batch public-values blob with the shared-vector
-    /// inner VKs (program VK words 1..4, vadcop VK words 5..8, big-endian
-    /// on the wire) and a commitment of 32 repeated `commitment_byte`s.
-    fn pv(commitment_byte: u8) -> Vec<u8> {
-        let mut pv = vec![0u8; ZISK_PUBLIC_VALUES_BYTES];
-        for (i, w) in [1u64, 2, 3, 4].iter().enumerate() {
-            pv[i * 8..(i + 1) * 8].copy_from_slice(&w.to_be_bytes());
+    /// A buffered input with the given commitment byte pattern and the
+    /// shared test VKs. The stream payload is a small marker — this
+    /// manager treats streams as opaque bytes (shape validation happens in
+    /// `ZiskJobManager` before buffering).
+    fn input(commitment_byte: u8) -> AggregationInput {
+        AggregationInput {
+            stream: vec![commitment_byte; 64],
+            program_vk: B256::repeat_byte(0xA1),
+            vadcop_vk: B256::repeat_byte(0xB2),
+            commitment: B256::repeat_byte(commitment_byte),
         }
-        pv[PV_COMMITMENT].fill(commitment_byte);
-        for (i, w) in [5u64, 6, 7, 8].iter().enumerate() {
-            pv[288 + i * 8..288 + (i + 1) * 8].copy_from_slice(&w.to_be_bytes());
-        }
-        pv
     }
 
     async fn feed(manager: &ZiskAggregationJobManager, batch: u64) {
-        manager
-            .on_proof_completed(batch, vec![batch as u8; ZISK_SNARK_PROOF_BYTES], pv(batch as u8))
-            .await;
+        manager.on_proof_completed(batch, input(batch as u8)).await;
     }
 
-    /// Valid aggregated public values for a range: the binding digest in
-    /// the commitment slot.
+    /// Aggregated public values for a range: the given digest at [32..64].
     fn aggregated_pv(digest: B256) -> Vec<u8> {
         let mut pv = vec![0u8; ZISK_PUBLIC_VALUES_BYTES];
-        pv[PV_COMMITMENT].copy_from_slice(digest.as_slice());
+        pv[32..64].copy_from_slice(digest.as_slice());
         pv
     }
 
-    /// Shared cross-crate test vector: the aggregator guest's lib test
-    /// (`binding_digest_shared_vector` in
-    /// zksync-os-zisk/guest-aggregator/src/lib.rs) asserts the same digest
-    /// for the same inputs. Update both together.
+    async fn expected_digest(manager: &ZiskAggregationJobManager, from: u64, to: u64) -> B256 {
+        let state = manager.state.lock().await;
+        let inputs: Vec<&AggregationInput> = (from..=to)
+            .map(|b| state.inputs.get(&b).expect("input buffered"))
+            .collect();
+        expected_aggregated_public_input(&inputs).expect("digest")
+    }
+
+    /// THE cross-stack binding vector (real 4-batch aggregation session,
+    /// ZiSK v0.18.0). The aggregator guest's `cross_stack_binding_vector`
+    /// test and `zksync-os-zisk/guest-aggregator/BINDING_VECTOR.md` pin
+    /// the same values. Update all pins together.
     #[test]
-    fn shared_vector_digest_matches_guest() {
-        let pvs = [pv(0x11), pv(0x22)];
-        let refs: Vec<&[u8]> = pvs.iter().map(|p| p.as_slice()).collect();
-        let digest = expected_aggregated_commitment(&refs).unwrap();
+    fn binding_digest_matches_cross_stack_vector() {
+        let program_vk: B256 = "0x481748830df5c3b7aa5522333ace2c4b533352637b92fd3c83ecc506c5104ead"
+            .parse()
+            .unwrap();
+        let vadcop_vk: B256 = "0xcf2a309856f107b143836ada112806da71ae11567fa3f2d2050baba5381c7b7d"
+            .parse()
+            .unwrap();
+        let commitments = [
+            "0x95693fd871251f2a04f558f94852d31d4f7b0cd38b0ee2c746bd2851dc701dca",
+            "0x4962160e4e0addc72fe2178dbbf3c5882ca1033790bb968d4fa451485987f99b",
+            "0xe697864dd72ddded6f1818db6618efff8e695714db8492ac50abc9f5d8b6221e",
+            "0x3cbda79d374329af945a0b1d2d73c87b2cd2cadb69ab3d6c03166a690dfff898",
+        ];
+        let inputs: Vec<AggregationInput> = commitments
+            .iter()
+            .map(|c| AggregationInput {
+                stream: vec![],
+                program_vk,
+                vadcop_vk,
+                commitment: c.parse().unwrap(),
+            })
+            .collect();
+        let refs: Vec<&AggregationInput> = inputs.iter().collect();
+        let digest = expected_aggregated_public_input(&refs).unwrap();
         assert_eq!(
-            format!("{digest:x}"),
-            // Same un-prefixed literal as SHARED_VECTOR_DIGEST in the guest test.
-            "f73b9b6beae4a1c5e9597a42e7c51a8ab67a0e234f0c03e488cc604fd2b711a5"
+            format!("{digest:#x}"),
+            "0x5f47db9b336cf84b7b7fc49ca77eadb5160e373dc8f12057d719f45d3b2fbd84"
         );
     }
 
+    /// A single-batch range binds the first public input unhashed
+    /// (`initialHash == 0` seeds the chain with PI[0]).
     #[test]
-    fn commitment_rejects_mixed_inner_vks() {
-        let a = pv(0x11);
-        let mut b = pv(0x22);
-        b[0] ^= 0xFF; // program VK
-        let err = expected_aggregated_commitment(&[&a, &b]).unwrap_err();
+    fn single_batch_digest_seeds_with_first_public_input() {
+        let a = input(0x11);
+        let digest = expected_aggregated_public_input(&[&a]).unwrap();
+        let mut binding = [0u8; 96];
+        binding[..32].copy_from_slice(a.program_vk.as_slice());
+        binding[32..64].copy_from_slice(a.vadcop_vk.as_slice());
+        binding[64..].copy_from_slice(shr32(&a.commitment).as_slice());
+        assert_eq!(digest, keccak256(binding));
+    }
+
+    #[test]
+    fn digest_rejects_mixed_inner_vks() {
+        let a = input(0x11);
+        let mut b = input(0x22);
+        b.program_vk = B256::repeat_byte(0xFF);
+        let err = expected_aggregated_public_input(&[&a, &b]).unwrap_err();
         assert!(err.contains("program VK"), "{err}");
 
-        let mut c = pv(0x22);
-        c[289] ^= 0xFF; // vadcop VK
-        let err = expected_aggregated_commitment(&[&a, &c]).unwrap_err();
+        let mut c = input(0x22);
+        c.vadcop_vk = B256::repeat_byte(0xFF);
+        let err = expected_aggregated_public_input(&[&a, &c]).unwrap_err();
         assert!(err.contains("vadcop VK"), "{err}");
     }
 
-    /// Out-of-order per-batch completion still forms the range once the
-    /// contiguous run is complete, and the job carries the proofs in batch
-    /// order.
+    /// Ranges form only when noted by the SNARK lane — buffered inputs
+    /// alone never form a job — and out-of-order per-batch completion
+    /// still forms the range once the run is complete, in batch order.
     #[tokio::test]
-    async fn out_of_order_completion_forms_range() {
+    async fn ranges_form_only_when_noted() {
         let manager = manager();
         for batch in [9u64, 7, 10, 8] {
             feed(&manager, batch).await;
-            if batch != 8 {
-                assert!(
-                    manager.pick_next_job("agg-1").await.is_none(),
-                    "incomplete run must not form a range (after batch {batch})"
-                );
-            }
         }
+        assert!(
+            manager.pick_next_job("agg-1").await.is_none(),
+            "inputs without a noted SNARK range must not form a job"
+        );
+
+        manager.note_snark_range(7, 10).await;
         let job = manager.pick_next_job("agg-1").await.expect("range formed");
         assert_eq!((job.from_batch, job.to_batch), (7, 10));
-        let batches: Vec<u64> = job.proofs.iter().map(|(b, _)| *b).collect();
+        let batches: Vec<u64> = job.streams.iter().map(|(b, _)| *b).collect();
         assert_eq!(batches, vec![7, 8, 9, 10]);
-        assert!(manager.pick_next_job("agg-2").await.is_none(), "no second range yet");
+        assert!(
+            manager.pick_next_job("agg-2").await.is_none(),
+            "no second range"
+        );
     }
 
-    /// A gap blocks formation until it fills; batches beyond the gap wait.
+    /// A noted range waits for its missing inputs and forms when the gap
+    /// fills.
     #[tokio::test]
-    async fn gap_blocks_range_formation() {
+    async fn noted_range_waits_for_inputs() {
         let manager = manager();
-        for batch in [1u64, 2, 4, 5] {
+        manager.note_snark_range(1, 4).await;
+        for batch in [1u64, 2, 4] {
             feed(&manager, batch).await;
         }
+        assert_eq!(
+            manager.range_status(1, 4).await,
+            ZiskAggregationRangeStatus::InFlight,
+            "tracked while inputs are incomplete"
+        );
         assert!(manager.pick_next_job("agg-1").await.is_none(), "gap at 3");
         feed(&manager, 3).await;
         let job = manager.pick_next_job("agg-1").await.expect("gap filled");
         assert_eq!((job.from_batch, job.to_batch), (1, 4));
     }
 
-    /// Accepted ranges advance the floor: the next range continues where
-    /// the previous ended, and a proof arriving below the floor is dropped.
+    /// The full lifecycle: note → feed → pick → submit → take. Taking the
+    /// completed proof retires the consumed inputs (floor advances), so
+    /// late arrivals below the floor are dropped and the next range
+    /// continues cleanly.
     #[tokio::test]
-    async fn sequential_ranges_and_floor() {
+    async fn lifecycle_and_floor_advance() {
         let manager = manager();
+        manager.note_snark_range(5, 8).await;
         for batch in 5..=8u64 {
             feed(&manager, batch).await;
         }
         let job = manager.pick_next_job("agg-1").await.expect("range 5..8");
-        let pvs: Vec<&[u8]> = job.proofs.iter().map(|(_, p)| p.public_values.as_slice()).collect();
-        let digest = expected_aggregated_commitment(&pvs).unwrap();
+        let digest = expected_digest(&manager, 5, 8).await;
         manager
-            .submit_proof(5, 8, vec![0; ZISK_SNARK_PROOF_BYTES], aggregated_pv(digest), "agg-1")
+            .submit_proof(
+                5,
+                8,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                aggregated_pv(digest),
+                "agg-1",
+            )
             .await
             .expect("valid aggregated proof accepted");
-        assert!(manager.take_recorded(5, 8).await.is_some(), "recorded exactly once");
-        assert!(manager.take_recorded(5, 8).await.is_none());
+        assert_eq!((job.from_batch, job.to_batch), (5, 8));
+        assert_eq!(
+            manager.range_status(5, 8).await,
+            ZiskAggregationRangeStatus::Completed
+        );
 
-        // Late arrival below the floor is dropped: it can never range.
+        let taken = manager
+            .take_completed(5, 8)
+            .await
+            .expect("parked proof taken");
+        assert_eq!(taken.proof.len(), ZISK_SNARK_PROOF_BYTES);
+        assert!(
+            manager.take_completed(5, 8).await.is_none(),
+            "taken exactly once"
+        );
+        assert_eq!(
+            manager.range_status(5, 8).await,
+            ZiskAggregationRangeStatus::Unknown
+        );
+
+        // Late arrival below the floor is dropped; the next range works.
         feed(&manager, 4).await;
-        for batch in 9..=11u64 {
+        assert!(!manager.has_input(4).await);
+        manager.note_snark_range(9, 12).await;
+        for batch in 9..=12u64 {
             feed(&manager, batch).await;
         }
-        assert!(
-            manager.pick_next_job("agg-1").await.is_none(),
-            "9..12 incomplete; 4 must not resurrect a lower range"
-        );
-        feed(&manager, 12).await;
         let job = manager.pick_next_job("agg-1").await.expect("range 9..12");
         assert_eq!((job.from_batch, job.to_batch), (9, 12));
     }
 
+    /// A timed-out SNARK range re-picked with different bounds: both
+    /// ranges are tracked over the shared inputs, and whichever the
+    /// Airbender submission settles on can rendezvous; taking it retires
+    /// the overlapping alternative.
+    #[tokio::test]
+    async fn overlapping_rekeyed_ranges_share_inputs() {
+        let manager = manager();
+        manager.note_snark_range(1, 2).await;
+        manager.note_snark_range(1, 4).await;
+        for batch in 1..=4u64 {
+            feed(&manager, batch).await;
+        }
+
+        let job_a = manager.pick_next_job("agg-1").await.expect("first range");
+        let job_b = manager.pick_next_job("agg-2").await.expect("second range");
+        let mut ranges = [
+            (job_a.from_batch, job_a.to_batch),
+            (job_b.from_batch, job_b.to_batch),
+        ];
+        ranges.sort();
+        assert_eq!(ranges, [(1, 2), (1, 4)]);
+
+        let digest = expected_digest(&manager, 1, 2).await;
+        manager
+            .submit_proof(
+                1,
+                2,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                aggregated_pv(digest),
+                "agg-1",
+            )
+            .await
+            .expect("accepted");
+        manager.take_completed(1, 2).await.expect("composed");
+        // The overlapping (1,4) assignment is retired with the take.
+        let digest = B256::ZERO;
+        let err = manager
+            .submit_proof(
+                1,
+                4,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                aggregated_pv(digest),
+                "agg-2",
+            )
+            .await
+            .expect_err("retired range");
+        assert!(matches!(
+            err,
+            ZiskAggregationSubmitError::UnknownRange { .. }
+        ));
+        // Batches 3..4 can still join a re-keyed range.
+        assert!(manager.has_input(3).await && manager.has_input(4).await);
+        manager.note_snark_range(3, 4).await;
+        let job = manager
+            .pick_next_job("agg-3")
+            .await
+            .expect("re-keyed range");
+        assert_eq!((job.from_batch, job.to_batch), (3, 4));
+    }
+
     /// Timeout reassignment: an assigned range whose prover vanished is
-    /// re-offered with identical proofs.
+    /// re-offered with identical streams.
     #[tokio::test]
     async fn timeout_reassigns_range() {
-        let manager = ZiskAggregationJobManager::new(K, Duration::ZERO);
+        let manager = ZiskAggregationJobManager::new(K, Duration::ZERO, None);
+        manager.note_snark_range(1, 4).await;
         for batch in 1..=4u64 {
             feed(&manager, batch).await;
         }
         let job_a = manager.pick_next_job("agg-a").await.expect("assigned to A");
         // Zero timeout: immediately reassignable.
-        let job_b = manager.pick_next_job("agg-b").await.expect("reassigned to B");
-        assert_eq!((job_b.from_batch, job_b.to_batch), (job_a.from_batch, job_a.to_batch));
-        assert_eq!(job_b.proofs[0].1.proof, job_a.proofs[0].1.proof);
+        let job_b = manager
+            .pick_next_job("agg-b")
+            .await
+            .expect("reassigned to B");
+        assert_eq!(
+            (job_b.from_batch, job_b.to_batch),
+            (job_a.from_batch, job_a.to_batch)
+        );
+        assert_eq!(job_b.streams[0].1, job_a.streams[0].1);
     }
 
     /// Submissions for unknown/unassigned ranges are rejected; a wrong
-    /// aggregated commitment requeues the range for another prover.
+    /// digest requeues the range for another prover; VK drift is rejected
+    /// without consuming the assignment.
     #[tokio::test]
     async fn submit_validation() {
-        let manager = manager();
+        let expected_vk = B256::repeat_byte(0x42);
+        let manager = ZiskAggregationJobManager::new(K, Duration::from_secs(60), Some(expected_vk));
+        manager.note_snark_range(1, 4).await;
         for batch in 1..=4u64 {
             feed(&manager, batch).await;
         }
+
+        let mut pv = aggregated_pv(B256::ZERO);
+        pv[..32].copy_from_slice(expected_vk.as_slice());
+
         // Not picked yet -> unknown.
         let err = manager
-            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], aggregated_pv(B256::ZERO), "agg-1")
+            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], pv.clone(), "agg-1")
             .await
             .expect_err("unassigned range");
-        assert!(matches!(err, ZiskAggregationSubmitError::UnknownRange { .. }));
+        assert!(matches!(
+            err,
+            ZiskAggregationSubmitError::UnknownRange { .. }
+        ));
 
-        let job = manager.pick_next_job("agg-1").await.expect("job");
+        manager.pick_next_job("agg-1").await.expect("job");
 
         // Bad sizes.
         let err = manager
-            .submit_proof(1, 4, vec![0; 3], aggregated_pv(B256::ZERO), "agg-1")
+            .submit_proof(1, 4, vec![0; 3], pv.clone(), "agg-1")
             .await
             .expect_err("bad proof size");
-        assert!(matches!(err, ZiskAggregationSubmitError::InvalidProofSize { .. }));
+        assert!(matches!(
+            err,
+            ZiskAggregationSubmitError::InvalidProofSize { .. }
+        ));
+
+        // Aggregator VK drift: rejected, assignment untouched.
+        let mut drifted = pv.clone();
+        drifted[..32].copy_from_slice(B256::repeat_byte(0x13).as_slice());
+        let err = manager
+            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], drifted, "agg-1")
+            .await
+            .expect_err("VK drift");
+        assert!(matches!(err, ZiskAggregationSubmitError::VkDrift { .. }));
 
         // Wrong digest -> rejected, range requeued and re-pickable.
         let err = manager
-            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], aggregated_pv(B256::ZERO), "agg-1")
+            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], pv, "agg-1")
             .await
             .expect_err("wrong digest");
-        assert!(matches!(err, ZiskAggregationSubmitError::CommitmentMismatch(_)));
-        let requeued = manager.pick_next_job("agg-2").await.expect("requeued range");
+        assert!(matches!(err, ZiskAggregationSubmitError::DigestMismatch(_)));
+        let requeued = manager
+            .pick_next_job("agg-2")
+            .await
+            .expect("requeued range");
         assert_eq!((requeued.from_batch, requeued.to_batch), (1, 4));
 
         // Correct digest accepted.
-        let pvs: Vec<&[u8]> = job.proofs.iter().map(|(_, p)| p.public_values.as_slice()).collect();
-        let digest = expected_aggregated_commitment(&pvs).unwrap();
+        let digest = expected_digest(&manager, 1, 4).await;
+        let mut pv = aggregated_pv(digest);
+        pv[..32].copy_from_slice(expected_vk.as_slice());
         manager
-            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], aggregated_pv(digest), "agg-2")
+            .submit_proof(1, 4, vec![0; ZISK_SNARK_PROOF_BYTES], pv, "agg-2")
             .await
             .expect("accepted");
-        assert!(manager.take_recorded(1, 4).await.is_some());
+        assert!(manager.take_completed(1, 4).await.is_some());
     }
 
-    /// Discards drop overlapping formed/assigned ranges whole (including
-    /// their above-the-cut inputs) and advance the floor; unaffected
-    /// buffered inputs still form later ranges.
+    /// Discards drop overlapping tracked ranges whole and advance the
+    /// floor, but keep above-the-cut inputs for future re-keyed ranges.
     #[tokio::test]
-    async fn discard_interactions() {
+    async fn discard_keeps_inputs_above_the_cut() {
         let manager = manager();
-
-        // Discard before any formation: buffered inputs at/below the cut go.
-        for batch in 1..=3u64 {
-            feed(&manager, batch).await;
-        }
-        manager.discard_up_to(2).await;
-        // Batch 3 survives and anchors the first range at 3.
-        for batch in 4..=6u64 {
+        manager.note_snark_range(3, 6).await;
+        for batch in 3..=6u64 {
             feed(&manager, batch).await;
         }
         let job = manager.pick_next_job("agg-1").await.expect("range 3..6");
         assert_eq!((job.from_batch, job.to_batch), (3, 6));
 
-        // Discard cutting into the assigned range drops it whole: the
-        // submit is rejected and its above-the-cut inputs (5, 6) are gone.
+        // The cut breaks the assigned range: the submit is rejected, but
+        // inputs 5..6 survive for a re-keyed range.
         manager.discard_up_to(4).await;
-        let pvs: Vec<&[u8]> = job.proofs.iter().map(|(_, p)| p.public_values.as_slice()).collect();
-        let digest = expected_aggregated_commitment(&pvs).unwrap();
         let err = manager
-            .submit_proof(3, 6, vec![0; ZISK_SNARK_PROOF_BYTES], aggregated_pv(digest), "agg-1")
+            .submit_proof(
+                3,
+                6,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                aggregated_pv(B256::ZERO),
+                "agg-1",
+            )
             .await
             .expect_err("range dropped by discard");
-        assert!(matches!(err, ZiskAggregationSubmitError::UnknownRange { .. }));
+        assert!(matches!(
+            err,
+            ZiskAggregationSubmitError::UnknownRange { .. }
+        ));
+        assert!(manager.has_input(5).await && manager.has_input(6).await);
 
-        // Next range starts past the cut with fresh inputs.
-        for batch in 5..=8u64 {
-            feed(&manager, batch).await;
-        }
-        // 5..8 would overlap the dropped range's tail — the floor moved to
-        // 5 (past the cut at 4), so it forms cleanly.
-        let job = manager.pick_next_job("agg-1").await.expect("range 5..8");
-        assert_eq!((job.from_batch, job.to_batch), (5, 8));
+        manager.note_snark_range(5, 6).await;
+        let job = manager
+            .pick_next_job("agg-1")
+            .await
+            .expect("re-keyed range 5..6");
+        assert_eq!((job.from_batch, job.to_batch), (5, 6));
+
+        // A parked completed proof overlapping a later cut is dropped too.
+        let digest = expected_digest(&manager, 5, 6).await;
+        manager
+            .submit_proof(
+                5,
+                6,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                aggregated_pv(digest),
+                "agg-1",
+            )
+            .await
+            .expect("accepted");
+        manager.discard_up_to(6).await;
+        assert!(manager.take_completed(5, 6).await.is_none());
     }
 
-    /// Feeding the same batch twice keeps the first proof (idempotence).
+    /// Feeding the same batch twice keeps the first input (idempotence),
+    /// and re-noting a known range is a no-op.
     #[tokio::test]
-    async fn duplicate_feed_is_idempotent() {
+    async fn duplicate_feed_and_note_are_idempotent() {
         let manager = manager();
-        manager
-            .on_proof_completed(1, vec![0xAA; ZISK_SNARK_PROOF_BYTES], pv(0xAA))
-            .await;
-        manager
-            .on_proof_completed(1, vec![0xBB; ZISK_SNARK_PROOF_BYTES], pv(0xBB))
-            .await;
-        for batch in 2..=4u64 {
-            feed(&manager, batch).await;
-        }
+        manager.note_snark_range(1, 1).await;
+        manager.note_snark_range(1, 1).await;
+        manager.on_proof_completed(1, input(0xAA)).await;
+        manager.on_proof_completed(1, input(0xBB)).await;
         let job = manager.pick_next_job("agg-1").await.expect("range");
-        assert_eq!(job.proofs[0].1.proof, vec![0xAA; ZISK_SNARK_PROOF_BYTES]);
+        assert_eq!(job.streams[0].1, vec![0xAA; 64]);
+        assert!(
+            manager.pick_next_job("agg-2").await.is_none(),
+            "no duplicate range"
+        );
     }
 }
