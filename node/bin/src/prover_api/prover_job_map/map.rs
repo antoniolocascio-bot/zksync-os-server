@@ -135,6 +135,30 @@ impl<T: Clone> ProverJobMap<T> {
         &self,
         limit: usize,
         prover_id: &str,
+        predicate: F,
+    ) -> Vec<(FriJob, T)>
+    where
+        F: FnMut(&JobEntry<T>) -> bool,
+    {
+        self.pick_jobs_group_with_limit(limit, 1, prover_id, predicate)
+            .await
+    }
+
+    /// Like [`Self::pick_jobs_while_with_limit`], but all-or-nothing: assigns
+    /// the group only when at least `min_count` consecutive eligible jobs are
+    /// available, and assigns nothing otherwise.
+    ///
+    /// Used by the aggregated ZiSK lane, where the assigned SNARK range
+    /// doubles as the aggregation range: a partial pick (FRIs still proving)
+    /// would fragment the fixed-size ranges the range verifier expects. The
+    /// group always fills on a live chain because batches keep sealing; a
+    /// proving-version boundary inside a group cannot occur in aggregated
+    /// mode (the upgrade lane runs with `max_fris_per_snark = 1`).
+    pub async fn pick_jobs_group_with_limit<F>(
+        &self,
+        limit: usize,
+        min_count: usize,
+        prover_id: &str,
         mut predicate: F,
     ) -> Vec<(FriJob, T)>
     where
@@ -143,8 +167,10 @@ impl<T: Clone> ProverJobMap<T> {
         let now = Instant::now();
         let mut jobs = self.lock_with_tracking(JobMapMethod::PickJobsWhile).await;
 
+        // Pass 1: find the group without assigning, so a too-small group
+        // stays pending for other pickers instead of being locked up.
         let mut selected_jobs = Vec::new();
-        for (_, entry) in jobs.iter_mut() {
+        for (_, entry) in jobs.iter() {
             if !self.is_job_eligible(&selected_jobs, entry, now, limit, &mut predicate) {
                 if selected_jobs.is_empty() {
                     // We didn't find any jobs yet - continue looking for the first eligible one
@@ -154,10 +180,21 @@ impl<T: Clone> ProverJobMap<T> {
                     break;
                 }
             }
-
-            // Assign job
-            entry.metadata.assign(now, prover_id.to_string());
             selected_jobs.push(entry.metadata.clone());
+        }
+
+        if selected_jobs.len() < min_count {
+            return Vec::new();
+        }
+
+        // Pass 2: assign exactly the jobs found above (the lock was held
+        // throughout, so the map cannot have changed in between).
+        for metadata in &mut selected_jobs {
+            metadata.assign(now, prover_id.to_string());
+            let entry = jobs
+                .get_mut(&metadata.batch_number)
+                .expect("selected batch must exist under the held lock");
+            entry.metadata = metadata.clone();
         }
 
         if selected_jobs.is_empty() {

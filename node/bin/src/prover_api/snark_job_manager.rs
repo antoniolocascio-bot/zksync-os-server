@@ -127,9 +127,18 @@ impl SnarkJobManager {
     ) -> anyhow::Result<Option<Vec<(FriJob, FriProof)>>> {
         self.process_pending_fake_fri_proofs().await?;
 
+        // Aggregated mode: the assigned range doubles as the ZiSK
+        // aggregation range, so hand out full `max_fris_per_snark` groups
+        // only — a partial pick while later FRIs are still proving would
+        // fragment the fixed-size ranges the range verifier expects.
+        let min_group = if self.zisk_aggregation_job_manager.is_some() {
+            self.max_fris_per_snark
+        } else {
+            1
+        };
         let batches_with_real_proofs = self
             .jobs
-            .pick_jobs_while_with_limit(self.max_fris_per_snark, &prover_id, |job| {
+            .pick_jobs_group_with_limit(self.max_fris_per_snark, min_group, &prover_id, |job| {
                 !job.batch_envelope.data.is_fake()
             })
             .await;
