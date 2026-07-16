@@ -384,39 +384,52 @@ mod real_prover_upgrade {
             spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000, BATCHES as usize).await,
         );
 
+        // Drive traffic until EXACTLY `BATCHES` batches are sealed — one
+        // full aggregation range, nothing stranded past it. The tx↔batch
+        // mapping is timing-dependent (the setup blocks may or may not
+        // seal as batch 1 before the first transaction), so adapt: send a
+        // transaction, wait for the sealed-batch count to advance (the
+        // batch's ZiSK job appearing), repeat. Each iteration's block joins
+        // the batch that then seals, so when the count reaches `BATCHES`
+        // the last transaction's block is inside the last batch and no
+        // block is left for a fifth batch the range could never cover.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
-        for i in 1..=BATCHES {
+        let batch_sealed = |batch: u64| {
+            let url = format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek");
+            async move {
+                anyhow::Ok(
+                    reqwest::Client::new().get(url).send().await?.status()
+                        == reqwest::StatusCode::OK,
+                )
+            }
+        };
+        let mut sealed: u64 = 0;
+        while batch_sealed(sealed + 1).await? {
+            sealed += 1;
+        }
+        let mut nonce: u64 = 0;
+        while sealed < BATCHES {
+            nonce += 1;
             tester
                 .l2_provider
                 .send_transaction(
                     TransactionRequest::default()
                         .with_to(recipient)
-                        .with_value(U256::from(i)),
+                        .with_value(U256::from(nonce)),
                 )
                 .await?
                 .get_receipt()
                 .await?;
-            // Wait for batch i to seal (its ZiSK job appears) before the
-            // next transaction, so each transaction lands in its own batch
-            // and the run produces exactly `BATCHES` batches — one full
-            // aggregation range. Without this, fast consecutive receipts
-            // can pack several transactions into one batch, leaving fewer
-            // batches than the range needs and stalling finality.
             let deadline = std::time::Instant::now() + Duration::from_secs(180);
-            loop {
-                let response = reqwest::Client::new()
-                    .get(format!("{prover_api_url}/prover-jobs/v1/ZiSK/{i}/peek"))
-                    .send()
-                    .await?;
-                if response.status() == reqwest::StatusCode::OK {
-                    break;
-                }
+            while !batch_sealed(sealed + 1).await? {
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
-                    "batch {i} did not seal within the deadline"
+                    "batch {} did not seal within the deadline",
+                    sealed + 1
                 );
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
+            sealed += 1;
         }
 
         // Real finality of the last block = the 4-FRI SNARK verified on L1
