@@ -91,7 +91,7 @@ mod real_prover_upgrade {
         // concurrent warmup dies in the CUDA allocator). Start with v6; huge
         // iteration budget — it is killed at the upgrade boundary.
         let mut airbender_v6 =
-            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await);
+            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000, 1).await);
 
         // v30 traffic.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
@@ -229,7 +229,8 @@ mod real_prover_upgrade {
                     );
                     airbender_v6.0.kill().await.ok();
                     let v7 =
-                        spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000).await;
+                        spawn_airbender_prover(&tester, PROTOCOL_VERSION_V31_0, &urls, 1000, 1)
+                            .await;
                     return anyhow::Ok(KillOnDrop(v7));
                 }
             }
@@ -375,18 +376,13 @@ mod real_prover_upgrade {
         let urls = vec![prover_api_url.clone()];
 
         // Airbender first (single GPU: shivini claims all VRAM). One SNARK
-        // covers all four batches.
-        let mut airbender =
-            KillOnDrop(spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000).await);
-
-        // The service's FRI device pool sizes itself to ALL free VRAM at
-        // creation, while the SNARK wrapper's ProverContext allocates
-        // separately with no reserved headroom — whichever allocates first
-        // wins, and the FRI pool only wins races (it is created on the
-        // first picked job). Hold traffic until the wrapper context exists
-        // so the pool sizes itself around it; on a 32 GB card the reverse
-        // order fails with ErrorMemoryAllocation in the SNARK warmup.
-        tokio::time::sleep(Duration::from_secs(90)).await;
+        // covers all four batches, so the service must keep proving FRIs
+        // until it holds all four — with a smaller cap it would stop after
+        // the first FRI while the server (in aggregated mode) withholds
+        // SNARK work until a full range is ready, deadlocking the run.
+        let mut airbender = KillOnDrop(
+            spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000, BATCHES as usize).await,
+        );
 
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
         for i in 1..=BATCHES {

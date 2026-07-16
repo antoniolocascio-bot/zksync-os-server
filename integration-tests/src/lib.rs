@@ -1365,6 +1365,7 @@ pub async fn spawn_airbender_prover(
     protocol_version: &str,
     sequencer_urls: &[String],
     iterations: usize,
+    max_fris_per_snark: usize,
 ) -> tokio::process::Child {
     let app_bin_path = match protocol_version {
         PROTOCOL_VERSION => utils::materialize_multiblock_batch_bin(
@@ -1400,7 +1401,7 @@ pub async fn spawn_airbender_prover(
         .arg("--iterations")
         .arg(iterations.to_string())
         .arg("--max-fris-per-snark")
-        .arg("1")
+        .arg(max_fris_per_snark.to_string())
         .arg("--disable-zk")
         .spawn()
         .expect("failed to spawn prover service")
@@ -1415,7 +1416,7 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
         .clone();
     let protocol_version = tester.chain_layout.protocol_version();
     let mut child =
-        spawn_airbender_prover(tester, protocol_version, sequencer_urls, iterations).await;
+        spawn_airbender_prover(tester, protocol_version, sequencer_urls, iterations, 1).await;
     tokio::task::spawn(async move {
         let code = child
             .wait()
