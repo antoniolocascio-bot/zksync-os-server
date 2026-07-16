@@ -384,71 +384,75 @@ mod real_prover_upgrade {
             spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000, BATCHES as usize).await,
         );
 
-        // Drive traffic until a transaction's block lands in batch
-        // `BATCHES` — one full aggregation range, nothing stranded past
-        // it. The tx↔batch mapping is timing-dependent (setup blocks may
-        // claim batch 1, several transactions may share a batch), so ask
-        // the node authoritatively via `unstable_getBatchByBlockNumber`:
-        // after each transaction, wait for its block's batch to persist
-        // (seal + L1 commit) before deciding whether to send another.
-        // Persisting before the next send also guarantees each subsequent
-        // transaction opens a new batch, so the count advances one batch
-        // per iteration and stops exactly at `BATCHES`.
+        // Produce EXACTLY `BATCHES` batches — one full aggregation range,
+        // nothing stranded past it. The boot sequence emits a
+        // version-dependent number of setup blocks spread over one or more
+        // batches, so first let the chain settle: wait until block
+        // production and batch sealing (a batch's ZiSK job appearing) have
+        // both been quiet long enough for every boot-time block to be
+        // sealed (batch deadline + input generation). From that stable
+        // base, each transaction is the only block producer: it opens the
+        // next batch, and gating on that batch's seal before the next send
+        // keeps the mapping one-batch-per-transaction.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
-        fn find_batch_number(v: &serde_json::Value) -> Option<u64> {
-            match v {
-                serde_json::Value::Object(map) => {
-                    if let Some(n) = map
-                        .get("batchNumber")
-                        .or_else(|| map.get("batch_number"))
-                        .and_then(|n| n.as_u64())
-                    {
-                        return Some(n);
-                    }
-                    map.values().find_map(find_batch_number)
-                }
-                _ => None,
+        let batch_sealed = |batch: u64| {
+            let url = format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek");
+            async move {
+                anyhow::Ok(
+                    reqwest::Client::new().get(url).send().await?.status()
+                        == reqwest::StatusCode::OK,
+                )
             }
+        };
+
+        let settle_deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut base: u64 = 0;
+        let mut last_block = tester.l2_provider.get_block_number().await?;
+        let mut stable_since = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let mut sealed = base;
+            while batch_sealed(sealed + 1).await? {
+                sealed += 1;
+            }
+            let block = tester.l2_provider.get_block_number().await?;
+            if sealed != base || block != last_block {
+                base = sealed;
+                last_block = block;
+                stable_since = std::time::Instant::now();
+            } else if stable_since.elapsed() >= Duration::from_secs(12) {
+                break;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < settle_deadline,
+                "chain did not settle after boot (sealed={base}, block={last_block})"
+            );
         }
-        let mut last_batch: u64 = 0;
-        let mut nonce: u64 = 0;
-        while last_batch < BATCHES {
-            nonce += 1;
-            let receipt = tester
+        anyhow::ensure!(
+            base < BATCHES,
+            "boot produced {base} batches, no room left in a {BATCHES}-batch range"
+        );
+
+        for i in 1..=(BATCHES - base) {
+            tester
                 .l2_provider
                 .send_transaction(
                     TransactionRequest::default()
                         .with_to(recipient)
-                        .with_value(U256::from(nonce)),
+                        .with_value(U256::from(i)),
                 )
                 .await?
                 .get_receipt()
                 .await?;
-            let block = receipt
-                .block_number
-                .expect("mined transaction has a block");
             let deadline = std::time::Instant::now() + Duration::from_secs(180);
-            last_batch = loop {
-                let response: Result<serde_json::Value, _> = tester
-                    .l2_provider
-                    .client()
-                    .request("unstable_getBatchByBlockNumber", (block,))
-                    .await;
-                if let Ok(batch) = &response
-                    && let Some(n) = find_batch_number(batch)
-                {
-                    break n;
-                }
+            while !batch_sealed(base + i).await? {
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
-                    "block {block}'s batch did not persist within the deadline"
+                    "batch {} did not seal within the deadline",
+                    base + i
                 );
                 tokio::time::sleep(Duration::from_secs(2)).await;
-            };
-            anyhow::ensure!(
-                last_batch <= BATCHES,
-                "block {block} landed in batch {last_batch}, past the {BATCHES}-batch range"
-            );
+            }
         }
 
         // Real finality of the last block = the 4-FRI SNARK verified on L1
