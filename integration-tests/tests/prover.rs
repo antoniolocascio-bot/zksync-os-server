@@ -396,6 +396,27 @@ mod real_prover_upgrade {
                 .await?
                 .get_receipt()
                 .await?;
+            // Wait for batch i to seal (its ZiSK job appears) before the
+            // next transaction, so each transaction lands in its own batch
+            // and the run produces exactly `BATCHES` batches — one full
+            // aggregation range. Without this, fast consecutive receipts
+            // can pack several transactions into one batch, leaving fewer
+            // batches than the range needs and stalling finality.
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            loop {
+                let response = reqwest::Client::new()
+                    .get(format!("{prover_api_url}/prover-jobs/v1/ZiSK/{i}/peek"))
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::OK {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "batch {i} did not seal within the deadline"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
 
         // Real finality of the last block = the 4-FRI SNARK verified on L1
