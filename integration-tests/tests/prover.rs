@@ -363,6 +363,12 @@ mod real_prover_upgrade {
         config.prover_input_generator_config.second_proof_system = true;
         config.prover_api_config.zisk_aggregation.enabled = true;
         config.prover_api_config.zisk_aggregation.range_size = BATCHES as usize;
+        // One tx per batch => one block per batch => batch N is exactly
+        // block N. Batches otherwise seal lazily (only when the next block
+        // arrives or a timeout fires), which makes the tx-to-batch mapping
+        // timing-dependent — impossible to drive a fixed-size aggregation
+        // range against.
+        config.batcher_config.tx_per_batch_limit = 1;
         if let Ok(vk) = std::env::var("ZISK_PROGRAM_VK") {
             config.prover_api_config.zisk_program_vk = Some(vk.parse()?);
         }
@@ -384,55 +390,16 @@ mod real_prover_upgrade {
             spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000, BATCHES as usize).await,
         );
 
-        // Produce EXACTLY `BATCHES` batches — one full aggregation range,
-        // nothing stranded past it. The boot sequence emits a
-        // version-dependent number of setup blocks spread over one or more
-        // batches, so first let the chain settle: wait until block
-        // production and batch sealing (a batch's ZiSK job appearing) have
-        // both been quiet long enough for every boot-time block to be
-        // sealed (batch deadline + input generation). From that stable
-        // base, each transaction is the only block producer: it opens the
-        // next batch, and gating on that batch's seal before the next send
-        // keeps the mapping one-batch-per-transaction.
+        // With `tx_per_batch_limit = 1` the batch layout IS the block
+        // layout, so filling the range takes no observation or gating:
+        // boot emits its setup blocks (batches 1..=base), then each
+        // transaction is one block = one batch, up to batch `BATCHES`.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
-        let batch_sealed = |batch: u64| {
-            let url = format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek");
-            async move {
-                anyhow::Ok(
-                    reqwest::Client::new().get(url).send().await?.status()
-                        == reqwest::StatusCode::OK,
-                )
-            }
-        };
-
-        let settle_deadline = std::time::Instant::now() + Duration::from_secs(120);
-        let mut base: u64 = 0;
-        let mut last_block = tester.l2_provider.get_block_number().await?;
-        let mut stable_since = std::time::Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let mut sealed = base;
-            while batch_sealed(sealed + 1).await? {
-                sealed += 1;
-            }
-            let block = tester.l2_provider.get_block_number().await?;
-            if sealed != base || block != last_block {
-                base = sealed;
-                last_block = block;
-                stable_since = std::time::Instant::now();
-            } else if stable_since.elapsed() >= Duration::from_secs(12) {
-                break;
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < settle_deadline,
-                "chain did not settle after boot (sealed={base}, block={last_block})"
-            );
-        }
+        let base = tester.l2_provider.get_block_number().await?;
         anyhow::ensure!(
             base < BATCHES,
-            "boot produced {base} batches, no room left in a {BATCHES}-batch range"
+            "boot produced {base} blocks, no room left in a {BATCHES}-batch range"
         );
-
         for i in 1..=(BATCHES - base) {
             tester
                 .l2_provider
@@ -444,16 +411,12 @@ mod real_prover_upgrade {
                 .await?
                 .get_receipt()
                 .await?;
-            let deadline = std::time::Instant::now() + Duration::from_secs(180);
-            while !batch_sealed(base + i).await? {
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "batch {} did not seal within the deadline",
-                    base + i
-                );
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
         }
+        let last_block = tester.l2_provider.get_block_number().await?;
+        anyhow::ensure!(
+            last_block == BATCHES,
+            "expected the chain to stop at block {BATCHES}, got {last_block}"
+        );
 
         // Real finality of the last block = the 4-FRI SNARK verified on L1
         // (absorbs the one-time prover warmup).
