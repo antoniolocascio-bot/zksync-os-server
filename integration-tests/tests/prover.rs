@@ -384,33 +384,37 @@ mod real_prover_upgrade {
             spawn_airbender_prover(&tester, PROTOCOL_VERSION, &urls, 1000, BATCHES as usize).await,
         );
 
-        // Drive traffic until EXACTLY `BATCHES` batches are sealed — one
-        // full aggregation range, nothing stranded past it. The tx↔batch
-        // mapping is timing-dependent (the setup blocks may or may not
-        // seal as batch 1 before the first transaction), so adapt: send a
-        // transaction, wait for the sealed-batch count to advance (the
-        // batch's ZiSK job appearing), repeat. Each iteration's block joins
-        // the batch that then seals, so when the count reaches `BATCHES`
-        // the last transaction's block is inside the last batch and no
-        // block is left for a fifth batch the range could never cover.
+        // Drive traffic until a transaction's block lands in batch
+        // `BATCHES` — one full aggregation range, nothing stranded past
+        // it. The tx↔batch mapping is timing-dependent (setup blocks may
+        // claim batch 1, several transactions may share a batch), so ask
+        // the node authoritatively via `unstable_getBatchByBlockNumber`:
+        // after each transaction, wait for its block's batch to persist
+        // (seal + L1 commit) before deciding whether to send another.
+        // Persisting before the next send also guarantees each subsequent
+        // transaction opens a new batch, so the count advances one batch
+        // per iteration and stops exactly at `BATCHES`.
         let recipient: Address = "0xdead000000000000000000000000000000000001".parse()?;
-        let batch_sealed = |batch: u64| {
-            let url = format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek");
-            async move {
-                anyhow::Ok(
-                    reqwest::Client::new().get(url).send().await?.status()
-                        == reqwest::StatusCode::OK,
-                )
+        fn find_batch_number(v: &serde_json::Value) -> Option<u64> {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(n) = map
+                        .get("batchNumber")
+                        .or_else(|| map.get("batch_number"))
+                        .and_then(|n| n.as_u64())
+                    {
+                        return Some(n);
+                    }
+                    map.values().find_map(find_batch_number)
+                }
+                _ => None,
             }
-        };
-        let mut sealed: u64 = 0;
-        while batch_sealed(sealed + 1).await? {
-            sealed += 1;
         }
+        let mut last_batch: u64 = 0;
         let mut nonce: u64 = 0;
-        while sealed < BATCHES {
+        while last_batch < BATCHES {
             nonce += 1;
-            tester
+            let receipt = tester
                 .l2_provider
                 .send_transaction(
                     TransactionRequest::default()
@@ -420,16 +424,31 @@ mod real_prover_upgrade {
                 .await?
                 .get_receipt()
                 .await?;
+            let block = receipt
+                .block_number
+                .expect("mined transaction has a block");
             let deadline = std::time::Instant::now() + Duration::from_secs(180);
-            while !batch_sealed(sealed + 1).await? {
+            last_batch = loop {
+                let response: Result<serde_json::Value, _> = tester
+                    .l2_provider
+                    .client()
+                    .request("unstable_getBatchByBlockNumber", (block,))
+                    .await;
+                if let Ok(batch) = &response
+                    && let Some(n) = find_batch_number(batch)
+                {
+                    break n;
+                }
                 anyhow::ensure!(
                     std::time::Instant::now() < deadline,
-                    "batch {} did not seal within the deadline",
-                    sealed + 1
+                    "block {block}'s batch did not persist within the deadline"
                 );
                 tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            sealed += 1;
+            };
+            anyhow::ensure!(
+                last_batch <= BATCHES,
+                "block {block} landed in batch {last_batch}, past the {BATCHES}-batch range"
+            );
         }
 
         // Real finality of the last block = the 4-FRI SNARK verified on L1
