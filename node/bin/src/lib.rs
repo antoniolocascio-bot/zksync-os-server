@@ -1257,9 +1257,10 @@ async fn run_main_node_pipeline(
                 .maximum_in_flight_blocks,
             read_state: state.clone(),
             pubdata_mode,
-            merkle_tree: tree,
+            merkle_tree: tree.clone(),
             runtime: runtime.clone(),
             disabled: !config.prover_input_generator_config.enable_input_generation,
+            enable_second_proof_system: config.prover_input_generator_config.second_proof_system,
         })
         .pipe(Batcher {
             startup_config: BatcherStartupConfig {
@@ -1278,6 +1279,17 @@ async fn run_main_node_pipeline(
             sidecar_sender,
             committed_batch_provider: committed_batch_provider.clone(),
             read_state: state.clone(),
+            merkle_tree: tree,
+            zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig {
+                fri_proof_verification_enabled: config
+                    .genesis_config
+                    .fri_proof_verification_enabled,
+                max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+            },
+            zisk_shadow_execution: config.prover_input_generator_config.zisk_shadow_execution,
+            halt_on_shadow_mismatch: config
+                .prover_input_generator_config
+                .halt_on_zisk_commitment_mismatch,
         })
         .pipe(BatchVerificationPipelineStep::new(
             config.batch_verification_config.clone().into(),

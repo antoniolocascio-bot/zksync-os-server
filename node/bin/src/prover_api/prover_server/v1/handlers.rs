@@ -89,7 +89,9 @@ pub(super) async fn pick_fri_job(
     {
         Some((fri_job, input)) => {
             let bytes: Vec<u8> = match &input {
-                ProverInput::Real(words) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ProverInput::Real { witness, .. } => {
+                    witness.iter().flat_map(|v| v.to_le_bytes()).collect()
+                }
                 ProverInput::Fake => vec![],
             };
             let prover_input = general_purpose::STANDARD.encode(&bytes);
@@ -278,7 +280,9 @@ pub(super) async fn peek_fri_job(
     match state.fri_job_manager.peek_batch_data(batch_number).await {
         Some((vk_hash, prover_input)) => {
             let bytes: Vec<u8> = match &prover_input {
-                ProverInput::Real(words) => words.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                ProverInput::Real { witness, .. } => {
+                    witness.iter().flat_map(|v| v.to_le_bytes()).collect()
+                }
                 ProverInput::Fake => vec![],
             };
             Json(BatchDataPayload {

@@ -16,6 +16,7 @@ use zksync_os_batch_types::batcher_model::{
 use zksync_os_batcher_metrics::BATCHER_METRICS;
 use zksync_os_contract_interface::models::StoredBatchInfo;
 use zksync_os_l1_watcher::CommittedBatchProvider;
+use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
 use zksync_os_storage_api::ReadStateHistory;
@@ -51,6 +52,16 @@ pub struct Batcher<ReadState> {
     pub sidecar_sender: mpsc::Sender<BlobTransactionSidecar>,
     pub committed_batch_provider: CommittedBatchProvider,
     pub read_state: ReadState,
+    /// Merkle tree handle for batch-boundary tree views (ZiSK batch tree update).
+    pub merkle_tree: MerkleTree<RocksDBWrapper>,
+    /// Chain-config parameters committed into the ZiSK batch public input.
+    pub zisk_chain_config: batch_builder::ZiskChainConfig,
+    /// Re-execute every sealed batch's ZiSK input in-process and compare the
+    /// batch public input (equivalence self-check; see config docs).
+    pub zisk_shadow_execution: bool,
+    /// Fail batch sealing on a shadow-execution divergence (shares the
+    /// `halt_on_zisk_commitment_mismatch` switch).
+    pub halt_on_shadow_mismatch: bool,
 }
 
 #[async_trait]
@@ -122,43 +133,47 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> PipelineComponent
             state_reporter.enter_state(GenericComponentState::Active);
 
             let recreated;
-            let batch_envelope =
-                if prev_batch_info.batch_number < self.startup_config.last_committed_batch {
-                    let committed_batch = self
-                        .committed_batch_provider
-                        .wait_for_batch(prev_batch_info.batch_number + 1)
-                        .await;
-                    // Validate that the existing batch's first block matches the next block in the stream
-                    anyhow::ensure!(
-                        committed_batch.first_block_number() == next_block_number,
-                        "Existing batch first block ({}) does not match next block in stream ({})",
-                        committed_batch.first_block_number(),
-                        next_block_number
-                    );
+            // en_dump_only mode: never freely create batches; only recreate
+            // ones the main node has already committed to L1
+            // (wait_for_batch blocks until the batch lands there).
+            let batch_envelope = if self.batcher_config.en_dump_only
+                || prev_batch_info.batch_number < self.startup_config.last_committed_batch
+            {
+                let committed_batch = self
+                    .committed_batch_provider
+                    .wait_for_batch(prev_batch_info.batch_number + 1)
+                    .await;
+                // Validate that the existing batch's first block matches the next block in the stream
+                anyhow::ensure!(
+                    committed_batch.first_block_number() == next_block_number,
+                    "Existing batch first block ({}) does not match next block in stream ({})",
+                    committed_batch.first_block_number(),
+                    next_block_number
+                );
 
-                    let Some(batch_envelope) = self
-                        .recreate_existing_batch(
-                            &mut input,
-                            &prev_batch_info,
-                            committed_batch,
-                            &state_reporter,
-                        )
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    recreated = true;
-                    batch_envelope
-                } else {
-                    let Some(batch_envelope) = self
-                        .create_batch(&mut input, &prev_batch_info, &state_reporter)
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    recreated = false;
-                    batch_envelope
+                let Some(batch_envelope) = self
+                    .recreate_existing_batch(
+                        &mut input,
+                        &prev_batch_info,
+                        committed_batch,
+                        &state_reporter,
+                    )
+                    .await?
+                else {
+                    return Ok(());
                 };
+                recreated = true;
+                batch_envelope
+            } else {
+                let Some(batch_envelope) = self
+                    .create_batch(&mut input, &prev_batch_info, &state_reporter)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                recreated = false;
+                batch_envelope
+            };
 
             let time_since_last_batch =
                 last_created_batch_at.map(|last_created_batch_at| last_created_batch_at.elapsed());
@@ -192,11 +207,14 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> PipelineComponent
                 "Batch da_input",
             );
 
-            if let Some(sidecar) = batch_envelope.batch.blob_sidecar.clone() {
-                self.sidecar_sender
-                    .send(sidecar)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to send sidecar: {e}"))?;
+            if let Some(sidecar) = batch_envelope.batch.blob_sidecar.clone()
+                && self.sidecar_sender.send(sidecar).await.is_err()
+            {
+                // The sidecar consumer is not a pipeline component and drops
+                // on shutdown while a seal can still be in flight; erroring
+                // here panics a critical task mid-teardown.
+                tracing::info!("sidecar channel closed; stopping batcher");
+                return Ok(());
             }
             output.send_and_record(batch_envelope, &state_reporter)?;
         }
@@ -316,6 +334,13 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
 
         let protocol_version = &blocks.first().as_ref().unwrap().1.protocol_version;
 
+        // Batch-boundary tree view for the ZiSK batch-level tree update:
+        // the tree before the first block of the batch.
+        let batch_tree_start = blocks.first().map(|(_, rr, _, _)| MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: rr.block_context.block_number - 1,
+        });
+
         /* ---------- seal the batch ---------- */
         let batch_envelope = batch_builder::seal_batch(
             &blocks,
@@ -328,6 +353,10 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 .adapt_for_protocol_version(protocol_version),
             self.sl_chain_id,
             &self.read_state,
+            self.zisk_chain_config,
+            self.zisk_shadow_execution,
+            self.halt_on_shadow_mismatch,
+            batch_tree_start,
         )?;
         Ok(Some(batch_envelope))
     }
@@ -389,6 +418,13 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             "Block number mismatch in last block of a rebuilt batch"
         );
 
+        // Batch-boundary tree view for the ZiSK batch-level tree update:
+        // the tree before the first block of the batch.
+        let batch_tree_start = blocks.first().map(|(_, rr, _, _)| MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: rr.block_context.block_number - 1,
+        });
+
         // Rebuild the batch from blocks
         let rebuilt_batch = batch_builder::seal_batch(
             &blocks,
@@ -400,6 +436,10 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             self.pubdata_mode,
             self.sl_chain_id,
             &self.read_state,
+            self.zisk_chain_config,
+            self.zisk_shadow_execution,
+            self.halt_on_shadow_mismatch,
+            batch_tree_start,
         )?;
 
         // Verify that the rebuilt batch matches the stored batch by comparing hashes

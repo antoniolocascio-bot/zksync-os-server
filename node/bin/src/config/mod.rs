@@ -666,6 +666,19 @@ pub struct GenesisConfig {
     /// Path to the file with genesis input.
     #[config_validate(required_if = NodeRole::MainNode)]
     pub genesis_input_path: Option<PathBuf>,
+
+    /// ZKsync OS chain-config parameter committed into the batch public input:
+    /// whether Gateway FRI-proof verification is enabled for this chain. Must
+    /// match the value the native STF runs with, or the two proof systems'
+    /// public inputs diverge.
+    #[config(default_t = false)]
+    pub fri_proof_verification_enabled: bool,
+
+    /// ZKsync OS chain-config parameter committed into the batch public input:
+    /// the per-transaction gas cap. Must match the value the native STF runs
+    /// with, or the two proof systems' public inputs diverge.
+    #[config(default_t = 1 << 24)]
+    pub max_tx_gas_limit: u64,
 }
 
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
@@ -1324,6 +1337,14 @@ pub struct BatcherConfig {
     /// when recovering from corrupted state.
     #[config(default_t = true)]
     pub assert_rebuilt_batch_hashes: bool,
+
+    /// When true, run ProverInputGenerator + Batcher on an External Node and
+    /// discard the output (no FRI proving, no L1 settlement). Used together
+    /// with `ZISK_DUMP_DIR` to snapshot a production chain's `BatchInput`
+    /// bincode for offline execution through `zksync-os-zisk-lib`.
+    /// Has no effect on the Main Node.
+    #[config(default_t = false)]
+    pub en_dump_only: bool,
 }
 
 /// Only used on the Main Node.
@@ -1345,6 +1366,38 @@ pub struct ProverInputGeneratorConfig {
     /// is unnecessary.
     #[config(default_t = true)]
     pub enable_input_generation: bool,
+
+    /// Enable ZiSK (RV64IMA) proof generation alongside Airbender.
+    /// When true, generates ZiSK prover input for every batch and the
+    /// `MultiProofCombiner` combines both proofs for L1 verification.
+    /// Requires `zisk_*` paths to be configured below.
+    #[config(default_t = false)]
+    pub second_proof_system: bool,
+
+    /// When true, deploy and use the MultiProofVerifier on L1 which requires
+    /// BOTH Airbender and ZiSK proofs for every state transition.
+    /// Implies `second_proof_system = true`.
+    #[config(default_t = false)]
+    pub multi_proof_verifier: bool,
+
+    /// When true, a ZiSK proof whose public values disagree with the batch
+    /// commitment halts the node (a mismatch means one proof system is wrong
+    /// — a security event). Default: continue — the mismatch is logged and
+    /// counted (`zisk_lane_commitment_mismatches`) and the job is retried, so
+    /// a faulty prover cannot stall the chain. The switch is config, not a
+    /// deploy. Also applies to `zisk_shadow_execution` mismatches.
+    #[config(default_t = false)]
+    pub halt_on_zisk_commitment_mismatch: bool,
+
+    /// When true, every sealed batch's ZiSK `BatchInput` is re-executed
+    /// in-process with the guest executor (CPU-only, no proving) and the
+    /// computed batch public input is compared against the expected one — the
+    /// full guest pipeline as an equivalence check per batch. A mismatch is
+    /// counted (`zisk_lane_commitment_mismatches`) and, under
+    /// `halt_on_zisk_commitment_mismatch`, fails batch sealing loudly.
+    /// Intended for equivalence testing and shadow deployments.
+    #[config(default_t = false)]
+    pub zisk_shadow_execution: bool,
 }
 
 /// Only used on the Main Node.
@@ -1393,6 +1446,21 @@ pub struct ProverApiConfig {
     #[config(default_t = 10)]
     pub max_fris_per_snark: usize,
 
+    /// How long a batch may block on its ZiSK proof path (no input, or the
+    /// ZiSK job queue full) before an Airbender-only submission is accepted
+    /// despite `multi_proof_verifier`. Unset (default): block indefinitely —
+    /// finalization waits for the ZiSK proof or operator intervention; the
+    /// escape hatch is flipping this config, not a deploy. Measured from
+    /// when the batch entered SNARK proving.
+    pub multi_proof_wait_timeout: Option<Duration>,
+
+    /// Expected ZiSK program VK: the first 32 bytes of a ZiSK proof's public
+    /// values, fixed by the guest build (record it from the reproducible
+    /// build output). When set, a submission with a different VK is rejected
+    /// and counted (`zisk_lane_vk_drift`) — the prover is running a different
+    /// guest build. Unset: the reported VK is only logged on each submit.
+    pub zisk_program_vk: Option<B256>,
+
     /// Default: store files in ./db/fri_proofs/ with 1GiB disk usage cap
     #[config(nest, default)]
     pub proof_storage: ProofStorageConfig,
@@ -1400,6 +1468,46 @@ pub struct ProverApiConfig {
     /// Stop accepting transactions when the prover pipeline falls this many batches behind
     /// its upstream. Applied to both FRI and SNARK job managers.
     pub max_batch_diff_to_upstream: Option<u64>,
+
+    /// ZiSK aggregation stage: collapse a range of per-batch ZiSK proofs
+    /// into one aggregator-guest proof for L1.
+    #[config(nest)]
+    pub zisk_aggregation: ZiskAggregationConfig,
+}
+
+/// ZiSK aggregation stage. Mirrors the Airbender FRI→SNARK split: the
+/// per-batch pick/submit flow stays, but the daemon submits `vadcop_final`
+/// proof streams instead of PLONK-wrapped SNARKs, and an aggregation job
+/// (`/ZiSK-AGG/{pick,submit}`) collapses the streams of one Airbender
+/// SNARK range into a single range proof — the ZiSK half of that range's
+/// MultiProof. Requires `second_proof_system`, daemons running with
+/// `--aggregation`, and `max_fris_per_snark == range_size` (aggregation
+/// ranges are exactly the Airbender SNARK job ranges).
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
+#[config(derive(Default))]
+pub struct ZiskAggregationConfig {
+    /// Whether the aggregation stage is enabled.
+    #[config(default_t = false)]
+    pub enabled: bool,
+
+    /// Maximum number of consecutive batches per aggregation range. Must
+    /// equal `prover_api.max_fris_per_snark`; a range covers exactly the
+    /// batches of its Airbender SNARK job (usually `range_size`, fewer
+    /// when the SNARK lane picked a partial range).
+    #[config(default_t = 4)]
+    pub range_size: usize,
+
+    /// Timeout after which an aggregation job is offered to another prover.
+    #[config(default_t = Duration::from_secs(600))]
+    pub job_timeout: Duration,
+
+    /// Expected AGGREGATOR guest program VK: the first 32 bytes of an
+    /// aggregated proof's public values, fixed by the aggregator-guest
+    /// build (`zksync-os-zisk/guest-aggregator/GUEST_PROGRAM_VK`). When
+    /// set, a submission with a different VK is rejected and counted
+    /// (`zisk_lane_aggregated_vk_drift`). Unset: the reported VK is only
+    /// logged on each submit.
+    pub program_vk: Option<B256>,
 }
 
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
@@ -2364,6 +2472,8 @@ mod tests {
                 bytecode_supplier_address: Some(Address::with_last_byte(0x01)),
                 chain_id: Some(270),
                 genesis_input_path: Some("genesis.json".into()),
+                fri_proof_verification_enabled: false,
+                max_tx_gas_limit: 1 << 24,
             },
             rpc_config: RpcConfig::default(),
             mempool_config: MempoolConfig::default(),
