@@ -1,6 +1,9 @@
+pub(crate) mod zisk_input_builder;
+
 use self::tree_adapter::TreeOutputAdapter;
 use self::tree_adapter::VersionedMerkleTree;
 use crate::prover_block::ProverBlock;
+use alloy::primitives::B256;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -14,11 +17,11 @@ use zksync_os_batch_types::BlockMerkleTreeData;
 use zksync_os_batch_types::batcher_model::ProverInput;
 use zksync_os_contract_interface::models::DACommitmentScheme;
 use zksync_os_interface::traits::TxListSource;
-use zksync_os_merkle_tree::{MerkleTree, RocksDBWrapper};
+use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
 use zksync_os_storage_api::{ReadStateHistory, ReplayRecord, TreeBlock};
-use zksync_os_types::{ProvingVersion, PubdataMode, ZksyncOsEncode};
+use zksync_os_types::{BlockOutput, ProvingVersion, PubdataMode, ZksyncOsEncode};
 
 mod tree_adapter;
 
@@ -36,6 +39,9 @@ pub struct ProverInputGenerator<ReadState> {
     pub merkle_tree: MerkleTree<RocksDBWrapper>,
     /// When true, skip all computation and emit `ProverInput::Fake` for every block.
     pub disabled: bool,
+    /// When true, generate second proof system (ZiSK) input alongside the
+    /// airbender witness. The two run in parallel — airbender is always primary.
+    pub enable_second_proof_system: bool,
 }
 
 #[async_trait]
@@ -165,17 +171,39 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
             replay_record.transactions.len(),
         );
         let versioned_tree = VersionedMerkleTree::new(self.merkle_tree.clone(), block_number - 1);
+        let enable_second_proof = self.enable_second_proof_system;
+        // Pointwise pre-state tree view for the ZiSK input builder (it
+        // extracts per-slot merkle proofs, which the streamed
+        // BlockMerkleTreeData does not carry). The witness is pre-state-only;
+        // the guest recomputes the post-state root itself.
+        let zisk_tree_before = MerkleTreeVersion {
+            tree: self.merkle_tree.clone(),
+            block: block_number - 1,
+        };
 
         let mut handle = tokio::task::spawn_blocking(move || {
             let tree_output = tree.output;
-            let prover_input = ProverInput::Real(compute_prover_input(
+            // Native execution's exact touched-key sets, used to verify the
+            // ZiSK witness discovery is complete (a gap fails generation
+            // loudly instead of surfacing at proving time).
+            let native_touched_keys: Vec<B256> = tree
+                .read_keys
+                .iter()
+                .chain(tree.written_keys.iter())
+                .copied()
+                .collect();
+            let prover_input = compute_prover_input(
                 &replay_record,
                 read_state,
                 tree,
                 versioned_tree,
+                zisk_tree_before,
+                &native_touched_keys,
+                &block_output,
                 da_commitment_scheme,
                 enable_logging,
-            ));
+                enable_second_proof,
+            );
             ProverBlock {
                 output: block_output,
                 record: replay_record,
@@ -203,14 +231,19 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_prover_input(
     replay_record: &ReplayRecord,
-    state_handle: impl ReadStateHistory,
+    state_handle: impl ReadStateHistory + Clone,
     tree_view: BlockMerkleTreeData,
     versioned_tree: VersionedMerkleTree,
+    zisk_tree_before: MerkleTreeVersion<RocksDBWrapper>,
+    native_touched_keys: &[B256],
+    block_output: &BlockOutput,
     da_commitment_scheme: DACommitmentScheme,
     enable_logging: bool,
-) -> Vec<u32> {
+    enable_second_proof: bool,
+) -> ProverInput {
     let block_number = replay_record.block_context.block_number;
     let state_view = state_handle.state_view_at(block_number - 1).unwrap();
     let transactions = replay_record
@@ -223,13 +256,24 @@ fn compute_prover_input(
         PROVER_INPUT_GENERATOR_METRICS.prover_input_generation[&"prover_input_generation"].start();
     let proving_version = ProvingVersion::try_from(replay_record.protocol_version.clone())
         .expect("invalid protocol version");
-    let prover_input = match proving_version {
+
+    // Always generate airbender witness (primary proof system)
+    let witness = match proving_version {
         ProvingVersion::V1
         | ProvingVersion::V2
         | ProvingVersion::V3
         | ProvingVersion::V4
         | ProvingVersion::V5 => {
-            panic!("computing prover input for batch with prover version v1-v5 is not supported");
+            // EN-dump-mode patch: instead of panicking, emit a Fake input so
+            // the pipeline can walk past historical blocks on pre-V6 protocol
+            // versions and reach the V6+ era where ZiSK proofs are supported.
+            tracing::warn!(
+                block_number,
+                ?proving_version,
+                "skipping prover input generation for pre-V6 block (returning ProverInput::Fake)"
+            );
+            drop(prover_input_generation_latency);
+            return ProverInput::Fake;
         }
         ProvingVersion::V6 => {
             use zk_ee_prev::{
@@ -243,15 +287,12 @@ fn compute_prover_input(
                 root: tree_view.input.root_hash.0.into(),
                 next_free_slot: tree_view.input.leaf_count,
             };
-
             let list_source = TxListSource { transactions };
-
             let bin_bytes = if enable_logging {
                 zksync_os_multivm::apps::v6::SINGLEBLOCK_BATCH_LOGGING_ENABLED
             } else {
                 zksync_os_multivm::apps::v6::SINGLEBLOCK_BATCH_APP
             };
-
             let da_commitment_scheme = (da_commitment_scheme as u8)
                 .try_into()
                 .expect("Failed to convert DA commitment scheme");
@@ -281,15 +322,12 @@ fn compute_prover_input(
                 root: tree_view.input.root_hash.0.into(),
                 next_free_slot: tree_view.input.leaf_count,
             };
-
             let list_source = TxListSource { transactions };
-
             let bin_bytes = if enable_logging {
                 zksync_os_multivm::apps::v7::SINGLEBLOCK_BATCH_LOGGING_ENABLED
             } else {
                 zksync_os_multivm::apps::v7::SINGLEBLOCK_BATCH_APP
             };
-
             let da_commitment_scheme = (da_commitment_scheme as u8)
                 .try_into()
                 .expect("Failed to convert DA commitment scheme");
@@ -308,14 +346,43 @@ fn compute_prover_input(
             .expect("proof gen failed")
         }
     };
-    let latency = prover_input_generation_latency.observe();
 
+    // Optionally generate ZiSK prover input alongside airbender witness
+    let zisk_data = if enable_second_proof {
+        tracing::debug!(
+            block_number,
+            "Generating ZiSK prover input alongside airbender witness"
+        );
+        match zisk_input_builder::build_block_data(
+            block_output,
+            replay_record,
+            &zisk_tree_before,
+            native_touched_keys,
+            &state_handle,
+        ) {
+            Ok(block_data) => {
+                Some(bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"))
+            }
+            Err(e) => {
+                tracing::error!(block_number, "ZiSK input generation failed: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let prover_input = ProverInput::Real { witness, zisk_data };
+    let latency = prover_input_generation_latency.observe();
+    let zisk_size = prover_input.zisk_data().map(|d| d.len()).unwrap_or(0);
     tracing::info!(
         block_number,
-        "Completed prover input computation in {:?}.",
-        latency
+        zisk_data_bytes = zisk_size,
+        "Completed prover input computation in {:?}. Airbender witness: {} words, ZiSK data: {} bytes",
+        latency,
+        prover_input.unwrap_real().len(),
+        zisk_size,
     );
-
     prover_input
 }
 

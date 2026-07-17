@@ -180,22 +180,42 @@ impl<E, S> BatchEnvelope<E, S> {
 }
 
 /// Input data required to generate a ZK proof for a batch.
-///
-/// Used for tests and testnets where the expensive RiscV witness computation is unnecessary.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ProverInput {
-    Real(Vec<u32>),
+    /// Airbender RiscV witness words (V6/V7).
+    /// Optionally carries ZiSK prover input alongside (when ZiSK generation is enabled).
+    Real {
+        witness: Vec<u32>,
+        /// Optional ZiSK data: bincode-serialized ZiskBlockData (per-block)
+        /// or BatchInput (per-batch). Present when ZiSK proof generation is enabled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zisk_data: Option<Vec<u8>>,
+    },
+    /// Fake proof for testing purposes.
     Fake,
 }
 
 impl ProverInput {
-    /// Returns the underlying witness words.
-    /// Panics if called on `Fake`.
+    /// Returns the underlying witness words (airbender format).
     pub fn unwrap_real(&self) -> &[u32] {
         match self {
-            ProverInput::Real(v) => v.as_slice(),
+            ProverInput::Real { witness, .. } => witness.as_slice(),
             ProverInput::Fake => panic!("ProverInput::Fake has no witness data"),
         }
+    }
+
+    /// Returns the optional ZiSK bincode bytes, if present.
+    pub fn zisk_data(&self) -> Option<&[u8]> {
+        match self {
+            ProverInput::Real {
+                zisk_data: Some(v), ..
+            } => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn is_fake(&self) -> bool {
+        matches!(self, ProverInput::Fake)
     }
 }
 
@@ -273,7 +293,6 @@ pub enum SnarkProof {
     Real(RealSnarkProof),
 }
 
-// V1 can be dropped if there testnet-alpha will be regenerated from scratch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RealSnarkProof {

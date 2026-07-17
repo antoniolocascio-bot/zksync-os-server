@@ -70,6 +70,9 @@ zk_ee.workspace = true
 zk_os_basic_system.workspace = true
 zk_os_forward_system.workspace = true
 
+zksync-os-zisk-lib.workspace = true
+zksync-os-revm.workspace = true
+revm.workspace = true
 zksync_os_interface.workspace = true
 execution_utils.workspace = true
 full_statement_verifier.workspace = true
@@ -101,6 +104,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
 bincode.workspace = true
+bincode1 = { package = "bincode", version = "1.3" }
 smart-config = { workspace = true, features = ["primitive-types", "alloy"] }
 smart-config-commands.workspace = true
 axum.workspace = true
@@ -119,3 +123,7 @@ url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true

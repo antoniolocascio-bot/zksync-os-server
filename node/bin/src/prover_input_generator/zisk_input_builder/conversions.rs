@@ -1,0 +1,153 @@
+//! Converting server-side blocks, transactions and logs into guest input form.
+
+use super::*;
+
+pub(super) fn extract_block_hashes(
+    hashes: &zksync_os_storage_api::BlockHashes,
+    block_number: u64,
+) -> Vec<(u64, B256)> {
+    hashes
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(i, hash)| {
+            let h = B256::from(hash.to_be_bytes::<32>());
+            if !h.is_zero() && block_number > 0 {
+                // Map index to block number: hashes[0] = current-1, hashes[255] = current-256
+                // For block 1: hashes[255] = genesis block (block 0)
+                let offset = 256u64.saturating_sub(i as u64);
+                if offset <= block_number {
+                    let num = block_number - offset;
+                    Some((num, h))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(super) fn extract_l2_to_l1_logs(block_output: &BlockOutput) -> Vec<L2ToL1LogEntry> {
+    let mut logs = Vec::new();
+    for tx_result in block_output.tx_results.iter().flatten() {
+        for log in &tx_result.l2_to_l1_logs {
+            logs.push(L2ToL1LogEntry {
+                l2_shard_id: log.log.l2_shard_id,
+                is_service: log.log.is_service,
+                tx_number_in_block: log.log.tx_number_in_block,
+                sender: log.log.sender,
+                key: log.log.key,
+                value: log.log.value,
+            });
+        }
+    }
+    logs
+}
+
+// ---------------------------------------------------------------------------
+// Transaction conversion
+// ---------------------------------------------------------------------------
+
+pub(super) fn convert_all_txs(
+    transactions: &[ZkTransaction],
+    block_output: &BlockOutput,
+) -> Vec<TxInput> {
+    transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| {
+            let mut tx_input = convert_tx(tx);
+            // Include the server's gas_used for all transactions.
+            // REVM's gas computation may differ from ZKsync OS native gas
+            // (especially for L1 deposits and upgrade txs), so the server's
+            // gas value is authoritative for block header computation.
+            match block_output.tx_results.get(i) {
+                Some(Ok(result)) => {
+                    tx_input.gas_used_override = Some(result.gas_used);
+                }
+                Some(Err(_)) => {
+                    tx_input.gas_used_override = Some(0);
+                    tx_input.force_fail = true;
+                }
+                None => {}
+            }
+            tx_input
+        })
+        .collect()
+}
+
+pub(super) fn convert_tx(tx: &ZkTransaction) -> TxInput {
+    use alloy::sol_types::SolValue;
+
+    // Helper to ABI-encode an L1/upgrade tx as L2CanonicalTransaction.
+    fn abi_encode_l1<T: zksync_os_types::L1TxType>(
+        i: &zksync_os_types::L1Tx<T>,
+        tx_type_byte: u8,
+    ) -> Vec<u8> {
+        zksync_os_contract_interface::L2CanonicalTransaction {
+            txType: U256::from(tx_type_byte),
+            from: U256::from_be_slice(i.initiator.as_slice()),
+            to: U256::from_be_slice(i.to.as_slice()),
+            gasLimit: U256::from(i.gas_limit),
+            gasPerPubdataByteLimit: U256::from(i.gas_per_pubdata_byte_limit),
+            maxFeePerGas: U256::from(i.max_fee_per_gas),
+            maxPriorityFeePerGas: U256::from(i.max_priority_fee_per_gas),
+            paymaster: U256::ZERO,
+            nonce: U256::from(i.nonce),
+            value: U256::from(i.value),
+            reserved: [
+                U256::from(i.to_mint),
+                U256::from_be_slice(i.refund_recipient.as_slice()),
+                U256::ZERO,
+                U256::ZERO,
+            ],
+            data: i.input().to_vec().into(),
+            signature: Default::default(),
+            factoryDeps: i
+                .factory_deps
+                .iter()
+                .map(|h| U256::from_be_bytes(h.0))
+                .collect(),
+            paymasterInput: Default::default(),
+            reservedDynamic: Default::default(),
+        }
+        .abi_encode()
+    }
+
+    let auth = match tx.envelope() {
+        ZkEnvelope::System(system_envelope) => TxAuth::System {
+            tx_hash: *system_envelope.hash(),
+            encoded_2718: system_envelope.encoded_2718(),
+        },
+        ZkEnvelope::L2(_) => TxAuth::L2 {
+            signed_bytes: tx.envelope().encoded_2718(),
+        },
+        ZkEnvelope::L1(l1) => {
+            let i = &l1.inner;
+            TxAuth::L1 {
+                tx_hash: i.hash,
+                abi_encoded: abi_encode_l1(i, 0x7f),
+            }
+        }
+        ZkEnvelope::Upgrade(u) => {
+            let i = &u.inner;
+            TxAuth::Upgrade {
+                tx_hash: i.hash,
+                abi_encoded: abi_encode_l1(i, 0x7e),
+            }
+        }
+    };
+
+    TxInput {
+        chain_id: tx.envelope().chain_id(),
+        gas_used_override: None,
+        force_fail: false,
+        auth,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tracking database for pre-execution
+// ---------------------------------------------------------------------------

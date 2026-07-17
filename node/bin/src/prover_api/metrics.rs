@@ -118,8 +118,89 @@ pub struct ProofStorageMetrics {
     pub disk_usage: Family<ProofStorageMethod, Gauge<u64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[metrics(rename_all = "snake_case", label = "reason")]
+pub enum ZiskCacheEvictionReason {
+    /// Entry exceeded `max_age` before the Airbender SNARK arrived.
+    Expired,
+    /// Cache exceeded `max_entries`; the oldest entry was dropped.
+    Overflow,
+}
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "zisk_data_cache")]
+pub struct ZiskDataCacheMetrics {
+    /// Number of batches with ZiSK data awaiting multi-proof composition.
+    pub entries: Gauge<u64>,
+    /// Batch number of the oldest cached entry (0 when empty).
+    pub oldest_batch_number: Gauge<u64>,
+    /// Age of the oldest cached entry in seconds (0 when empty). An entry
+    /// nearing `max_age` is a batch about to lose its multi-proof.
+    pub oldest_entry_age_seconds: Gauge<u64>,
+    /// Evicted entries by reason. Every eviction is a batch that can no longer
+    /// multi-prove without a replay.
+    pub evictions: Family<ZiskCacheEvictionReason, vise::Counter>,
+    /// Entries found expired when consumed (the batch missed its multi-proof).
+    pub expired_on_access: vise::Counter,
+}
+
 #[vise::register]
 pub(crate) static PROVER_METRICS: vise::Global<ProverMetrics> = vise::Global::new();
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "zisk_lane")]
+pub struct ZiskLaneMetrics {
+    /// ZiSK public values disagreed with the batch commitment — one proof
+    /// system is wrong. The headline divergence alarm: page, don't just log.
+    pub commitment_mismatches: vise::Counter,
+    /// Airbender SNARK submissions rejected (job left in place) because the
+    /// batch's ZiSK proof path was unavailable while multi-proof is required.
+    pub blocked_submits: vise::Counter,
+    /// Batches submitted Airbender-only although multi-proof was required —
+    /// only possible after `multi_proof_wait_timeout` elapsed.
+    pub degraded_to_single_proof: vise::Counter,
+    /// A ZiSK prover submitted a proof whose embedded program VK differs
+    /// from the server's expected one — the prover is running a different
+    /// guest build. Fires only when `zisk_program_vk` is configured.
+    pub vk_drift: vise::Counter,
+    /// ZiSK jobs waiting to be picked by a prover.
+    pub jobs_pending: Gauge<u64>,
+    /// ZiSK jobs assigned to provers, awaiting proof submission.
+    pub jobs_assigned: Gauge<u64>,
+    /// Validated ZiSK proofs parked awaiting their Airbender SNARK for
+    /// multi-proof composition (the rendezvous buffer).
+    pub proofs_awaiting_snark: Gauge<u64>,
+    /// Age of the oldest ZiSK job (pending or assigned) in seconds.
+    pub oldest_job_age_seconds: Gauge<u64>,
+    /// Time from ZiSK job creation (batch seal) to an accepted ZiSK proof
+    /// submission.
+    #[metrics(unit = Unit::Seconds, buckets = Buckets::LATENCIES)]
+    pub time_to_submit: Histogram<Duration>,
+    /// Wall-clock of the in-process guest re-execution per batch when
+    /// `zisk_shadow_execution` is enabled.
+    #[metrics(unit = Unit::Seconds, buckets = Buckets::LATENCIES)]
+    pub shadow_execution_time: Histogram<Duration>,
+    /// An aggregation prover submitted a range proof whose embedded
+    /// aggregator program VK differs from the server's expected one.
+    /// Fires only when `zisk_aggregation.program_vk` is configured.
+    pub aggregated_vk_drift: vise::Counter,
+    /// An aggregated range proof's committed binding digest disagreed with
+    /// the digest recomputed from the buffered per-batch proofs.
+    pub aggregated_digest_mismatches: vise::Counter,
+    /// Aggregated range proofs accepted and parked for the rendezvous.
+    pub aggregated_proofs_accepted: vise::Counter,
+    /// Per-batch `vadcop_final` streams buffered as aggregation inputs.
+    pub aggregation_inputs_buffered: Gauge<u64>,
+    /// Validated aggregated range proofs parked awaiting their Airbender
+    /// SNARK for multi-proof composition.
+    pub aggregated_proofs_awaiting_snark: Gauge<u64>,
+}
+
+#[vise::register]
+pub(crate) static ZISK_LANE_METRICS: vise::Global<ZiskLaneMetrics> = vise::Global::new();
+
+#[vise::register]
+pub(crate) static ZISK_DATA_CACHE_METRICS: vise::Global<ZiskDataCacheMetrics> = vise::Global::new();
 
 #[vise::register]
 pub(crate) static PROVER_API_METRICS: vise::Global<ProverApiMetrics> = vise::Global::new();
