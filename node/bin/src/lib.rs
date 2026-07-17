@@ -423,7 +423,8 @@ pub async fn run<State: ReadStateHistory + WriteState + StateInitializer + Clone
         config.general_config.force_starting_block_number,
         ?node_startup_state,
         starting_block,
-        blocks_to_replay = node_startup_state.block_replay_storage_last_block + 1 - starting_block,
+        blocks_to_replay =
+            (node_startup_state.block_replay_storage_last_block + 1).saturating_sub(starting_block),
         "Node state on startup"
     );
 
@@ -1200,15 +1201,35 @@ async fn run_main_node_pipeline(
         None
     };
 
-    // Until a multi-batch ZiSK guest exists, one SNARK covers exactly one
-    // batch: a wider range could not be paired with a ZiSK proof and would
-    // either stall (require_multi_proof) or silently degrade to
-    // Airbender-only. Enforce the constraint at startup instead.
+    // The ZiSK lane must be able to cover every Airbender SNARK range with
+    // one ZiSK proof, or ranges would either stall (require_multi_proof) or
+    // silently degrade to Airbender-only. Enforce the pairing at startup:
+    // - aggregation disabled: per-batch PLONK proofs cover exactly one
+    //   batch, so one SNARK covers exactly one batch;
+    // - aggregation enabled: aggregation ranges are keyed to the SNARK job
+    //   ranges, whose width is bounded by max_fris_per_snark — the two
+    //   settings must agree.
     if zisk_data_cache.is_some() {
-        assert_eq!(
-            config.prover_api_config.max_fris_per_snark, 1,
-            "second_proof_system requires prover_api.max_fris_per_snark = 1: multi-batch \
-             SNARK ranges cannot be covered by the single-batch ZiSK guest",
+        let agg_config = &config.prover_api_config.zisk_aggregation;
+        if agg_config.enabled {
+            assert_eq!(
+                config.prover_api_config.max_fris_per_snark, agg_config.range_size,
+                "zisk_aggregation.enabled requires prover_api.max_fris_per_snark == \
+                 zisk_aggregation.range_size: the aggregated ZiSK range proof must cover \
+                 exactly the batch range of its Airbender SNARK",
+            );
+        } else {
+            assert_eq!(
+                config.prover_api_config.max_fris_per_snark, 1,
+                "second_proof_system without zisk_aggregation requires \
+                 prover_api.max_fris_per_snark = 1: multi-batch SNARK ranges cannot be \
+                 covered by the single-batch ZiSK guest",
+            );
+        }
+    } else {
+        assert!(
+            !config.prover_api_config.zisk_aggregation.enabled,
+            "zisk_aggregation.enabled requires prover_input_generator.second_proof_system",
         );
     }
 
@@ -1230,6 +1251,32 @@ async fn run_main_node_pipeline(
         ))
     });
 
+    // ZiSK aggregation stage (default OFF): in aggregated mode the daemon
+    // submits per-batch vadcop_final streams, this manager collapses each
+    // Airbender SNARK range of them into one /ZiSK-AGG job, and the
+    // accepted aggregated range proof pairs with the Airbender range SNARK
+    // in the MultiProof rendezvous.
+    let zisk_aggregation_job_manager = zisk_job_manager.as_ref().and_then(|zjm| {
+        let agg_config = &config.prover_api_config.zisk_aggregation;
+        if !agg_config.enabled {
+            return None;
+        }
+        let agg = Arc::new(
+            crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager::new(
+                agg_config.range_size,
+                agg_config.job_timeout,
+                agg_config.program_vk,
+            ),
+        );
+        zjm.set_aggregation_sink(agg.clone());
+        tracing::info!(
+            range_size = agg_config.range_size,
+            aggregator_program_vk = ?agg_config.program_vk,
+            "ZiSK aggregation stage enabled (per-batch vadcop_final streams, range proofs on L1)"
+        );
+        Some(agg)
+    });
+
     let (fri_proving_step, fri_job_manager) = FriProvingPipelineStep::new(
         proof_storage.clone(),
         node_state_on_startup.l1_state.last_proved_batch,
@@ -1246,6 +1293,7 @@ async fn run_main_node_pipeline(
         config.prover_api_config.max_assigned_batch_range,
         zisk_data_cache,
         zisk_job_manager.clone(),
+        zisk_aggregation_job_manager.clone(),
         config.prover_input_generator_config.multi_proof_verifier,
         config.prover_api_config.multi_proof_wait_timeout,
     );
@@ -1281,6 +1329,7 @@ async fn run_main_node_pipeline(
                 fri_job_manager.clone(),
                 snark_job_manager.clone(),
                 zisk_job_manager.clone(),
+                zisk_aggregation_job_manager.clone(),
                 proof_storage.clone(),
                 prover_listener,
                 shutdown,
@@ -1296,7 +1345,11 @@ async fn run_main_node_pipeline(
     }
 
     if config.prover_api_config.fake_snark_provers.enabled {
-        run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager);
+        run_fake_snark_provers(
+            &config.prover_api_config,
+            runtime,
+            snark_job_manager.clone(),
+        );
     }
 
     if !config.prover_input_generator_config.enable_input_generation {
@@ -1495,8 +1548,76 @@ async fn run_en_pipeline(
         .pipe(TreeManager {
             tree: tree.clone(),
             runtime: runtime.clone(),
-        })
-        .pipe_if(
+        });
+
+    let snapshot_rx = if config.batcher_config.en_dump_only {
+        // EN dump-only mode: run ProverInputGenerator + Batcher, drain into
+        // NoOpSink. No FRI proving, no L1 settlement. `ZISK_DUMP_DIR` inside
+        // the Batcher writes bincode BatchInput to disk for offline testing.
+        // Dawn commits pubdata to L1 via blobs. For any other L1-settled
+        // chain, override via the `l1_sender_pubdata_mode` env var. The batch
+        // commitment hashes over the DA mode, so this must match the chain.
+        let pubdata_mode = config
+            .l1_sender_config
+            .pubdata_mode
+            .unwrap_or(PubdataMode::Blobs);
+        let (sidecar_tx, mut sidecar_rx) = tokio::sync::mpsc::channel::<BlobTransactionSidecar>(8);
+        runtime.spawn_critical_task("en_dump_sidecar_drain", async move {
+            while sidecar_rx.recv().await.is_some() {
+                // In dump-only mode we never submit blob txs to L1, so drop
+                // whatever the Batcher produces to keep the channel unblocked.
+            }
+        });
+        let pipeline = pipeline
+            .pipe(ProverInputGenerator {
+                enable_logging: config.prover_input_generator_config.logging_enabled,
+                maximum_in_flight_blocks: config
+                    .prover_input_generator_config
+                    .maximum_in_flight_blocks,
+                read_state: state.clone(),
+                pubdata_mode,
+                merkle_tree: tree.clone(),
+                runtime: runtime.clone(),
+                disabled: !config.prover_input_generator_config.enable_input_generation,
+                enable_second_proof_system: config
+                    .prover_input_generator_config
+                    .second_proof_system,
+            })
+            .pipe(Batcher {
+                startup_config: BatcherStartupConfig {
+                    last_committed_batch: node_state_on_startup.l1_state.last_committed_batch,
+                    last_executed_batch: node_state_on_startup.l1_state.last_executed_batch,
+                    last_persisted_block: node_state_on_startup.block_replay_storage_last_block,
+                },
+                chain_id,
+                // Feeds the committed `CommitBatchInfo.sl_chain_id` (part of the v31+ public input
+                // hash); the settlement layer is always L1 now.
+                sl_chain_id: node_state_on_startup.l1_state.l1_chain_id,
+                chain_address: node_state_on_startup.l1_state.diamond_proxy_address(),
+                pubdata_limit_bytes: config.sequencer_config.block_pubdata_limit_bytes,
+                batcher_config: config.batcher_config.clone(),
+                pubdata_mode,
+                sidecar_sender: sidecar_tx,
+                committed_batch_provider: committed_batch_provider.clone(),
+                read_state: state.clone(),
+                merkle_tree: tree,
+                zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig {
+                    fri_proof_verification_enabled: config
+                        .genesis_config
+                        .fri_proof_verification_enabled,
+                    max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+                },
+                zisk_shadow_execution: config.prover_input_generator_config.zisk_shadow_execution,
+                halt_on_shadow_mismatch: config
+                    .prover_input_generator_config
+                    .halt_on_zisk_commitment_mismatch,
+            })
+            .pipe(NoOpSink::new());
+        let components = pipeline.components();
+        pipeline.spawn();
+        PipelineTracker::spawn(runtime, components)
+    } else {
+        let pipeline = pipeline.pipe_if(
             config.batch_verification_config.client_enabled,
             BatchVerificationResponder::new(
                 chain_id,
@@ -1510,10 +1631,10 @@ async fn run_en_pipeline(
             ),
             NoOpSink::new(),
         );
-
-    let components = pipeline.components();
-    pipeline.spawn();
-    let snapshot_rx = PipelineTracker::spawn(runtime, components);
+        let components = pipeline.components();
+        pipeline.spawn();
+        PipelineTracker::spawn(runtime, components)
+    };
 
     if config.general_config.run_priority_tree {
         let priority_tree_manager = PriorityTreeManager::new(

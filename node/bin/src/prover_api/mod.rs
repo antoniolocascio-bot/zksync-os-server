@@ -10,8 +10,11 @@ mod prover_job_map;
 pub mod prover_server;
 pub mod snark_job_manager;
 pub mod snark_proving_pipeline_step;
+#[cfg(test)]
+mod test_util;
+pub mod zisk_aggregation_job_manager;
 pub mod zisk_data_cache;
 pub mod zisk_job_manager;
-pub(crate) mod zisk_proof_constants;
-mod test_util;
+pub mod zisk_proof_constants;
 pub mod zisk_proof_verifier;
+pub mod zisk_vadcop_stream;
