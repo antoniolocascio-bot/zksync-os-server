@@ -16984,30 +16984,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zksync_os_zisk_en_feeder"
-version = "0.20.11"
-dependencies = [
- "alloy",
- "anyhow",
- "bincode 2.0.1",
- "clap",
- "hex",
- "reqwest 0.12.28",
- "rocksdb",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.22",
- "zksync-os-zisk-lib",
- "zksync_os_interface",
- "zksync_os_merkle_tree",
- "zksync_os_server",
- "zksync_os_storage_api",
- "zksync_os_types",
-]
-
-[[package]]
 name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
