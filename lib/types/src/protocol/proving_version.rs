@@ -72,9 +72,13 @@ impl ProvingVersion {
     const V7_VK_HASH: &'static str =
         "0x23156cf220288cd1e436dccfc09aa4883ea8288da61aa69e2c7251b0c0c44ccd";
 
-    /// TODO: replace with actual ZiSK V1 VK hash once the ZiSK proving circuit is finalized.
+    /// keccak256(programVK || rootCVadcopFinal) in wire byte order (u64
+    /// limbs big-endian): the guest ELF 7cb3289f… (programVK 0x481748…4ead)
+    /// under the cargo-zisk v0.18.0 vadcop-final circuit. Regenerate with
+    /// era-contracts `tools -- --variant zisk` whenever either pin moves —
+    /// the on-chain ZiskVerifier must report the same value.
     const ZISK_V1_VK_HASH: &'static str =
-        "0x0000000000000000000000000000000000000000000000000000000000000001";
+        "0xbbdb8e5d70b7690513c7575d357c7d6c8e894c32d2665b2f7513c0d64a9a577b";
 
     /// Get the verification key hash associated with this execution version.
     pub fn vk_hash(&self) -> &'static str {
