@@ -3,7 +3,6 @@ use crate::batcher::seal_criteria::BatchInfoAccumulator;
 use crate::config::BatcherConfig;
 use crate::prover_block::ProverBlock;
 use alloy::consensus::BlobTransactionSidecar;
-use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use std::pin::Pin;
@@ -17,6 +16,7 @@ use zksync_os_batch_types::batcher_model::{
 use zksync_os_batcher_metrics::BATCHER_METRICS;
 use zksync_os_contract_interface::models::StoredBatchInfo;
 use zksync_os_l1_watcher::CommittedBatchProvider;
+use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
 use zksync_os_storage_api::ReadStateHistory;
@@ -45,7 +45,7 @@ pub struct Batcher<ReadState> {
     pub startup_config: BatcherStartupConfig,
     pub chain_id: u64,
     pub sl_chain_id: u64,
-    pub chain_address_sl: Address,
+    pub chain_address: Address,
     pub pubdata_limit_bytes: u64,
     pub batcher_config: BatcherConfig,
     pub pubdata_mode: PubdataMode,
@@ -347,7 +347,7 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             prev_batch_info.clone(),
             batch_number,
             self.chain_id,
-            self.chain_address_sl,
+            self.chain_address,
             // we need to adapt pubdata mode depending on protocol version, to ensure automatic DA mode change during v30 upgrade
             self.pubdata_mode
                 .adapt_for_protocol_version(protocol_version),
@@ -431,7 +431,7 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             prev_batch_info.clone(),
             batch_number,
             self.chain_id,
-            self.chain_address_sl,
+            self.chain_address,
             // Assume pubdata mode does not change
             self.pubdata_mode,
             self.sl_chain_id,

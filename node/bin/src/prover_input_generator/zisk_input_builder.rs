@@ -8,7 +8,7 @@ use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use revm::database::CacheDB;
 use revm::database_interface::DBErrorMarker;
-use revm::primitives::{TxKind, KECCAK_EMPTY};
+use revm::primitives::{KECCAK_EMPTY, TxKind};
 use revm::state::{AccountInfo, Bytecode};
 use revm::{DatabaseRef, ExecuteCommitEvm};
 use std::cell::RefCell;
@@ -16,17 +16,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use zk_ee::utils::Bytes32;
 use zk_os_forward_system::run::ReadStorageTree;
 use zksync_os_interface::traits::{PreimageSource, ReadStorage};
-use zksync_os_types::BlockOutput;
 use zksync_os_merkle_tree::{MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_revm::transaction::abstraction::ZKsyncTxBuilder;
 use zksync_os_revm::{DefaultZk, ZKsyncTx, ZkBuilder, ZkContext, ZkSpecId};
 use zksync_os_storage_api::{ReadStateHistory, ReplayRecord, ViewState};
+use zksync_os_types::BlockOutput;
 use zksync_os_types::{ExecutionVersion, ZkEnvelope, ZkTransaction};
 
 use serde::{Deserialize, Serialize};
 use zksync_os_zisk_lib::merkle::{
     self as zisk_merkle, BatchTreeUpdate, NeighborProofEntry, SlotProofEntry, StorageProof,
-    TreeLeaf, WriteOp, TREE_DEPTH,
+    TREE_DEPTH, TreeLeaf, WriteOp,
 };
 use zksync_os_zisk_lib::types::*;
 
@@ -88,7 +88,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     // blocks between root_info() and merkle_proof() calls.
     let (_initial_root, leaf_count) = tree_view.root_info()?;
     let basefee: u64 = ctx.eip1559_basefee.try_into().unwrap_or(u64::MAX);
-        // Use the block header's prevrandao value from the BlockOutput (computed by Airbender),
+    // Use the block header's prevrandao value from the BlockOutput (computed by Airbender),
     // not the BlockContext's mix_hash (which may be 0). The Airbender VM sets
     // the header's mix_hash to the actual prevrandao value.
     let prev_randao = block_output.header.mix_hash;
@@ -101,7 +101,10 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     // For upgrade blocks, include all known system/user contract addresses.
     // The genesis upgrade accesses many addresses that aren't in storage_writes/account_diffs.
-    if transactions.iter().any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. })) {
+    if transactions
+        .iter()
+        .any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. }))
+    {
         for i in 0..=0x0c {
             let addr: Address = format!("0x{:040x}", 0x10000u64 + i).parse().unwrap();
             if !initial_addrs.contains(&addr) {
@@ -113,7 +116,8 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     // Create a state view with published preimages as overrides.
     // This resolves system contract bytecodes for genesis/upgrade blocks where
     // preimages are published during execution but aren't in the state view at block N-1.
-    let all_preimages: Vec<(B256, Vec<u8>)> = block_output.published_preimages
+    let all_preimages: Vec<(B256, Vec<u8>)> = block_output
+        .published_preimages
         .iter()
         .chain(&replay_record.force_preimages)
         .cloned()
@@ -123,16 +127,27 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         &all_preimages,
     );
 
-    let (mut accounts_map, mut bytecodes_map, mut bytecodes_out) =
-        load_accounts_and_bytecodes(&initial_addrs, &mut state_with_preimages, block_output, replay_record);
+    let (mut accounts_map, mut bytecodes_map, mut bytecodes_out) = load_accounts_and_bytecodes(
+        &initial_addrs,
+        &mut state_with_preimages,
+        block_output,
+        replay_record,
+    );
 
     // For upgrade txs: pre-create accounts that are force-deployed in this block.
-    let has_upgrade = transactions.iter().any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. }));
+    let has_upgrade = transactions
+        .iter()
+        .any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. }));
     let mut bytecodes_extra = Vec::new();
     if has_upgrade {
         resolve_upgrade_bytecodes(
-            block_output, block_number, read_state, &mut state_view,
-            &mut accounts_map, &mut bytecodes_map, &mut bytecodes_out,
+            block_output,
+            block_number,
+            read_state,
+            &mut state_view,
+            &mut accounts_map,
+            &mut bytecodes_map,
+            &mut bytecodes_out,
             &mut bytecodes_extra,
         )?;
 
@@ -149,16 +164,24 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             };
             // Extract calldata from the ABI-encoded L2CanonicalTransaction.
             // Field 14 is the data offset (relative to outer offset 32).
-            let data_rel_offset: usize = alloy::primitives::U256::from_be_slice(&abi_data[32 + 14*32..32 + 15*32]).to();
+            let data_rel_offset: usize =
+                alloy::primitives::U256::from_be_slice(&abi_data[32 + 14 * 32..32 + 15 * 32]).to();
             let data_abs_offset = 32 + data_rel_offset;
-            let data_len: usize = alloy::primitives::U256::from_be_slice(&abi_data[data_abs_offset..data_abs_offset + 32]).to();
+            let data_len: usize = alloy::primitives::U256::from_be_slice(
+                &abi_data[data_abs_offset..data_abs_offset + 32],
+            )
+            .to();
             let data = &abi_data[data_abs_offset + 32..data_abs_offset + 32 + data_len];
             // Scan at every byte offset, not just 32-byte aligned,
             // because nested ABI encoding places hashes at arbitrary offsets.
             for offset in 0..data.len() {
-                if offset + 32 > data.len() { break; }
+                if offset + 32 > data.len() {
+                    break;
+                }
                 let hash = B256::from_slice(&data[offset..offset + 32]);
-                if hash.is_zero() || scanned.contains(&hash) || bytecodes_map.contains_key(&hash) { continue; }
+                if hash.is_zero() || scanned.contains(&hash) || bytecodes_map.contains_key(&hash) {
+                    continue;
+                }
                 scanned.insert(hash);
                 if let Some(preimage) = state_for_scan.get_preimage(hash)
                     && preimage.len() > 100
@@ -177,7 +200,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             }
         }
         if calldata_resolved > 0 {
-            tracing::info!(calldata_resolved, scanned = scanned.len(), "calldata bytecode scan results");
+            tracing::info!(
+                calldata_resolved,
+                scanned = scanned.len(),
+                "calldata bytecode scan results"
+            );
         }
     }
 
@@ -202,14 +229,24 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         // `bytecodes_map` (keccak-keyed), resolved from post-state separately.
         let state_view_for_pre = read_state.state_view_at(block_number - 1)?;
         let (read_keys, extra_addrs, storage_reads, pre_exec_preimages) = pre_execute_for_reads(
-            ctx, spec_id, basefee, prev_randao, &transactions, block_output,
-            &accounts_map, &storage_prestate, &bytecodes_map,
+            ctx,
+            spec_id,
+            basefee,
+            prev_randao,
+            &transactions,
+            block_output,
+            &accounts_map,
+            &storage_prestate,
+            &bytecodes_map,
             state_view_for_pre,
         );
 
         // Merge bytecodes resolved from preimage DB during pre-execution.
         if !pre_exec_preimages.is_empty() {
-            tracing::info!(count = pre_exec_preimages.len(), "pre-execution resolved preimages from DB");
+            tracing::info!(
+                count = pre_exec_preimages.len(),
+                "pre-execution resolved preimages from DB"
+            );
         }
         for (hash, preimage) in pre_exec_preimages {
             bytecodes_map
@@ -220,8 +257,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
         let new_keys = read_keys.difference(&all_storage_read_keys).count();
         tracing::info!(
-            iteration, total_read_keys = read_keys.len(), new_keys,
-            extra_addrs = extra_addrs.len(), storage_reads = storage_reads.len(),
+            iteration,
+            total_read_keys = read_keys.len(),
+            new_keys,
+            extra_addrs = extra_addrs.len(),
+            storage_reads = storage_reads.len(),
             bytecodes_available = bytecodes_map.len(),
             "pre-execution discovery results",
         );
@@ -238,7 +278,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
         // Load newly discovered accounts — try pre-execution state first, then post-execution.
         let mut state_view_reload = read_state.state_view_at(block_number - 1)?;
-        let mut state_after_reload = if has_upgrade { Some(read_state.state_view_at(block_number)?) } else { None };
+        let mut state_after_reload = if has_upgrade {
+            Some(read_state.state_view_at(block_number)?)
+        } else {
+            None
+        };
         let mut new_accounts = 0;
         for addr in extra_addrs {
             if seen_addrs.insert(addr) {
@@ -250,18 +294,33 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                     let preimage_hash = B256::from(props.bytecode_hash.as_u8_array());
                     let observable_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
                     let effective = if observable_hash.is_zero() {
-                        if props.nonce == 0 && props.balance == U256::ZERO { B256::ZERO } else { KECCAK_EMPTY }
-                    } else { observable_hash };
-                    accounts_map.insert(addr, AccountInfo {
-                        nonce: props.nonce, balance: props.balance, code_hash: effective,
-                        code: None, account_id: None,
-                    });
+                        if props.nonce == 0 && props.balance == U256::ZERO {
+                            B256::ZERO
+                        } else {
+                            KECCAK_EMPTY
+                        }
+                    } else {
+                        observable_hash
+                    };
+                    accounts_map.insert(
+                        addr,
+                        AccountInfo {
+                            nonce: props.nonce,
+                            balance: props.balance,
+                            code_hash: effective,
+                            code: None,
+                            account_id: None,
+                        },
+                    );
                     if !preimage_hash.is_zero()
                         && !observable_hash.is_zero()
                         && let Some(padded_code) = state_view_reload.get_preimage(preimage_hash)
                         && push_code_from_blob(
-                            observable_hash, &padded_code, props.unpadded_code_len as usize,
-                            &mut bytecodes_map, &mut bytecodes_out,
+                            observable_hash,
+                            &padded_code,
+                            props.unpadded_code_len as usize,
+                            &mut bytecodes_map,
+                            &mut bytecodes_out,
                         )
                     {
                         resolved = true;
@@ -279,8 +338,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                         && let Some(full_preimage) = state_after.get_preimage(pre_hash)
                     {
                         push_code_from_blob(
-                            obs_hash, &full_preimage, props.unpadded_code_len as usize,
-                            &mut bytecodes_map, &mut bytecodes_out,
+                            obs_hash,
+                            &full_preimage,
+                            props.unpadded_code_len as usize,
+                            &mut bytecodes_map,
+                            &mut bytecodes_out,
                         );
                         // Deliberately NOT inserted into accounts_map: this
                         // account only exists post-state, and pre-execution
@@ -295,7 +357,10 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         }
 
         tracing::debug!(
-            iteration, new_keys, new_reads, new_accounts,
+            iteration,
+            new_keys,
+            new_reads,
+            new_accounts,
             "Pre-execution iteration"
         );
 
@@ -308,8 +373,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     // The upgrade tx reads the ComplexUpgrader's ERC1967 implementation slot.
     // The ZiSK executor needs a merkle proof for this read.
     if has_upgrade {
-        use crate::prover_api::zisk_proof_constants::{COMPLEX_UPGRADER_ADDRESS, ERC1967_IMPLEMENTATION_SLOT};
-        let proxy_addr: Address = COMPLEX_UPGRADER_ADDRESS.parse().expect("invalid upgrader address constant");
+        use crate::prover_api::zisk_proof_constants::{
+            COMPLEX_UPGRADER_ADDRESS, ERC1967_IMPLEMENTATION_SLOT,
+        };
+        let proxy_addr: Address = COMPLEX_UPGRADER_ADDRESS
+            .parse()
+            .expect("invalid upgrader address constant");
         let impl_slot = B256::from_slice(
             &alloy::primitives::hex::decode(ERC1967_IMPLEMENTATION_SLOT)
                 .expect("invalid ERC1967 slot constant"),
@@ -330,10 +399,19 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let mut proven_flat_keys: HashSet<B256> = storage_proofs.iter().map(|(k, _)| *k).collect();
 
     let _storage_out = extract_storage_write_proofs(
-        &block_output.storage_writes, &storage_prestate, &mut tree, &mut proven_flat_keys, &mut storage_proofs,
+        &block_output.storage_writes,
+        &storage_prestate,
+        &mut tree,
+        &mut proven_flat_keys,
+        &mut storage_proofs,
     );
 
-    extract_storage_read_proofs(&storage_read_keys, &mut tree, &mut proven_flat_keys, &mut storage_proofs);
+    extract_storage_read_proofs(
+        &storage_read_keys,
+        &mut tree,
+        &mut proven_flat_keys,
+        &mut storage_proofs,
+    );
 
     // Include proofs for every key the native execution touched, discovered
     // or not. REVM serves reads on accounts created within the block from its
@@ -342,7 +420,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     // structurally invisible to the pre-execution discovery. The proofs are
     // tree-authenticated, so adding them grants the witness no extra trust.
     let native_keys: HashSet<B256> = native_touched_keys.iter().copied().collect();
-    extract_storage_read_proofs(&native_keys, &mut tree, &mut proven_flat_keys, &mut storage_proofs);
+    extract_storage_read_proofs(
+        &native_keys,
+        &mut tree,
+        &mut proven_flat_keys,
+        &mut storage_proofs,
+    );
 
     // Witness-discovery completeness: every flat key the native execution
     // touched (reads and writes, recorded by the sequencer's tree pass) must
@@ -370,15 +453,19 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let root_hash = if let Some((key, proof)) = storage_proofs.first() {
         match proof.verify(key) {
             Ok((root, _)) => root,
-            Err(_) => tree_view.root_info()?.0,  // fallback
+            Err(_) => tree_view.root_info()?.0, // fallback
         }
     } else {
-        tree_view.root_info()?.0  // no proofs, use tree directly
+        tree_view.root_info()?.0 // no proofs, use tree directly
     };
 
     // Phase 3: tree update
     let tree_update = if !block_output.storage_writes.is_empty() {
-        Some(build_tree_update(&mut tree, &block_output.storage_writes, leaf_count))
+        Some(build_tree_update(
+            &mut tree,
+            &block_output.storage_writes,
+            leaf_count,
+        ))
     } else {
         None
     };
@@ -417,9 +504,10 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             // All bytecodes keyed by keccak256. Force-deploy preimages are stored
             // in the preimage DB by blake2s — re-key them by keccak256 here.
             let mut all = bytecodes_out;
-            let mut seen: std::collections::HashSet<B256> =
-                all.iter().map(|(h, _)| *h).collect();
-            for (_blake2s_hash, code) in block_output.published_preimages.iter()
+            let mut seen: std::collections::HashSet<B256> = all.iter().map(|(h, _)| *h).collect();
+            for (_blake2s_hash, code) in block_output
+                .published_preimages
+                .iter()
                 .chain(&replay_record.force_preimages)
                 .chain(bytecodes_extra.iter())
             {
@@ -458,11 +546,15 @@ fn collect_touched_addresses(
     let mut addrs = Vec::new();
     let mut seen = HashSet::new();
     let push = |addr: Address, seen: &mut HashSet<Address>, addrs: &mut Vec<Address>| {
-        if seen.insert(addr) { addrs.push(addr); }
+        if seen.insert(addr) {
+            addrs.push(addr);
+        }
     };
     for tx in &replay_record.transactions {
         push(tx.signer(), &mut seen, &mut addrs);
-        if let Some(to) = tx.to() { push(to, &mut seen, &mut addrs); }
+        if let Some(to) = tx.to() {
+            push(to, &mut seen, &mut addrs);
+        }
     }
     push(coinbase, &mut seen, &mut addrs);
     // REVM calls basic_ref on precompile addresses during CALL (for balance checks),
@@ -496,7 +588,8 @@ fn load_accounts_and_bytecodes<S: ViewState>(
     let mut seen_hashes = HashSet::new();
 
     // Build a lookup for force_preimages (system contract bytecodes from upgrade tx)
-    let force_preimage_map: HashMap<B256, &Vec<u8>> = block_output.published_preimages
+    let force_preimage_map: HashMap<B256, &Vec<u8>> = block_output
+        .published_preimages
         .iter()
         .chain(&replay_record.force_preimages)
         .map(|(h, c)| (*h, c))
@@ -518,7 +611,11 @@ fn load_accounts_and_bytecodes<S: ViewState>(
             let preimage_hash = B256::from(props.bytecode_hash.as_u8_array());
 
             let mut effective = if observable_hash.is_zero() {
-                if props.nonce == 0 && props.balance == U256::ZERO { B256::ZERO } else { KECCAK_EMPTY }
+                if props.nonce == 0 && props.balance == U256::ZERO {
+                    B256::ZERO
+                } else {
+                    KECCAK_EMPTY
+                }
             } else {
                 observable_hash // keccak256 of raw code — correct for REVM
             };
@@ -531,8 +628,11 @@ fn load_accounts_and_bytecodes<S: ViewState>(
                         && seen_hashes.insert(preimage_hash)
                     {
                         push_code_from_blob(
-                            observable_hash, &padded_code, props.unpadded_code_len as usize,
-                            &mut bytecodes_map, &mut bytecodes_out,
+                            observable_hash,
+                            &padded_code,
+                            props.unpadded_code_len as usize,
+                            &mut bytecodes_map,
+                            &mut bytecodes_out,
                         );
                     }
                 } else if let Some(code) = force_preimage_map.get(&preimage_hash) {
@@ -544,7 +644,8 @@ fn load_accounts_and_bytecodes<S: ViewState>(
                     effective = keccak_hash;
                     if seen_hashes.insert(preimage_hash) {
                         bytecodes_out.push((keccak_hash, code.to_vec()));
-                        bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
+                        bytecodes_map
+                            .insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
                     }
                     tracing::debug!(
                         addr = %addr,
@@ -555,14 +656,24 @@ fn load_accounts_and_bytecodes<S: ViewState>(
                     );
                 }
             }
-            accounts.insert(addr, AccountInfo {
-                nonce: props.nonce, balance: props.balance, code_hash: effective,
-                code: None, account_id: None,
-            });
+            accounts.insert(
+                addr,
+                AccountInfo {
+                    nonce: props.nonce,
+                    balance: props.balance,
+                    code_hash: effective,
+                    code: None,
+                    account_id: None,
+                },
+            );
         }
     }
     // Load force_preimages (system contract bytecodes from upgrade/genesis) into bytecodes.
-    for (hash, code) in block_output.published_preimages.iter().chain(&replay_record.force_preimages) {
+    for (hash, code) in block_output
+        .published_preimages
+        .iter()
+        .chain(&replay_record.force_preimages)
+    {
         let keccak_hash = alloy::primitives::keccak256(code);
         if seen_hashes.insert(*hash) {
             bytecodes_out.push((keccak_hash, code.clone()));
@@ -582,7 +693,10 @@ fn load_storage_prestate(
     let mut prestate = HashMap::new();
     for w in writes {
         let old = state_view.read(w.key).unwrap_or(B256::ZERO);
-        prestate.insert((w.account, U256::from_be_bytes(w.account_key.0)), U256::from_be_bytes(old.0));
+        prestate.insert(
+            (w.account, U256::from_be_bytes(w.account_key.0)),
+            U256::from_be_bytes(old.0),
+        );
     }
     prestate
 }
@@ -612,7 +726,8 @@ fn pre_execute_for_reads(
     let resolved_preimages: RefCell<Vec<(B256, Vec<u8>)>> = RefCell::new(Vec::new());
 
     let tracking_db = TrackingDB {
-        accounts, storage_prestate,
+        accounts,
+        storage_prestate,
         state_view: RefCell::new(state_view),
         bytecodes,
         block_hashes: &ctx.block_hashes,
@@ -625,11 +740,25 @@ fn pre_execute_for_reads(
 
     let cache_db = CacheDB::new(tracking_db);
     run_pre_execution(
-        ctx.chain_id, spec_id, ctx.block_number, ctx.timestamp, ctx.coinbase,
-        basefee, ctx.gas_limit, prev_randao, transactions, block_output, cache_db,
+        ctx.chain_id,
+        spec_id,
+        ctx.block_number,
+        ctx.timestamp,
+        ctx.coinbase,
+        basefee,
+        ctx.gas_limit,
+        prev_randao,
+        transactions,
+        block_output,
+        cache_db,
     );
 
-    (read_keys.into_inner(), read_accounts.into_inner(), read_storage.into_inner(), resolved_preimages.into_inner())
+    (
+        read_keys.into_inner(),
+        read_accounts.into_inner(),
+        read_storage.into_inner(),
+        resolved_preimages.into_inner(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -654,8 +783,11 @@ fn extract_account_proofs<S1: ViewState, S2: ViewState>(
             // Try pre-execution state first, fall back to post-execution state.
             // Some system contracts have preimages only in the post-execution state
             // (e.g. force-deployed contracts in genesis/upgrade blocks).
-            let preimage = state_view.get_preimage(hash_value)
-                .or_else(|| state_view_post.as_mut().and_then(|sv| sv.get_preimage(hash_value)));
+            let preimage = state_view.get_preimage(hash_value).or_else(|| {
+                state_view_post
+                    .as_mut()
+                    .and_then(|sv| sv.get_preimage(hash_value))
+            });
             if let Some(preimage) = preimage {
                 preimages.push((addr, preimage));
             } else {
@@ -682,7 +814,10 @@ fn extract_storage_write_proofs(
             proofs.push((w.key, extract_proof(tree, w.key)));
         }
         let slot = U256::from_be_bytes(w.account_key.0);
-        let old = prestate.get(&(w.account, slot)).copied().unwrap_or(U256::ZERO);
+        let old = prestate
+            .get(&(w.account, slot))
+            .copied()
+            .unwrap_or(U256::ZERO);
         storage_out.push((w.account, slot, old));
     }
     storage_out
@@ -743,10 +878,10 @@ pub fn build_tree_update(
     // Seed the key map from leaves we discover.
     // Only load proofs for indices that actually exist in the tree (< leaf_count).
     let ensure_leaf = |tree: &mut MerkleTreeVersion<RocksDBWrapper>,
-                           idx: u64,
-                           leaf_proofs: &mut HashMap<u64, LeafWithProof>,
-                           key_to_index: &mut BTreeMap<B256, u64>,
-                           index_to_next: &mut HashMap<u64, u64>| {
+                       idx: u64,
+                       leaf_proofs: &mut HashMap<u64, LeafWithProof>,
+                       key_to_index: &mut BTreeMap<B256, u64>,
+                       index_to_next: &mut HashMap<u64, u64>| {
         if idx < leaf_count && !leaf_proofs.contains_key(&idx) {
             let p = get_leaf_proof(tree, idx);
             key_to_index.insert(p.key, p.index);
@@ -763,7 +898,13 @@ pub fn build_tree_update(
             // Update existing leaf
             operations.push(WriteOp::Update { index: tree_index });
             entries.push((flat_key, write.value));
-            ensure_leaf(tree, tree_index, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+            ensure_leaf(
+                tree,
+                tree_index,
+                &mut leaf_proofs,
+                &mut key_to_index,
+                &mut index_to_next,
+            );
         } else {
             // Insert new leaf. Load the tree's own predecessor first so the
             // ordered in-memory map always contains it; the true predecessor
@@ -773,14 +914,26 @@ pub fn build_tree_update(
             // by an earlier update — would shadow the tree's predecessor and
             // corrupt the linked list.)
             let tree_prev = tree.prev_tree_index(flat_key_bytes32);
-            ensure_leaf(tree, tree_prev, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+            ensure_leaf(
+                tree,
+                tree_prev,
+                &mut leaf_proofs,
+                &mut key_to_index,
+                &mut index_to_next,
+            );
             let prev_index = *key_to_index
                 .range(..flat_key)
                 .next_back()
                 .expect("predecessor always exists (MIN guard)")
                 .1;
             let old_next = index_to_next[&prev_index];
-            ensure_leaf(tree, old_next, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+            ensure_leaf(
+                tree,
+                old_next,
+                &mut leaf_proofs,
+                &mut key_to_index,
+                &mut index_to_next,
+            );
 
             let this_index = next_free_index;
             next_free_index += 1;
@@ -822,14 +975,29 @@ pub fn build_tree_update(
         for (depth, sibling) in missing {
             // Leftmost leaf of the uncovered subtree; < leaf_count by construction.
             let anchor = sibling << depth;
-            ensure_leaf(tree, anchor, &mut leaf_proofs, &mut key_to_index, &mut index_to_next);
+            ensure_leaf(
+                tree,
+                anchor,
+                &mut leaf_proofs,
+                &mut key_to_index,
+                &mut index_to_next,
+            );
         }
     }
 
     // Build sorted_leaves (touched leaves + anchors)
     let mut sorted_leaves: Vec<(u64, TreeLeaf)> = leaf_proofs
         .values()
-        .map(|p| (p.index, TreeLeaf { key: p.key, value: p.value, next_index: p.next_index }))
+        .map(|p| {
+            (
+                p.index,
+                TreeLeaf {
+                    key: p.key,
+                    value: p.value,
+                    next_index: p.next_index,
+                },
+            )
+        })
         .collect();
     sorted_leaves.sort_by_key(|(idx, _)| *idx);
 
@@ -858,8 +1026,7 @@ pub fn build_tree_update(
 /// returns every (depth, index) the pass authenticates — leaf hashes,
 /// consumed siblings, and computed internal nodes.
 fn simulate_pass1_authenticated(old_indices: &[u64], leaf_count: u64) -> HashSet<(u8, u64)> {
-    let mut authenticated: HashSet<(u8, u64)> =
-        old_indices.iter().map(|idx| (0u8, *idx)).collect();
+    let mut authenticated: HashSet<(u8, u64)> = old_indices.iter().map(|idx| (0u8, *idx)).collect();
     let mut nodes: Vec<u64> = old_indices.to_vec();
     let mut last_idx_on_level = leaf_count - 1;
 
@@ -939,7 +1106,9 @@ fn compute_old_intermediate_hashes(
     for proof in leaf_proofs.values() {
         for d in 0..TREE_DEPTH {
             let sibling_node = (proof.index >> d) ^ 1;
-            sibling_cache.entry((d, sibling_node)).or_insert(proof.siblings[d as usize]);
+            sibling_cache
+                .entry((d, sibling_node))
+                .or_insert(proof.siblings[d as usize]);
         }
     }
 
@@ -955,7 +1124,9 @@ fn compute_old_intermediate_hashes(
         let p = get_leaf_proof(tree, leaf_in_subtree);
         for d in 0..TREE_DEPTH {
             let sn = (p.index >> d) ^ 1;
-            sibling_cache.entry((d, sn)).or_insert(p.siblings[d as usize]);
+            sibling_cache
+                .entry((d, sn))
+                .or_insert(p.siblings[d as usize]);
         }
         if let Some(&h) = sibling_cache.get(&(depth, sibling_node)) {
             return h;
@@ -1074,7 +1245,11 @@ fn extract_proof(tree: &mut MerkleTreeVersion<RocksDBWrapper>, flat_key: B256) -
                     index: left.index,
                     value: B256::from(left.leaf.value.as_u8_array()),
                     next_index: left.leaf.next,
-                    siblings: left.path.iter().map(|h| B256::from(h.as_u8_array())).collect(),
+                    siblings: left
+                        .path
+                        .iter()
+                        .map(|h| B256::from(h.as_u8_array()))
+                        .collect(),
                 },
                 leaf_key: B256::from(left.leaf.key.as_u8_array()),
             },
@@ -1083,7 +1258,11 @@ fn extract_proof(tree: &mut MerkleTreeVersion<RocksDBWrapper>, flat_key: B256) -
                     index: right.index,
                     value: B256::from(right.leaf.value.as_u8_array()),
                     next_index: right.leaf.next,
-                    siblings: right.path.iter().map(|h| B256::from(h.as_u8_array())).collect(),
+                    siblings: right
+                        .path
+                        .iter()
+                        .map(|h| B256::from(h.as_u8_array()))
+                        .collect(),
                 },
                 leaf_key: B256::from(right.leaf.key.as_u8_array()),
             },
@@ -1095,20 +1274,27 @@ fn extract_block_hashes(
     hashes: &zksync_os_storage_api::BlockHashes,
     block_number: u64,
 ) -> Vec<(u64, B256)> {
-    hashes.0.iter().enumerate().filter_map(|(i, hash)| {
-        let h = B256::from(hash.to_be_bytes::<32>());
-        if !h.is_zero() && block_number > 0 {
-            // Map index to block number: hashes[0] = current-1, hashes[255] = current-256
-            // For block 1: hashes[255] = genesis block (block 0)
-            let offset = 256u64.saturating_sub(i as u64);
-            if offset <= block_number {
-                let num = block_number - offset;
-                Some((num, h))
+    hashes
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(i, hash)| {
+            let h = B256::from(hash.to_be_bytes::<32>());
+            if !h.is_zero() && block_number > 0 {
+                // Map index to block number: hashes[0] = current-1, hashes[255] = current-256
+                // For block 1: hashes[255] = genesis block (block 0)
+                let offset = 256u64.saturating_sub(i as u64);
+                if offset <= block_number {
+                    let num = block_number - offset;
+                    Some((num, h))
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else { None }
-    }).collect()
+        })
+        .collect()
 }
 
 fn extract_l2_to_l1_logs(block_output: &BlockOutput) -> Vec<L2ToL1LogEntry> {
@@ -1133,31 +1319,38 @@ fn extract_l2_to_l1_logs(block_output: &BlockOutput) -> Vec<L2ToL1LogEntry> {
 // ---------------------------------------------------------------------------
 
 fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -> Vec<TxInput> {
-    transactions.iter().enumerate().map(|(i, tx)| {
-        let mut tx_input = convert_tx(tx);
-        // Include the server's gas_used for all transactions.
-        // REVM's gas computation may differ from ZKsync OS native gas
-        // (especially for L1 deposits and upgrade txs), so the server's
-        // gas value is authoritative for block header computation.
-        match block_output.tx_results.get(i) {
-            Some(Ok(result)) => {
-                tx_input.gas_used_override = Some(result.gas_used);
+    transactions
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| {
+            let mut tx_input = convert_tx(tx);
+            // Include the server's gas_used for all transactions.
+            // REVM's gas computation may differ from ZKsync OS native gas
+            // (especially for L1 deposits and upgrade txs), so the server's
+            // gas value is authoritative for block header computation.
+            match block_output.tx_results.get(i) {
+                Some(Ok(result)) => {
+                    tx_input.gas_used_override = Some(result.gas_used);
+                }
+                Some(Err(_)) => {
+                    tx_input.gas_used_override = Some(0);
+                    tx_input.force_fail = true;
+                }
+                None => {}
             }
-            Some(Err(_)) => {
-                tx_input.gas_used_override = Some(0);
-                tx_input.force_fail = true;
-            }
-            None => {}
-        }
-        tx_input
-    }).collect()
+            tx_input
+        })
+        .collect()
 }
 
 fn convert_tx(tx: &ZkTransaction) -> TxInput {
     use alloy::sol_types::SolValue;
 
     // Helper to ABI-encode an L1/upgrade tx as L2CanonicalTransaction.
-    fn abi_encode_l1<T: zksync_os_types::L1TxType>(i: &zksync_os_types::L1Tx<T>, tx_type_byte: u8) -> Vec<u8> {
+    fn abi_encode_l1<T: zksync_os_types::L1TxType>(
+        i: &zksync_os_types::L1Tx<T>,
+        tx_type_byte: u8,
+    ) -> Vec<u8> {
         zksync_os_contract_interface::L2CanonicalTransaction {
             txType: U256::from(tx_type_byte),
             from: U256::from_be_slice(i.initiator.as_slice()),
@@ -1172,14 +1365,20 @@ fn convert_tx(tx: &ZkTransaction) -> TxInput {
             reserved: [
                 U256::from(i.to_mint),
                 U256::from_be_slice(i.refund_recipient.as_slice()),
-                U256::ZERO, U256::ZERO,
+                U256::ZERO,
+                U256::ZERO,
             ],
             data: i.input().to_vec().into(),
             signature: Default::default(),
-            factoryDeps: i.factory_deps.iter().map(|h| U256::from_be_bytes(h.0)).collect(),
+            factoryDeps: i
+                .factory_deps
+                .iter()
+                .map(|h| U256::from_be_bytes(h.0))
+                .collect(),
             paymasterInput: Default::default(),
             reservedDynamic: Default::default(),
-        }.abi_encode()
+        }
+        .abi_encode()
     }
 
     let auth = match tx.envelope() {
@@ -1187,16 +1386,22 @@ fn convert_tx(tx: &ZkTransaction) -> TxInput {
             tx_hash: *system_envelope.hash(),
             encoded_2718: system_envelope.encoded_2718(),
         },
-        ZkEnvelope::L2(_) => {
-            TxAuth::L2 { signed_bytes: tx.envelope().encoded_2718() }
-        }
+        ZkEnvelope::L2(_) => TxAuth::L2 {
+            signed_bytes: tx.envelope().encoded_2718(),
+        },
         ZkEnvelope::L1(l1) => {
             let i = &l1.inner;
-            TxAuth::L1 { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7f) }
+            TxAuth::L1 {
+                tx_hash: i.hash,
+                abi_encoded: abi_encode_l1(i, 0x7f),
+            }
         }
         ZkEnvelope::Upgrade(u) => {
             let i = &u.inner;
-            TxAuth::Upgrade { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7e) }
+            TxAuth::Upgrade {
+                tx_hash: i.hash,
+                abi_encoded: abi_encode_l1(i, 0x7e),
+            }
         }
     };
 
@@ -1231,7 +1436,9 @@ struct TrackingDB<'a, S> {
 #[derive(Debug)]
 struct TrackingDBError;
 impl core::fmt::Display for TrackingDBError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { write!(f, "tracking db") }
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "tracking db")
+    }
 }
 impl std::error::Error for TrackingDBError {}
 impl DBErrorMarker for TrackingDBError {}
@@ -1252,7 +1459,9 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
             let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
             let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
             let effective = if obs_hash.is_zero() {
-                if props.nonce == 0 && props.balance == U256::ZERO { return Ok(None); }
+                if props.nonce == 0 && props.balance == U256::ZERO {
+                    return Ok(None);
+                }
                 KECCAK_EMPTY
             } else {
                 obs_hash
@@ -1272,8 +1481,11 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
                 None
             };
             return Ok(Some(AccountInfo {
-                nonce: props.nonce, balance: props.balance, code_hash: effective,
-                code, account_id: None,
+                nonce: props.nonce,
+                balance: props.balance,
+                code_hash: effective,
+                code,
+                account_id: None,
             }));
         }
         Ok(None)
@@ -1289,27 +1501,36 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
             && let Some(preimage) = self.state_view.borrow_mut().get_preimage(code_hash)
             && !preimage.is_empty()
         {
-            self.resolved_preimages.borrow_mut().push((code_hash, preimage.clone()));
+            self.resolved_preimages
+                .borrow_mut()
+                .push((code_hash, preimage.clone()));
             return Ok(Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
         }
         Ok(Bytecode::default())
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let flat_key = zisk_merkle::derive_flat_storage_key(&address.into_array(), &B256::from(index.to_be_bytes::<32>()));
+        let flat_key = zisk_merkle::derive_flat_storage_key(
+            &address.into_array(),
+            &B256::from(index.to_be_bytes::<32>()),
+        );
         self.read_keys.borrow_mut().insert(flat_key);
 
         let val = if let Some(&val) = self.storage_prestate.get(&(address, index)) {
             val
         } else {
-            self.state_view.borrow_mut().read(flat_key)
+            self.state_view
+                .borrow_mut()
+                .read(flat_key)
                 .map(|v| U256::from_be_bytes(v.0))
                 .unwrap_or(U256::ZERO)
         };
         // Capture read for SimpleDB storage population
         self.read_storage.borrow_mut().push((address, index, val));
         // DEBUG: print storage reads for upgrade-related addresses
-        if address.as_slice()[18] >= 0x80 || (address.as_slice()[16] == 0x00 && address.as_slice()[17] == 0x01) {
+        if address.as_slice()[18] >= 0x80
+            || (address.as_slice()[16] == 0x00 && address.as_slice()[17] == 0x01)
+        {
             tracing::debug!("SLOAD({address}, slot={index}) = 0x{val:064x}");
         }
         Ok(val)
@@ -1328,17 +1549,33 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_pre_execution<DB: DatabaseRef>(
-    chain_id: u64, spec_id: ZkSpecId, block_number: u64, timestamp: u64,
-    coinbase: Address, basefee: u64, gas_limit: u64, prev_randao: B256,
-    transactions: &[TxInput], block_output: &BlockOutput, mut cache_db: CacheDB<DB>,
-) where DB::Error: core::fmt::Debug {
+    chain_id: u64,
+    spec_id: ZkSpecId,
+    block_number: u64,
+    timestamp: u64,
+    coinbase: Address,
+    basefee: u64,
+    gas_limit: u64,
+    prev_randao: B256,
+    transactions: &[TxInput],
+    block_output: &BlockOutput,
+    mut cache_db: CacheDB<DB>,
+) where
+    DB::Error: core::fmt::Debug,
+{
     let mut evm = <ZkContext<_>>::default()
         .with_db(&mut cache_db)
-        .modify_cfg_chained(|cfg| { cfg.chain_id = chain_id; cfg.spec = spec_id; })
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = chain_id;
+            cfg.spec = spec_id;
+        })
         .modify_block_chained(|blk| {
-            blk.number = U256::from(block_number); blk.timestamp = U256::from(timestamp);
-            blk.beneficiary = coinbase; blk.basefee = basefee;
-            blk.gas_limit = gas_limit; blk.prevrandao = Some(prev_randao);
+            blk.number = U256::from(block_number);
+            blk.timestamp = U256::from(timestamp);
+            blk.beneficiary = coinbase;
+            blk.basefee = basefee;
+            blk.gas_limit = gas_limit;
+            blk.prevrandao = Some(prev_randao);
         })
         .build_zk();
 
@@ -1349,38 +1586,99 @@ fn run_pre_execution<DB: DatabaseRef>(
             None => (None, false),
         };
         // Decode tx fields from the authenticated source, matching the guest's logic.
-        let (caller, kind, value, data, nonce, gas_limit, gas_price, gas_priority_fee,
-             chain_id, tx_type, mint, refund_recipient, tx_hash) = match &tx_input.auth {
-            TxAuth::L1 { tx_hash, abi_encoded } | TxAuth::Upgrade { tx_hash, abi_encoded } => {
-                let w = |f: usize| alloy::primitives::U256::from_be_slice(&abi_encoded[32 + f*32..32 + (f+1)*32]);
+        let (
+            caller,
+            kind,
+            value,
+            data,
+            nonce,
+            gas_limit,
+            gas_price,
+            gas_priority_fee,
+            chain_id,
+            tx_type,
+            mint,
+            refund_recipient,
+            tx_hash,
+        ) = match &tx_input.auth {
+            TxAuth::L1 {
+                tx_hash,
+                abi_encoded,
+            }
+            | TxAuth::Upgrade {
+                tx_hash,
+                abi_encoded,
+            } => {
+                let w = |f: usize| {
+                    alloy::primitives::U256::from_be_slice(
+                        &abi_encoded[32 + f * 32..32 + (f + 1) * 32],
+                    )
+                };
                 let a = |f: usize| Address::from_slice(&w(f).to_be_bytes::<32>()[12..]);
                 let raw_gl: u64 = w(3).to();
                 let tt: u8 = w(0).to();
-                let gl = if tt == 0x7e { raw_gl.saturating_mul(10) } else { raw_gl };
+                let gl = if tt == 0x7e {
+                    raw_gl.saturating_mul(10)
+                } else {
+                    raw_gl
+                };
                 let data_rel: usize = w(14).to();
                 let data_abs = 32 + data_rel;
-                let data_len: usize = alloy::primitives::U256::from_be_slice(&abi_encoded[data_abs..data_abs+32]).to();
-                let data = abi_encoded[data_abs+32..data_abs+32+data_len].to_vec();
+                let data_len: usize =
+                    alloy::primitives::U256::from_be_slice(&abi_encoded[data_abs..data_abs + 32])
+                        .to();
+                let data = abi_encoded[data_abs + 32..data_abs + 32 + data_len].to_vec();
                 // Always pass the recipient, zero address included: the Atlas
                 // handler requires one for every L1->L2 tx (the consistency
                 // checker passes it unconditionally too).
-                (a(1), TxKind::Call(a(2)), w(9), data, w(8).to::<u64>(), gl, w(5).to::<u128>(),
-                 None, tx_input.chain_id, tt, w(10), Some(a(11)), *tx_hash)
+                (
+                    a(1),
+                    TxKind::Call(a(2)),
+                    w(9),
+                    data,
+                    w(8).to::<u64>(),
+                    gl,
+                    w(5).to::<u128>(),
+                    None,
+                    tx_input.chain_id,
+                    tt,
+                    w(10),
+                    Some(a(11)),
+                    *tx_hash,
+                )
             }
             TxAuth::L2 { signed_bytes } => {
                 use alloy::consensus::Transaction;
                 use alloy::consensus::TxEnvelope;
                 use alloy::eips::Decodable2718;
                 let env = TxEnvelope::decode_2718(&mut &signed_bytes[..]).expect("decode");
-                let signer = alloy::consensus::transaction::SignerRecoverable::recover_signer(&env).expect("ecrecover");
-                let k = match env.to() { Some(a) => TxKind::Call(a), None => TxKind::Create };
+                let signer = alloy::consensus::transaction::SignerRecoverable::recover_signer(&env)
+                    .expect("ecrecover");
+                let k = match env.to() {
+                    Some(a) => TxKind::Call(a),
+                    None => TxKind::Create,
+                };
                 let h = alloy::primitives::keccak256(signed_bytes);
-                (signer, k, env.value(), env.input().to_vec(), env.nonce(), env.gas_limit(),
-                 env.max_fee_per_gas(), env.max_priority_fee_per_gas(),
-                 env.chain_id().or(tx_input.chain_id), env.tx_type() as u8,
-                 U256::ZERO, None, h)
+                (
+                    signer,
+                    k,
+                    env.value(),
+                    env.input().to_vec(),
+                    env.nonce(),
+                    env.gas_limit(),
+                    env.max_fee_per_gas(),
+                    env.max_priority_fee_per_gas(),
+                    env.chain_id().or(tx_input.chain_id),
+                    env.tx_type() as u8,
+                    U256::ZERO,
+                    None,
+                    h,
+                )
             }
-            TxAuth::System { tx_hash, encoded_2718 } => {
+            TxAuth::System {
+                tx_hash,
+                encoded_2718,
+            } => {
                 // Mirrors the consistency checker's System arm: bootloader
                 // caller, zero fees/value/nonce, block gas limit (the tx's
                 // own is zero), service tx type 0x7d.
@@ -1389,21 +1687,46 @@ fn run_pre_execution<DB: DatabaseRef>(
                 let env = zksync_os_types::SystemTxEnvelope::decode_2718(&mut &encoded_2718[..])
                     .expect("decode system tx");
                 let to = env.to().expect("system tx always has `to`");
-                (zksync_os_types::BOOTLOADER_FORMAL_ADDRESS, TxKind::Call(to), U256::ZERO,
-                 env.input().to_vec(), 0, gas_limit, 0, Some(0),
-                 None, zksync_os_types::SYSTEM_TX_TYPE_ID, U256::ZERO, None, *tx_hash)
+                (
+                    zksync_os_types::BOOTLOADER_FORMAL_ADDRESS,
+                    TxKind::Call(to),
+                    U256::ZERO,
+                    env.input().to_vec(),
+                    0,
+                    gas_limit,
+                    0,
+                    Some(0),
+                    None,
+                    zksync_os_types::SYSTEM_TX_TYPE_ID,
+                    U256::ZERO,
+                    None,
+                    *tx_hash,
+                )
             }
         };
         let mut b = revm::context::TxEnv::builder()
-            .caller(caller).gas_limit(gas_limit).gas_price(gas_price)
-            .kind(kind).value(value).data(Bytes::from(data)).nonce(nonce)
-            .tx_type(Some(tx_type)).chain_id(chain_id).blob_hashes(vec![]);
-        if let Some(fee) = gas_priority_fee { b = b.gas_priority_fee(Some(fee)); }
+            .caller(caller)
+            .gas_limit(gas_limit)
+            .gas_price(gas_price)
+            .kind(kind)
+            .value(value)
+            .data(Bytes::from(data))
+            .nonce(nonce)
+            .tx_type(Some(tx_type))
+            .chain_id(chain_id)
+            .blob_hashes(vec![]);
+        if let Some(fee) = gas_priority_fee {
+            b = b.gas_priority_fee(Some(fee));
+        }
         let tx: ZKsyncTx<revm::context::TxEnv> = ZKsyncTxBuilder::new()
-            .base(b).mint(mint).refund_recipient(refund_recipient)
-            .gas_used_override(gas_override).force_fail(force_fail)
+            .base(b)
+            .mint(mint)
+            .refund_recipient(refund_recipient)
+            .gas_used_override(gas_override)
+            .force_fail(force_fail)
             .tx_hash(tx_hash)
-            .build().expect("tx build failed");
+            .build()
+            .expect("tx build failed");
         match evm.transact_commit(tx) {
             Ok(result) => {
                 if matches!(tx_input.auth, TxAuth::Upgrade { .. }) {
@@ -1455,14 +1778,17 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
             .map(|w| w.account)
             .chain(block_output.account_diffs.iter().map(|d| d.address))
             .filter(|addr| {
-                accounts_map
-                    .get(addr)
-                    .is_none_or(|info| info.code_hash == KECCAK_EMPTY || info.code_hash == B256::ZERO)
+                accounts_map.get(addr).is_none_or(|info| {
+                    info.code_hash == KECCAK_EMPTY || info.code_hash == B256::ZERO
+                })
             })
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        tracing::info!(count = addrs_needing_code.len(), "resolving post-execution bytecodes");
+        tracing::info!(
+            count = addrs_needing_code.len(),
+            "resolving post-execution bytecodes"
+        );
         for addr in addrs_needing_code {
             if let Some(props) = state_after.get_account(addr) {
                 let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
@@ -1476,9 +1802,11 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
                 {
                     {
                         push_code_from_blob(
-                            effective, &padded_code_with_artifacts,
+                            effective,
+                            &padded_code_with_artifacts,
                             props.unpadded_code_len as usize,
-                            bytecodes_map, bytecodes_out,
+                            bytecodes_map,
+                            bytecodes_out,
                         );
                         // Store the FULL preimage (code + artifacts) under the blake2s hash.
                         // The deployer precompile looks up by this hash.
@@ -1538,7 +1866,10 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
             }
         }
         if extra_from_published > 0 {
-            tracing::info!(extra_from_published, "included published_preimages as extra_bytecodes");
+            tracing::info!(
+                extra_from_published,
+                "included published_preimages as extra_bytecodes"
+            );
         }
     }
 
@@ -1559,12 +1890,16 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
         let mut props_decoded = 0;
         for write in &block_output.storage_writes {
             let value_hash = write.value;
-            if value_hash.is_zero() { continue; }
+            if value_hash.is_zero() {
+                continue;
+            }
             total_writes += 1;
             // Resolve AccountProperties preimage
             if let Some(props_bytes) = state_for_bytecodes.get_preimage(value_hash) {
                 preimage_found += 1;
-                if props_bytes.len() < 124 { continue; }
+                if props_bytes.len() < 124 {
+                    continue;
+                }
                 props_decoded += 1;
                 // AccountProperties layout: versioning_data(4) + nonce(8) + balance(32) + bytecode_hash(32) + ...
                 // The bytecode_hash is at a fixed offset. Let's use the merkle module's decoder.
@@ -1577,8 +1912,12 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
                         "AccountProperties scan: found bytecode_hash"
                     );
                 }
-                if bytecode_hash.is_zero() || !seen_bytecode_hashes.insert(bytecode_hash) { continue; }
-                if bytecodes_map.contains_key(&bytecode_hash) { continue; }
+                if bytecode_hash.is_zero() || !seen_bytecode_hashes.insert(bytecode_hash) {
+                    continue;
+                }
+                if bytecodes_map.contains_key(&bytecode_hash) {
+                    continue;
+                }
                 if let Some(code_preimage) = state_for_bytecodes.get_preimage(bytecode_hash)
                     && !code_preimage.is_empty()
                 {
@@ -1592,7 +1931,10 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
             }
         }
         tracing::info!(
-            total_writes, preimage_found, props_decoded, resolved_count,
+            total_writes,
+            preimage_found,
+            props_decoded,
+            resolved_count,
             "AccountProperties bytecode scan stats"
         );
         if resolved_count > 0 {
@@ -1604,7 +1946,9 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
     }
 
     // Resolve the proxy implementation target via the ERC1967 storage slot.
-    use crate::prover_api::zisk_proof_constants::{COMPLEX_UPGRADER_ADDRESS, ERC1967_IMPLEMENTATION_SLOT};
+    use crate::prover_api::zisk_proof_constants::{
+        COMPLEX_UPGRADER_ADDRESS, ERC1967_IMPLEMENTATION_SLOT,
+    };
     let proxy_addr: Address = COMPLEX_UPGRADER_ADDRESS
         .parse()
         .expect("invalid upgrader address constant");
@@ -1633,15 +1977,22 @@ fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
     if let Some(props) = state_after.get_account(impl_addr) {
         let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
         let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
-        let effective = if obs_hash.is_zero() { KECCAK_EMPTY } else { obs_hash };
+        let effective = if obs_hash.is_zero() {
+            KECCAK_EMPTY
+        } else {
+            obs_hash
+        };
         tracing::info!(address = %impl_addr, code_hash = %effective, "resolving upgrade implementation bytecode");
         if !pre_hash.is_zero()
             && let Some(padded_code) = state_after.get_preimage(pre_hash)
         {
             {
                 push_code_from_blob(
-                    effective, &padded_code, props.unpadded_code_len as usize,
-                    bytecodes_map, bytecodes_out,
+                    effective,
+                    &padded_code,
+                    props.unpadded_code_len as usize,
+                    bytecodes_map,
+                    bytecodes_out,
                 );
             }
         }
@@ -1694,11 +2045,14 @@ mod tree_update_tests {
             write(B256::repeat_byte(155), B256::repeat_byte(0xa2)), // insert between 150/160
             write(B256::repeat_byte(156), B256::repeat_byte(0xa3)), // chained insert
             write(B256::repeat_byte(200), B256::repeat_byte(0xa4)), // update
-            write(B256::repeat_byte(75), B256::repeat_byte(0xa5)),  // insert between 70/80
+            write(B256::repeat_byte(75), B256::repeat_byte(0xa5)), // insert between 70/80
         ];
         let post_entries: Vec<TreeEntry> = changes
             .iter()
-            .map(|w| TreeEntry { key: w.key, value: w.value })
+            .map(|w| TreeEntry {
+                key: w.key,
+                value: w.value,
+            })
             .collect();
         let after = tree.extend(&post_entries).unwrap();
         let root_after = after.root_hash;
@@ -1712,7 +2066,10 @@ mod tree_update_tests {
 
         // The guest recomputes the post-state root with no trusted input.
         let (computed_root, computed_count) = update.apply(&root_before);
-        assert_eq!(computed_root, root_after, "guest-computed root != real tree root");
+        assert_eq!(
+            computed_root, root_after,
+            "guest-computed root != real tree root"
+        );
         assert_eq!(computed_count, after.leaf_count);
     }
 }

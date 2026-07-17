@@ -1,20 +1,22 @@
 #![cfg(feature = "prover-tests")]
 
-use zksync_os_integration_tests::{
-    CURRENT_TO_L1, NEXT_TO_GATEWAY, SettlementLayer, TestCase, TestEnvironment, test_multisetup,
-};
+use zksync_os_integration_tests::{CURRENT_TO_L1, NEXT_TO_L1, TestEnvironment, test_multisetup};
 
 #[cfg(feature = "gpu-prover-tests")]
 mod real_prover_upgrade {
     use alloy::network::TransactionBuilder;
     use alloy::primitives::{Address, U256};
     use alloy::providers::Provider;
-    use alloy::sol_types::SolCall;
     use alloy::rpc::types::TransactionRequest;
+    use alloy::sol_types::SolCall;
     use std::time::Duration;
     use zksync_os_integration_tests::provider::ZksyncTestingProvider;
-    use zksync_os_integration_tests::upgrade::{Action, CommitterFacetV31, FacetCut, UpgradeTester};
-    use zksync_os_integration_tests::{CURRENT_TO_L1, run_zisk_gpu_prover, run_zisk_gpu_prover_aggregated, spawn_airbender_prover};
+    use zksync_os_integration_tests::upgrade::{
+        Action, CommitterFacetV31, FacetCut, UpgradeTester,
+    };
+    use zksync_os_integration_tests::{
+        CURRENT_TO_L1, run_zisk_gpu_prover, run_zisk_gpu_prover_aggregated, spawn_airbender_prover,
+    };
     use zksync_os_server::default_protocol_version::{PROTOCOL_VERSION, PROTOCOL_VERSION_V31_0};
     use zksync_os_types::ProvingVersion;
 
@@ -152,7 +154,9 @@ mod real_prover_upgrade {
                 .genesis_config
                 .bytecode_supplier_address
                 .expect("bytecode_supplier_address must be configured");
-            let code = zksync_os_integration_tests::contracts::BytecodesSupplierV31::DEPLOYED_BYTECODE.clone();
+            let code =
+                zksync_os_integration_tests::contracts::BytecodesSupplierV31::DEPLOYED_BYTECODE
+                    .clone();
             tester
                 .l1_provider()
                 .anvil_set_code(supplier_address, code)
@@ -266,7 +270,10 @@ mod real_prover_upgrade {
             total_batches >= 2,
             "expected batches on both sides of the upgrade, got {total_batches}"
         );
-        tracing::info!(total_batches, "all batches real-proven on L1 — starting ZiSK lane");
+        tracing::info!(
+            total_batches,
+            "all batches real-proven on L1 — starting ZiSK lane"
+        );
 
         // ZiSK lane: jobs were created at batch seal and survive the
         // Airbender-only sends; the daemon exits 0 only after `total_batches`
@@ -317,9 +324,7 @@ mod real_prover_upgrade {
             let deadline = std::time::Instant::now() + Duration::from_secs(120);
             loop {
                 let status = reqwest::Client::new()
-                    .get(format!(
-                        "{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek"
-                    ))
+                    .get(format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek"))
                     .send()
                     .await?
                     .status();
@@ -486,8 +491,8 @@ mod real_prover_upgrade {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
-        let dir = std::env::var("CAPTURE_DIR")
-            .unwrap_or_else(|_| "/tmp/zisk-batch-inputs".to_string());
+        let dir =
+            std::env::var("CAPTURE_DIR").unwrap_or_else(|_| "/tmp/zisk-batch-inputs".to_string());
         std::fs::create_dir_all(&dir)?;
 
         let env = CURRENT_TO_L1.environment().await?;
@@ -552,29 +557,14 @@ mod real_prover_upgrade {
     }
 }
 
-#[test_multisetup([CURRENT_TO_L1, NEXT_TO_GATEWAY])]
-async fn prover(env: TestEnvironment, test_case: TestCase) -> anyhow::Result<()> {
+#[test_multisetup([CURRENT_TO_L1, NEXT_TO_L1])]
+async fn prover(env: TestEnvironment) -> anyhow::Result<()> {
     // Test that prover can successfully prove at least one batch
     let mut config = env.default_config().await?;
     config.prover_api_config.fake_fri_provers.enabled = false;
     config.prover_api_config.fake_snark_provers.enabled = false;
     config.prover_input_generator_config.logging_enabled = true;
     let tester = env.launch(config).await?;
-
-    if matches!(test_case.settlement_layer, SettlementLayer::Gateway) {
-        // Gateway comes with a pre-baked state and some batches are already fake-proven there.
-        // So we expect the next batch to be proven with real flow.
-        let last_proven_batch = tester.owned_supporting_nodes()[0]
-            .prover_tester
-            .last_proven_batch()
-            .await?;
-        // We expect that first supporting node is gateway node.
-        // Wait for the first batch to be proven on gateway node as well.
-        tester.owned_supporting_nodes()[0]
-            .prover_tester
-            .wait_for_batch_proven(last_proven_batch + 1)
-            .await?;
-    }
 
     // Test environment comes with some L1 transactions by default, so one batch should be provable
     // without any new transactions inside the test.

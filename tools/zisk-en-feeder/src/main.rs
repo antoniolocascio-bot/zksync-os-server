@@ -28,7 +28,11 @@ struct Args {
     en_rocks_db_path: PathBuf,
 
     /// Scratch dir for the secondary-mode replica state.
-    #[arg(long, env = "FEEDER_SECONDARY_PATH", default_value = "/tmp/zisk_feeder_secondary")]
+    #[arg(
+        long,
+        env = "FEEDER_SECONDARY_PATH",
+        default_value = "/tmp/zisk_feeder_secondary"
+    )]
     secondary_path: PathBuf,
 
     /// Sidecar base URL to push produced inputs to.
@@ -63,7 +67,8 @@ struct FeedBatchReq {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,zisk_en_feeder=debug"))
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,zisk_en_feeder=debug")),
         )
         .init();
     let args = Args::parse();
@@ -135,7 +140,12 @@ async fn build_and_push(
         airbender_witness_hex: have_any.then(|| format!("0x{}", hex::encode(&combined_airbender))),
     };
     if !have_any {
-        tracing::info!(batch_number, lo, hi, "input builder is still a stub — skipping push");
+        tracing::info!(
+            batch_number,
+            lo,
+            hi,
+            "input builder is still a stub — skipping push"
+        );
         return Ok(());
     }
 

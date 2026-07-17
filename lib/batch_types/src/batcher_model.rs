@@ -207,7 +207,9 @@ impl ProverInput {
     /// Returns the optional ZiSK bincode bytes, if present.
     pub fn zisk_data(&self) -> Option<&[u8]> {
         match self {
-            ProverInput::Real { zisk_data: Some(v), .. } => Some(v.as_slice()),
+            ProverInput::Real {
+                zisk_data: Some(v), ..
+            } => Some(v.as_slice()),
             _ => None,
         }
     }

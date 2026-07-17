@@ -175,7 +175,6 @@ impl<DB: Database + 'static, P: TreeParams + 'static> ReadStorageTree for Merkle
     }
 }
 
-
 pub fn fixed_bytes_to_bytes32(x: B256) -> Bytes32 {
     let x: [u8; 32] = x.into();
     x.into()

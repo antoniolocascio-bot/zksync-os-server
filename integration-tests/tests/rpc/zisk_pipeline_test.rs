@@ -17,24 +17,18 @@ use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use base64::Engine;
 use std::time::Duration;
-use zksync_os_integration_tests::{CURRENT_TO_L1, SettlementLayer, TestCase};
-use zksync_os_server::default_protocol_version::PROTOCOL_VERSION_V31_0;
 use zksync_os_integration_tests::assert_traits::ReceiptAssert;
 use zksync_os_integration_tests::l1_helpers::wait_for_l1_state;
 use zksync_os_integration_tests::test_config::make_commit_only_config;
+use zksync_os_integration_tests::{CURRENT_TO_L1, NEXT_TO_L1, TestCase};
+use zksync_os_server::default_protocol_version::PROTOCOL_VERSION_V31_0;
 use zksync_os_zisk_lib::executor;
 use zksync_os_zisk_lib::types::BatchOutput;
 
 /// v31.0 protocol chains stamp execution version 6, so their blocks run on
 /// the v0.3.x zksync-os line (AtlasV3 in REVM) — the newest supported spec.
-/// The shipped v31.0 chain state settles on Gateway (its L1 state has the
-/// chain already migrated), so the v31 variants run gateway-settling; the
+/// The v31 variants run on the upstream v31-on-L1 chain state; the
 /// second-proof input pipeline and guest execution are settlement-agnostic.
-const V31_TO_GATEWAY: TestCase = TestCase {
-    protocol_version: PROTOCOL_VERSION_V31_0,
-    settlement_layer: SettlementLayer::Gateway,
-};
-
 /// Equivalence teeth: the REVM consistency checker reverts on
 /// any native-vs-REVM divergence, and every sealed batch's ZiSK input is
 /// re-executed in-process with the guest executor and checked against the
@@ -71,7 +65,10 @@ async fn peek_zisk_data_once(
         return Ok(None);
     }
     let payload: ZiskBatchDataPayload = response.json().await?;
-    anyhow::ensure!(payload.batch_number == batch_number, "batch number mismatch");
+    anyhow::ensure!(
+        payload.batch_number == batch_number,
+        "batch number mismatch"
+    );
     Ok(Some(
         base64::engine::general_purpose::STANDARD.decode(payload.zisk_data)?,
     ))
@@ -99,13 +96,12 @@ async fn wait_input_containing_block(
     let client = reqwest::Client::new();
     for _ in 0..240 {
         for batch_number in 2..=max_batch {
-            let Some(bytes) =
-                peek_zisk_data_once(&client, prover_api_url, batch_number).await?
+            let Some(bytes) = peek_zisk_data_once(&client, prover_api_url, batch_number).await?
             else {
                 continue;
             };
-            let (output, commitment) = executor::execute_and_commit_from_bincode(&bytes)
-                .map_err(|e| {
+            let (output, commitment) =
+                executor::execute_and_commit_from_bincode(&bytes).map_err(|e| {
                     anyhow::anyhow!("ZiSK executor failed for batch {batch_number}: {e}")
                 })?;
             if output
@@ -128,7 +124,7 @@ async fn zisk_pipeline_e2e() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_pipeline_e2e_v31_to_gateway() -> anyhow::Result<()> {
-    zisk_pipeline_e2e_impl(V31_TO_GATEWAY).await
+    zisk_pipeline_e2e_impl(NEXT_TO_L1).await
 }
 
 async fn zisk_pipeline_e2e_impl(case: TestCase) -> anyhow::Result<()> {
@@ -195,7 +191,11 @@ async fn zisk_pipeline_e2e_impl(case: TestCase) -> anyhow::Result<()> {
         let (batch_number, output, commitment) =
             wait_input_containing_block(&prover_api_url, 8, block_number).await?;
 
-        assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
+        assert_ne!(
+            commitment,
+            B256::ZERO,
+            "batch commitment must be non-trivial"
+        );
         let block_result = output
             .block_results
             .iter()
@@ -266,7 +266,11 @@ async fn zisk_pipeline_e2e_impl(case: TestCase) -> anyhow::Result<()> {
     let zisk_bytes = peek_zisk_data(&prover_api_url, 1).await?;
     let (output, commitment) = executor::execute_and_commit_from_bincode(&zisk_bytes)
         .map_err(|e| anyhow::anyhow!("ZiSK executor failed for batch 1: {e}"))?;
-    assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
+    assert_ne!(
+        commitment,
+        B256::ZERO,
+        "batch commitment must be non-trivial"
+    );
     assert!(
         !output.block_results.is_empty(),
         "batch 1 produced no block results"
@@ -288,7 +292,7 @@ async fn zisk_input_regenerated_after_restart() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_input_regenerated_after_restart_v31_to_gateway() -> anyhow::Result<()> {
-    zisk_input_regenerated_after_restart_impl(V31_TO_GATEWAY).await
+    zisk_input_regenerated_after_restart_impl(NEXT_TO_L1).await
 }
 
 async fn zisk_input_regenerated_after_restart_impl(case: TestCase) -> anyhow::Result<()> {
@@ -350,11 +354,15 @@ async fn zisk_input_regenerated_after_restart_impl(case: TestCase) -> anyhow::Re
     // are recreated with their original numbers.
     for batch_number in 1..=committed_state.last_committed_batch {
         let zisk_bytes = peek_zisk_data(&prover_api_url, batch_number).await?;
-        let (output, commitment) = executor::execute_and_commit_from_bincode(&zisk_bytes)
-            .map_err(|e| {
+        let (output, commitment) =
+            executor::execute_and_commit_from_bincode(&zisk_bytes).map_err(|e| {
                 anyhow::anyhow!("regenerated input for batch {batch_number} failed: {e}")
             })?;
-        assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
+        assert_ne!(
+            commitment,
+            B256::ZERO,
+            "batch commitment must be non-trivial"
+        );
         assert!(
             !output.block_results.is_empty(),
             "batch {batch_number} produced no block results"
@@ -384,7 +392,7 @@ async fn zisk_multiblock_batch_hashes() -> anyhow::Result<()> {
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn zisk_multiblock_batch_hashes_v31_to_gateway() -> anyhow::Result<()> {
-    zisk_multiblock_batch_hashes_impl(V31_TO_GATEWAY).await
+    zisk_multiblock_batch_hashes_impl(NEXT_TO_L1).await
 }
 
 async fn zisk_multiblock_batch_hashes_impl(case: TestCase) -> anyhow::Result<()> {
@@ -467,7 +475,11 @@ async fn zisk_multiblock_batch_hashes_impl(case: TestCase) -> anyhow::Result<()>
                 .map_err(|e| {
                     anyhow::anyhow!("ZiSK re-execution failed for batch {next_batch}: {e}")
                 })?;
-            assert_ne!(commitment, B256::ZERO, "batch commitment must be non-trivial");
+            assert_ne!(
+                commitment,
+                B256::ZERO,
+                "batch commitment must be non-trivial"
+            );
             if output.block_results.len() >= 2 {
                 multi_block_batches += 1;
             }

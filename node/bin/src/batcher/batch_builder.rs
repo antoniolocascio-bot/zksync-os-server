@@ -1,5 +1,5 @@
-use alloy::primitives::Address;
 use alloy::consensus::BlobTransactionSidecar;
+use alloy::primitives::Address;
 use zksync_os_batch_types::PendingBatchInfo;
 use zksync_os_batch_types::batcher_model::{
     BatchEnvelope, BatchForSigning, BatchMetadata, ProverInput,
@@ -30,7 +30,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     prev_batch_info: StoredBatchInfo,
     batch_number: u64,
     chain_id: u64,
-    chain_address_sl: Address,
+    chain_address: Address,
     pubdata_mode: PubdataMode,
     sl_chain_id: u64,
     read_state: &ReadState,
@@ -94,9 +94,9 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         let mut seen = std::collections::HashSet::new();
         let mut preimages = Vec::new();
         let add = |addr: Address,
-                       state_after: &mut _,
-                       seen: &mut std::collections::HashSet<Address>,
-                       preimages: &mut Vec<(Address, Vec<u8>)>| {
+                   state_after: &mut _,
+                   seen: &mut std::collections::HashSet<Address>,
+                   preimages: &mut Vec<(Address, Vec<u8>)>| {
             if !seen.insert(addr) {
                 return;
             }
@@ -149,7 +149,9 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
             }
             if let Some(blob) = state_after.get_preimage(blake2s) {
                 match crate::prover_input_generator::zisk_input_builder::recover_code_matching(
-                    observable, &blob, props.unpadded_code_len as usize,
+                    observable,
+                    &blob,
+                    props.unpadded_code_len as usize,
                 ) {
                     Some(code) => out.push((observable, code)),
                     None => tracing::warn!(
@@ -202,9 +204,6 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     // Detect any `SetSLChainId` system transaction across all blocks in the batch.
     // Excludes the sentinel value `u64::MAX` which is used during protocol upgrades and is
     // unrelated to gateway migrations.
-    // Detect any `SetSLChainId` system transaction across all blocks in the batch.
-    // Excludes the sentinel value `u64::MAX` which is used during protocol upgrades and is
-    // unrelated to gateway migrations.
     let set_sl_chain_id_migration_number = blocks.iter().find_map(|(_, replay_record, _, _)| {
         replay_record.transactions.iter().find_map(|tx| {
             if let ZkEnvelope::System(system_tx) = tx.envelope()
@@ -222,7 +221,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         BatchMetadata {
             previous_stored_batch_info: prev_batch_info,
             batch_info,
-            chain_address: chain_address_sl,
+            chain_address,
             blob_sidecar,
             first_block_number: block_number_from,
             last_block_number: block_number_to,
@@ -288,8 +287,11 @@ fn compute_batch_prover_input(
         .collect();
 
     let witness = match proving_version {
-        ProvingVersion::V1 | ProvingVersion::V2 | ProvingVersion::V3
-        | ProvingVersion::V4 | ProvingVersion::V5 => {
+        ProvingVersion::V1
+        | ProvingVersion::V2
+        | ProvingVersion::V3
+        | ProvingVersion::V4
+        | ProvingVersion::V5 => {
             panic!("sealing batch with prover version v1-v5 is not supported");
         }
         ProvingVersion::V6 => {
@@ -348,13 +350,14 @@ fn assemble_zisk_batch(
     account_preimages_after: Vec<(Address, Vec<u8>)>,
     referenced_bytecodes: Vec<(alloy::primitives::B256, Vec<u8>)>,
 ) -> anyhow::Result<Vec<u8>> {
-    use blake2::{Blake2s256, Digest};
     use crate::prover_input_generator::zisk_input_builder::ZiskBlockData;
+    use blake2::{Blake2s256, Digest};
     use zksync_os_zisk_lib::types::*;
 
     let mut block_data_vec = Vec::with_capacity(blocks.len());
     for (_, _, _, pi) in blocks {
-        let bytes = pi.zisk_data()
+        let bytes = pi
+            .zisk_data()
             .ok_or_else(|| anyhow::anyhow!("ZiSK data missing from ProverInput"))?;
         let data: ZiskBlockData = bincode1::deserialize(bytes)
             .map_err(|e| anyhow::anyhow!("failed to deserialize ZiSK BlockData: {e}"))?;
@@ -402,9 +405,7 @@ fn assemble_zisk_batch(
     // state commitment that uses last_block_context.block_hashes.0[1..].
     let last_replay = &blocks.last().unwrap().1;
     let last_ctx = &last_replay.block_context;
-    let previous_block_hashes: Vec<alloy::primitives::B256> = last_ctx
-        .block_hashes
-        .0[1..]
+    let previous_block_hashes: Vec<alloy::primitives::B256> = last_ctx.block_hashes.0[1..]
         .iter()
         .map(|h| alloy::primitives::B256::from(h.to_be_bytes::<32>()))
         .collect();
@@ -413,13 +414,14 @@ fn assemble_zisk_batch(
         .upgrade_tx_hash
         .unwrap_or(alloy::primitives::B256::ZERO);
 
-    let spec_id = match crate::prover_input_generator::zisk_input_builder::spec_id_from_execution_version(
-        first_ctx.execution_version,
-    )? {
-        zksync_os_revm::ZkSpecId::AtlasV1 => 0u8,
-        zksync_os_revm::ZkSpecId::AtlasV2 => 1u8,
-        zksync_os_revm::ZkSpecId::AtlasV3 => 2u8,
-    };
+    let spec_id =
+        match crate::prover_input_generator::zisk_input_builder::spec_id_from_execution_version(
+            first_ctx.execution_version,
+        )? {
+            zksync_os_revm::ZkSpecId::AtlasV1 => 0u8,
+            zksync_os_revm::ZkSpecId::AtlasV2 => 1u8,
+            zksync_os_revm::ZkSpecId::AtlasV3 => 2u8,
+        };
 
     let batch_input = BatchInput {
         version: zksync_os_zisk_lib::types::BATCH_INPUT_VERSION,
@@ -441,9 +443,13 @@ fn assemble_zisk_batch(
             blob_versioned_hashes: blob_sidecar
                 .as_ref()
                 .map(|sidecar| {
-                    sidecar.commitments.iter().map(|commitment| {
-                        alloy::eips::eip4844::kzg_to_versioned_hash(commitment.as_slice())
-                    }).collect()
+                    sidecar
+                        .commitments
+                        .iter()
+                        .map(|commitment| {
+                            alloy::eips::eip4844::kzg_to_versioned_hash(commitment.as_slice())
+                        })
+                        .collect()
                 })
                 .unwrap_or_default(),
             tree_update: build_batch_tree_update(blocks, batch_tree_start)?,
@@ -478,7 +484,8 @@ fn assemble_zisk_batch(
         },
     };
 
-    let serialized = bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput");
+    let serialized =
+        bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput");
 
     // If ZISK_DUMP_DIR is set, write the BatchInput to disk for external proving.
     if let Ok(dump_dir) = std::env::var("ZISK_DUMP_DIR") {
@@ -626,7 +633,9 @@ fn shadow_execute_zisk_batch(
             // Component-level diagnostics: re-run the debug variant to see
             // which PI word drifted (state commitments, chain config, batch
             // output hash).
-            if let Ok(input) = bincode1::deserialize::<zksync_os_zisk_lib::types::BatchInput>(zisk_data) {
+            if let Ok(input) =
+                bincode1::deserialize::<zksync_os_zisk_lib::types::BatchInput>(zisk_data)
+            {
                 let (_, _, g_before, g_after, g_batch) =
                     zksync_os_zisk_lib::executor::execute_and_commit_debug(&input);
                 let chain_config_hash = zksync_os_zisk_lib::commitment::chain_config_hash(
@@ -678,7 +687,10 @@ fn shadow_execute_zisk_batch(
                     }
                 }
                 for d in &block_output.account_diffs {
-                    let props_key = crate::prover_input_generator::zisk_input_builder::account_flat_key(d.address);
+                    let props_key =
+                        crate::prover_input_generator::zisk_input_builder::account_flat_key(
+                            d.address,
+                        );
                     if props_key == flat_key {
                         tracing::error!(
                             batch_number, %flat_key, account = %d.address,

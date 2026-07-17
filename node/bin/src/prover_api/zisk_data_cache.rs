@@ -69,10 +69,13 @@ impl ZiskDataCache {
     /// not on every insert.
     pub async fn insert(&self, batch_number: u64, data: Vec<u8>) {
         let mut cache = self.inner.lock().await;
-        cache.insert(batch_number, CacheEntry {
-            data,
-            inserted_at: Instant::now(),
-        });
+        cache.insert(
+            batch_number,
+            CacheEntry {
+                data,
+                inserted_at: Instant::now(),
+            },
+        );
         // Only evict when over capacity — avoids O(n) scan on every insert.
         if cache.len() > self.max_entries {
             Self::evict(&mut cache, self.max_entries, self.max_age);
@@ -83,7 +86,8 @@ impl ZiskDataCache {
     /// Check whether ZiSK data exists for a batch (non-destructive).
     pub async fn contains(&self, batch_number: u64) -> bool {
         let cache = self.inner.lock().await;
-        cache.get(&batch_number)
+        cache
+            .get(&batch_number)
             .is_some_and(|e| e.inserted_at.elapsed() < self.max_age)
     }
 
@@ -115,7 +119,8 @@ impl ZiskDataCache {
     /// Evict expired entries and overflow (oldest first).
     fn evict(cache: &mut HashMap<u64, CacheEntry>, max_entries: usize, max_age: Duration) {
         // Remove expired entries
-        let expired: Vec<u64> = cache.iter()
+        let expired: Vec<u64> = cache
+            .iter()
             .filter(|(_, e)| e.inserted_at.elapsed() >= max_age)
             .map(|(&k, _)| k)
             .collect();
@@ -127,10 +132,12 @@ impl ZiskDataCache {
 
         // Remove oldest entries if over capacity
         while cache.len() > max_entries {
-            if let Some((&oldest_key, _)) = cache.iter()
-                .min_by_key(|(_, e)| e.inserted_at)
-            {
-                tracing::warn!(batch_number = oldest_key, "evicting ZiSK data (cache full, max_entries={})", max_entries);
+            if let Some((&oldest_key, _)) = cache.iter().min_by_key(|(_, e)| e.inserted_at) {
+                tracing::warn!(
+                    batch_number = oldest_key,
+                    "evicting ZiSK data (cache full, max_entries={})",
+                    max_entries
+                );
                 cache.remove(&oldest_key);
                 ZISK_DATA_CACHE_METRICS.evictions[&ZiskCacheEvictionReason::Overflow].inc();
             } else {
@@ -146,9 +153,11 @@ impl ZiskDataCache {
         ZISK_DATA_CACHE_METRICS
             .oldest_batch_number
             .set(oldest.map(|(&k, _)| k).unwrap_or(0));
-        ZISK_DATA_CACHE_METRICS
-            .oldest_entry_age_seconds
-            .set(oldest.map(|(_, e)| e.inserted_at.elapsed().as_secs()).unwrap_or(0));
+        ZISK_DATA_CACHE_METRICS.oldest_entry_age_seconds.set(
+            oldest
+                .map(|(_, e)| e.inserted_at.elapsed().as_secs())
+                .unwrap_or(0),
+        );
     }
 
     /// Refresh the gauges without mutating the cache. Ages only advance on
@@ -181,6 +190,10 @@ mod tests {
         let expiring = ZiskDataCache::with_limits(2, Duration::ZERO);
         expiring.insert(4, vec![4]).await;
         assert!(!expiring.contains(4).await);
-        assert_eq!(expiring.remove(4).await, None, "expired data must not be served");
+        assert_eq!(
+            expiring.remove(4).await,
+            None,
+            "expired data must not be served"
+        );
     }
 }

@@ -120,7 +120,10 @@ impl FriJobManager {
     }
 
     /// Set the ZiSK data cache (call before adding jobs when second_proof_system is enabled).
-    pub fn set_zisk_data_cache(&mut self, cache: Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>) {
+    pub fn set_zisk_data_cache(
+        &mut self,
+        cache: Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>,
+    ) {
         self.zisk_data_cache = Some(cache);
     }
 
@@ -139,9 +142,15 @@ impl FriJobManager {
     /// the batch at seal, in parallel with the Airbender FRI/SNARK lane; the
     /// Airbender SNARK submission is only the multi-proof rendezvous point.
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<ProverInput>) {
-        if let (Some(cache), Some(zisk_bytes)) = (&self.zisk_data_cache, batch_envelope.data.zisk_data()) {
+        if let (Some(cache), Some(zisk_bytes)) =
+            (&self.zisk_data_cache, batch_envelope.data.zisk_data())
+        {
             let batch_number = batch_envelope.batch_number();
-            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "caching ZiSK data for multi-proof");
+            tracing::info!(
+                batch_number,
+                zisk_bytes = zisk_bytes.len(),
+                "caching ZiSK data for multi-proof"
+            );
             cache.insert(batch_number, zisk_bytes.to_vec()).await;
             if let Some(zjm) = &self.zisk_job_manager {
                 // A full ZiSK queue is plain backpressure here: the data stays

@@ -55,7 +55,6 @@ where
             .borrow_mut()
             .insert(observable_code_hash, code);
     }
-
 }
 
 #[derive(Debug, thiserror::Error)]

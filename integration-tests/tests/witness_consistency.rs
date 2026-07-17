@@ -19,9 +19,9 @@ use std::time::Duration;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolCall;
 use alloy::providers::ext::AnvilApi;
 use alloy::rpc::types::TransactionRequest;
+use alloy::sol_types::SolCall;
 use base64::Engine;
 use zksync_os_integration_tests::CURRENT_TO_L1;
 use zksync_os_integration_tests::contracts::{BytecodesSupplierV31, SystemContextV31};
@@ -52,14 +52,8 @@ async fn capture_batch(
 ) -> anyhow::Result<Option<CapturedBatch>> {
     let started = std::time::Instant::now();
     loop {
-        let fri = peek_json(format!(
-            "{prover_api_url}/prover-jobs/v1/FRI/{batch}/peek"
-        ))
-        .await?;
-        let zisk = peek_json(format!(
-            "{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek"
-        ))
-        .await?;
+        let fri = peek_json(format!("{prover_api_url}/prover-jobs/v1/FRI/{batch}/peek")).await?;
+        let zisk = peek_json(format!("{prover_api_url}/prover-jobs/v1/ZiSK/{batch}/peek")).await?;
         if let (Some(fri), Some(zisk)) = (fri, zisk) {
             let b64 = base64::engine::general_purpose::STANDARD;
             let witness_bytes = b64.decode(
@@ -258,7 +252,7 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
         .wait_finalized_with_timeout(tip, Duration::from_secs(180))
         .await?;
     // The chain must now run the v31 verifier.
-    let active_verifier = upgrade_tester.diamond_proxy_sl.getVerifier().call().await?;
+    let active_verifier = upgrade_tester.diamond_proxy.getVerifier().call().await?;
     anyhow::ensure!(
         active_verifier == v31_verifier,
         "upgrade did not switch the verifier: {active_verifier} != {v31_verifier}"
@@ -305,6 +299,11 @@ async fn witness_consistency_across_v30_to_v31_upgrade() -> anyhow::Result<()> {
 
     anyhow::ensure!(v6 >= 1, "expected at least one pre-upgrade (V6) batch");
     anyhow::ensure!(v7 >= 1, "expected at least one post-upgrade (V7) batch");
-    tracing::info!(total = captured.len(), v6, v7, "witness consistency verified");
+    tracing::info!(
+        total = captured.len(),
+        v6,
+        v7,
+        "witness consistency verified"
+    );
     Ok(())
 }

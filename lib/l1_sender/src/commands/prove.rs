@@ -68,7 +68,7 @@ impl SendToL1 for ProofCommand {
     const MINED_STAGE: BatchExecutionStage = BatchExecutionStage::ProveL1TxMined;
     const PASSTHROUGH_STAGE: BatchExecutionStage = BatchExecutionStage::ProveL1Passthrough;
 
-    fn solidity_call(&self, _gateway: bool, _operator: &Address) -> Bytes {
+    fn solidity_call(&self, _operator: &Address) -> Bytes {
         proveBatchesSharedBridgeCall::new((
             self.batches.first().unwrap().batch.chain_address,
             U256::from(self.batches.first().unwrap().batch_number()),
@@ -183,7 +183,9 @@ impl ProofCommand {
             // MultiProofVerifier resolves sub-verifiers by version on-chain.
             Some(v) if matches!(self.proof, SnarkProof::MultiProof(_)) => v,
             Some(7) => 0,
-            Some(version) => return Err(ProofEncodingError::UnsupportedExecutionVersion { version }),
+            Some(version) => {
+                return Err(ProofEncodingError::UnsupportedExecutionVersion { version });
+            }
         };
 
         let public_input = Self::snark_public_input(previous_batch_info, &stored_batch_infos);
@@ -241,12 +243,9 @@ impl ProofCommand {
                 // same batch. ZiSK v0.18 public values are
                 // programVK(32) || guest publics(192) || vadcop VK(32), with the
                 // full batch commitment as the first guest-publics word.
-                let zisk_commitment =
-                    B256::from_slice(&multi_proof.zisk_public_values[32..64]);
-                let era_commitment = Self::get_batch_public_input(
-                    previous_batch_info,
-                    &stored_batch_infos[0],
-                );
+                let zisk_commitment = B256::from_slice(&multi_proof.zisk_public_values[32..64]);
+                let era_commitment =
+                    Self::get_batch_public_input(previous_batch_info, &stored_batch_infos[0]);
                 if zisk_commitment != era_commitment {
                     tracing::error!(
                         zisk = %zisk_commitment,
@@ -279,8 +278,8 @@ impl ProofCommand {
 
                 let mut proof_vec = vec![
                     U256::from(MULTI_PROOF_TYPE | (verifier_version << 8)),
-                    U256::from(0),                    // previous hash
-                    U256::from(era_chunks.len()),      // N
+                    U256::from(0),                // previous hash
+                    U256::from(era_chunks.len()), // N
                 ];
                 proof_vec.extend(era_chunks);
                 proof_vec.extend(zisk_proof_chunks);

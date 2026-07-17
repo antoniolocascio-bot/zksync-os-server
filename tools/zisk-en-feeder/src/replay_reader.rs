@@ -15,11 +15,18 @@ const CF_TXS: &str = "Txs";
 const CF_LATEST: &str = "Latest";
 
 const CF_NAMES: &[&str] = &[
-    CF_CONTEXT, CF_TXS, CF_LATEST,
-    "ProtocolVersion", "BlockOutputHash", "ForcePreimages",
-    "StartingL1SerialId", "StartingInteropEventIndex",
-    "StartingMigrationNumber", "StartingInteropFeeNumber",
-    "CanonicalHash", "NodeVersion",
+    CF_CONTEXT,
+    CF_TXS,
+    CF_LATEST,
+    "ProtocolVersion",
+    "BlockOutputHash",
+    "ForcePreimages",
+    "StartingL1SerialId",
+    "StartingInteropEventIndex",
+    "StartingMigrationNumber",
+    "StartingInteropFeeNumber",
+    "CanonicalHash",
+    "NodeVersion",
 ];
 
 // Consumed field-by-field by the feeder's input builder; the binary itself
@@ -41,12 +48,7 @@ impl SecondaryReplayReader {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(false);
         std::fs::create_dir_all(secondary_path)?;
-        let db = rocksdb::DB::open_cf_as_secondary(
-            &opts,
-            primary_path,
-            secondary_path,
-            CF_NAMES,
-        )?;
+        let db = rocksdb::DB::open_cf_as_secondary(&opts, primary_path, secondary_path, CF_NAMES)?;
         Ok(Self { db })
     }
 
@@ -67,17 +69,24 @@ impl SecondaryReplayReader {
     pub fn read_record(&self, block_number: u64) -> anyhow::Result<ReplayData> {
         let key = block_number.to_be_bytes();
         let ctx_cf = self.db.cf_handle(CF_CONTEXT).expect("missing Context CF");
-        let ctx_bytes = self.db.get_cf(&ctx_cf, key)?
+        let ctx_bytes = self
+            .db
+            .get_cf(&ctx_cf, key)?
             .ok_or_else(|| anyhow::anyhow!("no context for block {block_number}"))?;
         let (block_context, _): (BlockContext, _) =
             bincode::serde::decode_from_slice(&ctx_bytes, bincode::config::standard())?;
 
         let txs_cf = self.db.cf_handle(CF_TXS).expect("missing Txs CF");
-        let txs_bytes = self.db.get_cf(&txs_cf, key)?
+        let txs_bytes = self
+            .db
+            .get_cf(&txs_cf, key)?
             .ok_or_else(|| anyhow::anyhow!("no txs for block {block_number}"))?;
         let (transactions, _): (Vec<ZkTransaction>, _) =
             bincode::decode_from_slice(&txs_bytes, bincode::config::standard())?;
 
-        Ok(ReplayData { block_context, transactions })
+        Ok(ReplayData {
+            block_context,
+            transactions,
+        })
     }
 }

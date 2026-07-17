@@ -3,6 +3,7 @@ pub(crate) mod zisk_input_builder;
 use self::tree_adapter::TreeOutputAdapter;
 use self::tree_adapter::VersionedMerkleTree;
 use crate::prover_block::ProverBlock;
+use alloy::primitives::B256;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -16,7 +17,6 @@ use zksync_os_batch_types::BlockMerkleTreeData;
 use zksync_os_batch_types::batcher_model::ProverInput;
 use zksync_os_contract_interface::models::DACommitmentScheme;
 use zksync_os_interface::traits::TxListSource;
-use alloy::primitives::B256;
 use zksync_os_merkle_tree::{MerkleTree, MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_observability::{ComponentStateReporter, GenericComponentState};
 use zksync_os_pipeline::{PeekableReceiver, PipelineComponent, SendAndRecordExt};
@@ -349,7 +349,10 @@ fn compute_prover_input(
 
     // Optionally generate ZiSK prover input alongside airbender witness
     let zisk_data = if enable_second_proof {
-        tracing::debug!(block_number, "Generating ZiSK prover input alongside airbender witness");
+        tracing::debug!(
+            block_number,
+            "Generating ZiSK prover input alongside airbender witness"
+        );
         match zisk_input_builder::build_block_data(
             block_output,
             replay_record,
@@ -357,9 +360,9 @@ fn compute_prover_input(
             native_touched_keys,
             &state_handle,
         ) {
-            Ok(block_data) => Some(
-                bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"),
-            ),
+            Ok(block_data) => {
+                Some(bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"))
+            }
             Err(e) => {
                 tracing::error!(block_number, "ZiSK input generation failed: {e:#}");
                 None
@@ -369,10 +372,7 @@ fn compute_prover_input(
         None
     };
 
-    let prover_input = ProverInput::Real {
-        witness,
-        zisk_data,
-    };
+    let prover_input = ProverInput::Real { witness, zisk_data };
     let latency = prover_input_generation_latency.observe();
     let zisk_size = prover_input.zisk_data().map(|d| d.len()).unwrap_or(0);
     tracing::info!(
