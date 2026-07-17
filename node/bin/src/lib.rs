@@ -1189,19 +1189,85 @@ async fn run_main_node_pipeline(
         .await
         .expect("Failed to initialize ProofStorage");
 
+    // Create shared ZiSK data cache when second_proof_system is enabled.
+    // Passed to both FriProvingPipelineStep (stores data) and SnarkJobManager (reads data).
+    let zisk_data_cache = if config.prover_input_generator_config.second_proof_system {
+        tracing::info!("ZiSK proof generation enabled");
+        Some(Arc::new(
+            crate::prover_api::zisk_data_cache::ZiskDataCache::new(),
+        ))
+    } else {
+        None
+    };
+
+    // Until a multi-batch ZiSK guest exists, one SNARK covers exactly one
+    // batch: a wider range could not be paired with a ZiSK proof and would
+    // either stall (require_multi_proof) or silently degrade to
+    // Airbender-only. Enforce the constraint at startup instead.
+    if zisk_data_cache.is_some() {
+        assert_eq!(
+            config.prover_api_config.max_fris_per_snark, 1,
+            "second_proof_system requires prover_api.max_fris_per_snark = 1: multi-batch \
+             SNARK ranges cannot be covered by the single-batch ZiSK guest",
+        );
+    }
+
+    // The ZiSK job manager is shared by both pipeline steps: the FRI step
+    // creates ZiSK jobs at batch seal (proving starts immediately, parallel
+    // to the Airbender FRI/SNARK lane), and the SNARK step is the rendezvous
+    // that composes the MultiProof from whichever proof arrives last.
+    let zisk_job_manager = zisk_data_cache.as_ref().map(|_| {
+        Arc::new(crate::prover_api::zisk_job_manager::ZiskJobManager::new(
+            config.prover_api_config.snark_job_timeout,
+            config.prover_api_config.zisk_program_vk,
+            chain_id,
+            crate::batcher::batch_builder::ZiskChainConfig {
+                fri_proof_verification_enabled: config
+                    .genesis_config
+                    .fri_proof_verification_enabled,
+                max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+            },
+        ))
+    });
+
     let (fri_proving_step, fri_job_manager) = FriProvingPipelineStep::new(
         proof_storage.clone(),
         node_state_on_startup.l1_state.last_proved_batch,
         config.prover_api_config.fri_job_timeout,
         config.prover_api_config.max_assigned_batch_range,
+        zisk_data_cache.clone(),
+        zisk_job_manager.clone(),
     );
 
-    let (snark_proving_step, snark_job_manager) = SnarkProvingPipelineStep::new(
+    let (snark_proving_step, snark_job_manager) = SnarkProvingPipelineStep::new_with_zisk(
         config.prover_api_config.max_fris_per_snark,
         node_state_on_startup.l1_state.last_proved_batch,
         config.prover_api_config.snark_job_timeout,
         config.prover_api_config.max_assigned_batch_range,
+        zisk_data_cache,
+        zisk_job_manager.clone(),
+        config.prover_input_generator_config.multi_proof_verifier,
+        config.prover_api_config.multi_proof_wait_timeout,
     );
+
+    // Halt-on-mismatch (config, not deploy): a ZiSK commitment mismatch is a
+    // security event — one proof system is wrong. When armed, the mismatch
+    // fires this critical task, which panics to bring the node down (the
+    // same mechanism as the consistency checker's revert-on-divergence).
+    if config
+        .prover_input_generator_config
+        .halt_on_zisk_commitment_mismatch
+        && let Some(ref zjm) = zisk_job_manager
+    {
+        let (halt_tx, halt_rx) = tokio::sync::oneshot::channel::<String>();
+        zjm.set_halt_on_mismatch(halt_tx);
+        runtime.spawn_critical_task("zisk mismatch halt", async move {
+            if let Ok(msg) = halt_rx.await {
+                panic!("halting block production: {msg}");
+            }
+            // Sender dropped without firing (normal shutdown) — exit quietly.
+        });
+    }
 
     let prover_api_port = if config.prover_api_config.enabled {
         let prover_listener = prebound_prover_api_listener
@@ -1214,6 +1280,7 @@ async fn run_main_node_pipeline(
             prover_server::run(
                 fri_job_manager.clone(),
                 snark_job_manager.clone(),
+                zisk_job_manager.clone(),
                 proof_storage.clone(),
                 prover_listener,
                 shutdown,
