@@ -2,6 +2,8 @@
 //!
 //! This module provides an HTTP server that manages proof generation jobs
 //! and proof storage.
+#[cfg(test)]
+mod fleet_tests;
 mod v1;
 
 use std::sync::Arc;
@@ -20,6 +22,7 @@ use tokio::net::TcpListener;
 pub(in crate::prover_api::prover_server) struct AppState {
     fri_job_manager: Arc<FriJobManager>,
     snark_job_manager: Arc<SnarkJobManager>,
+    zisk_job_manager: Option<Arc<crate::prover_api::zisk_job_manager::ZiskJobManager>>,
     proof_storage: ProofStorage,
 }
 
@@ -27,6 +30,7 @@ pub(in crate::prover_api::prover_server) struct AppState {
 pub async fn run(
     fri_job_manager: Arc<FriJobManager>,
     snark_job_manager: Arc<SnarkJobManager>,
+    zisk_job_manager: Option<Arc<crate::prover_api::zisk_job_manager::ZiskJobManager>>,
     proof_storage: ProofStorage,
     listener: TcpListener,
     shutdown: GracefulShutdown,
@@ -34,6 +38,7 @@ pub async fn run(
     let app_state = AppState {
         fri_job_manager,
         snark_job_manager,
+        zisk_job_manager,
         proof_storage,
     };
 

@@ -32,17 +32,26 @@ impl FriProvingPipelineStep {
         last_proved_batch_number: u64,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
+        zisk_data_cache: Option<Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>>,
+        zisk_job_manager: Option<Arc<crate::prover_api::zisk_job_manager::ZiskJobManager>>,
     ) -> (Self, Arc<FriJobManager>) {
         // Create channel for completed proofs - between FriProveManager and GaplessCommitter
         let (batches_with_proof_sender, batches_with_proof_receiver) =
             mpsc::channel::<SignedBatchEnvelope<FriProof>>(5);
 
-        let fri_job_manager = Arc::new(FriJobManager::new(
+        let mut fjm = FriJobManager::new(
             batches_with_proof_sender,
             proof_storage,
             assignment_timeout,
             max_assigned_batch_range,
-        ));
+        );
+        if let Some(cache) = zisk_data_cache {
+            fjm.set_zisk_data_cache(cache);
+        }
+        if let Some(zjm) = zisk_job_manager {
+            fjm.set_zisk_job_manager(zjm);
+        }
+        let fri_job_manager = Arc::new(fjm);
 
         let result = Self {
             last_proved_batch_number,
