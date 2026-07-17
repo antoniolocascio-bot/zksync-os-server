@@ -67,6 +67,54 @@ impl<'a> UpgradeTester<'a> {
         Ok(upgrade_tester)
     }
 
+    /// Executes the default upgrade with PRODUCTION ordering: the chain's
+    /// diamond cut is applied BEFORE the upgrade timestamp activates, so the
+    /// L1 Committer already accepts the new commit-batch encoding when the
+    /// first post-upgrade batch is committed. `execute_default_upgrade`'s
+    /// ordering (timestamp first, cut only after pre-upgrade finality) races
+    /// the first v31 commit against the cut — invisible with fake provers,
+    /// guaranteed fatal under real proving latency
+    /// (`UnsupportedCommitBatchEncoding`, and the L1 sender treats a commit
+    /// revert as fatal).
+    ///
+    /// The caller must ensure every pre-upgrade batch is FINALIZED before
+    /// calling (the cut retires the old commit encoding), and is responsible
+    /// for awaiting the upgrade's L2 effects afterwards. Returns the L2 hash
+    /// of the upgrade transaction.
+    pub async fn execute_default_upgrade_cut_first(
+        &self,
+        protocol_upgrade: &interfaces::ProposedUpgrade,
+        deadline: U256,
+        upgrade_timestamp: U256,
+        facet_cuts: Vec<FacetCut>,
+    ) -> anyhow::Result<B256> {
+        let upgrade_contract =
+            DefaultUpgrade::deploy(self.tester.l1_provider(), protocol_upgrade).await?;
+        tracing::info!("DefaultUpgrade contract deployed");
+
+        self.pause_bridgehub_migrations().await?;
+        tracing::info!("Bridgehub migrations are paused");
+
+        let upgrade_data = upgrade_contract.diamond_cut_data(facet_cuts);
+        self.set_new_version_on_ctm(
+            upgrade_data.clone(),
+            deadline,
+            protocol_upgrade.newProtocolVersion,
+        )
+        .await?;
+        tracing::info!("Upgrade is set on CTM");
+
+        // The cut first: from here the chain accepts the new encoding.
+        self.upgrade_chain(upgrade_data).await?;
+        tracing::info!("Chain diamond cut executed on SL");
+
+        // Only now activate the upgrade for the L2 side.
+        self.set_upgrade_timestamp(upgrade_timestamp).await?;
+        tracing::info!("Upgrade scheduled; L2 activates at the timestamp");
+
+        Ok(upgrade_contract.upgrade_tx_l2_hash())
+    }
+
     /// Executes a "default" flow for `DefaultUpgrade`.
     pub async fn execute_default_upgrade(
         &self,
@@ -120,7 +168,7 @@ impl<'a> UpgradeTester<'a> {
                 .l2_zk_provider
                 .wait_finalized_with_timeout(
                     current_l2_block,
-                    crate::assert_traits::DEFAULT_TIMEOUT,
+                    crate::assert_traits::finality_timeout(),
                 )
                 .await?;
             tracing::info!("Current L2 block is finalized, proceeding with patch upgrade");
@@ -152,7 +200,7 @@ impl<'a> UpgradeTester<'a> {
                 .l2_zk_provider
                 .wait_finalized_with_timeout(
                     tx.block_number.unwrap(),
-                    crate::assert_traits::DEFAULT_TIMEOUT,
+                    crate::assert_traits::finality_timeout(),
                 )
                 .await?;
         } else {
@@ -273,7 +321,7 @@ impl<'a> UpgradeTester<'a> {
         // The genesis transaction has to be in the first block, so we wait for block 1 to be finalized.
         self.tester
             .l2_zk_provider
-            .wait_finalized_with_timeout(1, crate::assert_traits::DEFAULT_TIMEOUT)
+            .wait_finalized_with_timeout(1, crate::assert_traits::finality_timeout())
             .await?;
         Ok(())
     }
@@ -293,7 +341,7 @@ impl<'a> UpgradeTester<'a> {
             .l2_zk_provider
             .wait_finalized_with_timeout(
                 block_before_upgrade,
-                crate::assert_traits::DEFAULT_TIMEOUT,
+                crate::assert_traits::finality_timeout(),
             )
             .await
             .context("Block before upgrade transaction was not finalized")?;
@@ -312,7 +360,7 @@ impl<'a> UpgradeTester<'a> {
             .l2_zk_provider
             .wait_finalized_with_timeout(
                 upgrade_block_number,
-                crate::assert_traits::DEFAULT_TIMEOUT,
+                crate::assert_traits::finality_timeout(),
             )
             .await
             .context("Block before upgrade transaction was not finalized")?;
