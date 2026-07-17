@@ -26,11 +26,25 @@ pub fn make_full_pipeline_config(config: &mut Config) {
 }
 
 pub(crate) fn disable_prover_input_generation(config: &mut Config) {
+    // In equivalence mode input generation stays on everywhere so every
+    // sealed batch is shadow-executed (see `build_node_config`).
+    if equivalence_mode() {
+        return;
+    }
     if config.prover_api_config.fake_fri_provers.enabled
         && config.prover_api_config.fake_snark_provers.enabled
     {
         config.prover_input_generator_config.enable_input_generation = false;
+        config.prover_input_generator_config.second_proof_system = false;
     }
+}
+
+/// Opt-in deep equivalence mode for the whole suite: every sealed batch's
+/// ZiSK input is re-executed in-process with the guest executor and a batch
+/// public input divergence fails batch sealing. Slower (witness generation
+/// runs in every test), hence env-gated rather than default.
+pub(crate) fn equivalence_mode() -> bool {
+    std::env::var("ZKOS_TESTS_EQUIVALENCE").is_ok_and(|v| v == "1")
 }
 
 pub(crate) async fn build_node_config(
@@ -45,6 +59,23 @@ pub(crate) async fn build_node_config(
     config.rpc_config.send_raw_transaction_sync_timeout = Duration::from_secs(10);
     config.prover_api_config.fake_fri_provers.enabled = !with_proofs;
     config.prover_api_config.fake_snark_provers.enabled = !with_proofs;
+    // ZiSK second-proof lane: whenever prover input generation runs, batch
+    // inputs are assembled and served via /ZiSK/{batch}/peek (exercised by
+    // zisk_pipeline_test). The single-batch ZiSK guest requires one SNARK per
+    // batch; the server enforces this pairing at startup.
+    config.prover_input_generator_config.second_proof_system = true;
+    config.prover_api_config.max_fris_per_snark = 1;
+    // A native-vs-REVM divergence (state diffs, event logs, L2→L1 logs)
+    // fails the node — and therefore the test — instead of only logging.
+    config
+        .sequencer_config
+        .revm_consistency_checker_revert_on_divergence = true;
+    if equivalence_mode() {
+        config.prover_input_generator_config.zisk_shadow_execution = true;
+        config
+            .prover_input_generator_config
+            .halt_on_zisk_commitment_mismatch = true;
+    }
     config.batch_verification_config.server_enabled = false;
     config.batch_verification_config.client_enabled = false;
     config.batch_verification_config.threshold = 1;

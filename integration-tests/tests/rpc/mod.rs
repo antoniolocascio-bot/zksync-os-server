@@ -9,3 +9,4 @@ mod pubsub;
 mod simulate;
 mod storage_proof;
 mod transactions;
+mod zisk_pipeline_test;

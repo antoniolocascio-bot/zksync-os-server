@@ -13,6 +13,18 @@ use std::time::Duration;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// `DEFAULT_TIMEOUT`, overridable via `TEST_FINALITY_TIMEOUT_SECS`. For
+/// environments where L1 finality is legitimately slow — e.g. real GPU
+/// provers whose one-time precomputation warmup takes minutes (the upgrade
+/// flow's finality waits must survive an Airbender service swap).
+pub fn finality_timeout() -> Duration {
+    std::env::var("TEST_FINALITY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TIMEOUT)
+}
+
 #[allow(async_fn_in_trait)]
 pub trait EthCallAssert {
     async fn expect_to_fail(self, msg: &str);
