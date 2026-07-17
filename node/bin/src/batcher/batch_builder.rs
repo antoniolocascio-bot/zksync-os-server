@@ -177,7 +177,7 @@ fn compute_batch_prover_input(
                     .collect(),
             ))
         }
-        ProvingVersion::V7 => {
+        ProvingVersion::V7 | ProvingVersion::ZiskV1 => {
             // TODO: in the long-term we should generate proof input per batch
             ProverInput::Real(generate_batch_proof_input(
                 blocks

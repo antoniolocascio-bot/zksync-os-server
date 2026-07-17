@@ -16,6 +16,9 @@ zksync_os_rocksdb.workspace = true
 
 alloy = { workspace = true, default-features = false }
 anyhow.workspace = true
+zk_ee.workspace = true
+zk_os_basic_system.workspace = true
+zk_os_forward_system.workspace = true
 leb128.workspace = true
 once_cell.workspace = true
 rayon.workspace = true

@@ -9,6 +9,7 @@ pub use zksync_os_merkle_tree_api::{
     TreeBatchOutput, TreeEntry, TreeOperation,
 };
 
+pub use self::with_version::{MerkleTreeVersion, fixed_bytes_to_bytes32};
 pub use self::{
     errors::DeserializeError,
     storage::{Database, MerkleTreeColumnFamily, PatchSet, Patched, RocksDBWrapper},
@@ -26,6 +27,7 @@ mod storage;
 #[cfg(test)]
 mod tests;
 mod types;
+mod with_version;
 
 /// Unstable types that should not be used unless you know what you're doing (e.g., implementing
 /// `Database` trait for a custom type). There are no guarantees whatsoever that APIs / structure of

@@ -269,7 +269,7 @@ fn compute_prover_input(
             )
             .expect("proof gen failed")
         }
-        ProvingVersion::V7 => {
+        ProvingVersion::V7 | ProvingVersion::ZiskV1 => {
             use zk_ee::{
                 common_structs::ProofData, system::metadata::zk_metadata::BlockMetadataFromOracle,
             };
