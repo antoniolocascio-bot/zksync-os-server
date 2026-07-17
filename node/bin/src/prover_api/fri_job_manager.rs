@@ -246,6 +246,14 @@ impl FriJobManager {
                     program_proof,
                 )
             }
+            ProvingVersion::ZiskV1 => {
+                // ZiSK proofs go through `/ZiSK/submit`, where the batch
+                // public input is verified; the FRI channel has no way to
+                // check them and must not accept them.
+                Err(SubmitError::Other(
+                    "ZiSK proofs are submitted via /ZiSK/submit, not /FRI/submit".into(),
+                ))
+            }
         };
 
         if let Err(SubmitError::FriProofVerificationError {

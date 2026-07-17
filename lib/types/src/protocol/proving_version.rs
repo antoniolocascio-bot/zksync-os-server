@@ -17,6 +17,9 @@ pub enum ProvingVersion {
     V5 = 5,
     V6 = 6,
     V7 = 7,
+    /// ZiSK proof system (RV64IMA). Uses the same execution logic as V6/V7
+    /// but targets the ZiSK zkVM instead of the airbender RISC-V prover.
+    ZiskV1 = 8,
 }
 
 impl TryFrom<ProtocolSemanticVersion> for ProvingVersion {
@@ -69,6 +72,14 @@ impl ProvingVersion {
     const V7_VK_HASH: &'static str =
         "0x23156cf220288cd1e436dccfc09aa4883ea8288da61aa69e2c7251b0c0c44ccd";
 
+    /// keccak256(programVK || rootCVadcopFinal) in wire byte order (u64
+    /// limbs big-endian): the guest ELF 7cb3289f… (programVK 0x481748…4ead)
+    /// under the cargo-zisk v0.18.0 vadcop-final circuit. Regenerate with
+    /// era-contracts `tools -- --variant zisk` whenever either pin moves —
+    /// the on-chain ZiskVerifier must report the same value.
+    const ZISK_V1_VK_HASH: &'static str =
+        "0xbbdb8e5d70b7690513c7575d357c7d6c8e894c32d2665b2f7513c0d64a9a577b";
+
     /// Get the verification key hash associated with this execution version.
     pub fn vk_hash(&self) -> &'static str {
         match self {
@@ -79,6 +90,7 @@ impl ProvingVersion {
             Self::V5 => Self::V5_VK_HASH,
             Self::V6 => Self::V6_VK_HASH,
             Self::V7 => Self::V7_VK_HASH,
+            Self::ZiskV1 => Self::ZISK_V1_VK_HASH,
         }
     }
 
@@ -92,6 +104,7 @@ impl ProvingVersion {
             Self::V5_VK_HASH => Ok(Self::V5),
             Self::V6_VK_HASH => Ok(Self::V6),
             Self::V7_VK_HASH => Ok(Self::V7),
+            Self::ZISK_V1_VK_HASH => Ok(Self::ZiskV1),
             val => Err(ProvingVersionError::UnsupportedVkHash(val.to_string())),
         }
     }
