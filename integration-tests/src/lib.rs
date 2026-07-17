@@ -169,7 +169,7 @@ impl TestEnvironment {
     }
 
     async fn launch_impl(
-        mut self,
+        self,
         mut config: Config,
         auto_spawn_provers: bool,
     ) -> anyhow::Result<Tester> {
@@ -186,7 +186,7 @@ impl TestEnvironment {
         #[cfg(feature = "prover-tests")]
         let enable_prover =
             auto_spawn_provers && !config.prover_api_config.fake_fri_provers.enabled;
-        let mut tester = Tester::launch_node_inner(
+        let tester = Tester::launch_node_inner(
             self.l1,
             config,
             self.prepared_runtime.tempdir,
@@ -1116,6 +1116,7 @@ async fn spawn_prover_service(tester: &Tester, sequencer_urls: &[String], iterat
 /// - `ZISK_ELF` — path to the ZiSK guest ELF
 /// - `ZISK_PK` — path to ZiSK STARK proving key directory
 /// - `ZISK_SK` — path to ZiSK PLONK proving key directory
+///
 /// Aggregated-mode variant of [run_zisk_gpu_prover]: the daemon proves each
 /// batch to a vadcop_final STARK, submits the stream, aggregates ranges in
 /// the aggregator guest (`ZISK_AGG_ELF`), and submits one PLONK range proof

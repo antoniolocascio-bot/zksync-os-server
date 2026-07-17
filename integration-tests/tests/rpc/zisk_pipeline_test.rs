@@ -21,7 +21,6 @@ use zksync_os_integration_tests::assert_traits::ReceiptAssert;
 use zksync_os_integration_tests::l1_helpers::wait_for_l1_state;
 use zksync_os_integration_tests::test_config::make_commit_only_config;
 use zksync_os_integration_tests::{CURRENT_TO_L1, NEXT_TO_L1, TestCase};
-use zksync_os_server::default_protocol_version::PROTOCOL_VERSION_V31_0;
 use zksync_os_zisk_lib::executor;
 use zksync_os_zisk_lib::types::BatchOutput;
 

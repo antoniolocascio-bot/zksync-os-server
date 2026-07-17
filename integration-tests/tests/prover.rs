@@ -545,7 +545,7 @@ mod real_prover_upgrade {
             std::fs::write(format!("{dir}/batch-{batch}.bin"), &zisk_data)?;
             let mut framed = (zisk_data.len() as u64).to_le_bytes().to_vec();
             framed.extend_from_slice(&zisk_data);
-            while framed.len() % 8 != 0 {
+            while !framed.len().is_multiple_of(8) {
                 framed.push(0);
             }
             std::fs::write(format!("{dir}/batch-{batch}.input.bin"), &framed)?;
