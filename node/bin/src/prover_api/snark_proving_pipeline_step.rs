@@ -40,6 +40,7 @@ impl SnarkProvingPipelineStep {
             max_assigned_batch_range,
             None,
             None,
+            None,
             false,
             None,
         )
@@ -53,6 +54,9 @@ impl SnarkProvingPipelineStep {
         max_assigned_batch_range: usize,
         zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
         zisk_job_manager: Option<Arc<super::zisk_job_manager::ZiskJobManager>>,
+        zisk_aggregation_job_manager: Option<
+            Arc<super::zisk_aggregation_job_manager::ZiskAggregationJobManager>,
+        >,
         require_multi_proof: bool,
         multi_proof_wait_timeout: Option<Duration>,
     ) -> (Self, Arc<SnarkJobManager>) {
@@ -82,15 +86,23 @@ impl SnarkProvingPipelineStep {
                 });
             }
             sjm.set_zisk_job_manager(zjm);
+            let aggregated = zisk_aggregation_job_manager.is_some();
+            if let Some(ajm) = zisk_aggregation_job_manager {
+                sjm.set_zisk_aggregation_job_manager(ajm);
+            }
             if require_multi_proof {
                 sjm.set_require_multi_proof(true);
                 sjm.set_multi_proof_wait_timeout(multi_proof_wait_timeout);
                 tracing::info!(
                     wait_timeout = ?multi_proof_wait_timeout,
+                    aggregated,
                     "ZiSK job manager enabled (multi-proof REQUIRED)"
                 );
             } else {
-                tracing::info!("ZiSK job manager enabled (multi-proof optional)");
+                tracing::info!(
+                    aggregated,
+                    "ZiSK job manager enabled (multi-proof optional)"
+                );
             }
         }
 

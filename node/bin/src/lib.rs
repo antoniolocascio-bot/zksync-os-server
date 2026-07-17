@@ -423,7 +423,8 @@ pub async fn run<State: ReadStateHistory + WriteState + StateInitializer + Clone
         config.general_config.force_starting_block_number,
         ?node_startup_state,
         starting_block,
-        blocks_to_replay = node_startup_state.block_replay_storage_last_block + 1 - starting_block,
+        blocks_to_replay =
+            (node_startup_state.block_replay_storage_last_block + 1).saturating_sub(starting_block),
         "Node state on startup"
     );
 
@@ -1200,16 +1201,19 @@ async fn run_main_node_pipeline(
         None
     };
 
-    // Until a multi-batch ZiSK guest exists, one SNARK covers exactly one
-    // batch: a wider range could not be paired with a ZiSK proof and would
-    // either stall (require_multi_proof) or silently degrade to
-    // Airbender-only. Enforce the constraint at startup instead.
-    if zisk_data_cache.is_some() {
-        assert_eq!(
-            config.prover_api_config.max_fris_per_snark, 1,
-            "second_proof_system requires prover_api.max_fris_per_snark = 1: multi-batch \
-             SNARK ranges cannot be covered by the single-batch ZiSK guest",
-        );
+    // Enforce the ZiSK↔SNARK batching pairing at startup (see
+    // `validate_zisk_snark_pairing`). In shadow-only mode this deliberately
+    // does NOT constrain the primary Airbender lane's SNARK batching.
+    match validate_zisk_snark_pairing(
+        config.prover_input_generator_config.second_proof_system,
+        config.prover_input_generator_config.multi_proof_verifier,
+        config.prover_api_config.zisk_aggregation.enabled,
+        config.prover_api_config.max_fris_per_snark,
+        config.prover_api_config.zisk_aggregation.range_size,
+    ) {
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Ok(None) => {}
+        Err(msg) => panic!("{msg}"),
     }
 
     // The ZiSK job manager is shared by both pipeline steps: the FRI step
@@ -1230,6 +1234,32 @@ async fn run_main_node_pipeline(
         ))
     });
 
+    // ZiSK aggregation stage (default OFF): in aggregated mode the daemon
+    // submits per-batch vadcop_final streams, this manager collapses each
+    // Airbender SNARK range of them into one /ZiSK-AGG job, and the
+    // accepted aggregated range proof pairs with the Airbender range SNARK
+    // in the MultiProof rendezvous.
+    let zisk_aggregation_job_manager = zisk_job_manager.as_ref().and_then(|zjm| {
+        let agg_config = &config.prover_api_config.zisk_aggregation;
+        if !agg_config.enabled {
+            return None;
+        }
+        let agg = Arc::new(
+            crate::prover_api::zisk_aggregation_job_manager::ZiskAggregationJobManager::new(
+                agg_config.range_size,
+                agg_config.job_timeout,
+                agg_config.program_vk,
+            ),
+        );
+        zjm.set_aggregation_sink(agg.clone());
+        tracing::info!(
+            range_size = agg_config.range_size,
+            aggregator_program_vk = ?agg_config.program_vk,
+            "ZiSK aggregation stage enabled (per-batch vadcop_final streams, range proofs on L1)"
+        );
+        Some(agg)
+    });
+
     let (fri_proving_step, fri_job_manager) = FriProvingPipelineStep::new(
         proof_storage.clone(),
         node_state_on_startup.l1_state.last_proved_batch,
@@ -1246,6 +1276,7 @@ async fn run_main_node_pipeline(
         config.prover_api_config.max_assigned_batch_range,
         zisk_data_cache,
         zisk_job_manager.clone(),
+        zisk_aggregation_job_manager.clone(),
         config.prover_input_generator_config.multi_proof_verifier,
         config.prover_api_config.multi_proof_wait_timeout,
     );
@@ -1281,6 +1312,7 @@ async fn run_main_node_pipeline(
                 fri_job_manager.clone(),
                 snark_job_manager.clone(),
                 zisk_job_manager.clone(),
+                zisk_aggregation_job_manager.clone(),
                 proof_storage.clone(),
                 prover_listener,
                 shutdown,
@@ -1296,7 +1328,11 @@ async fn run_main_node_pipeline(
     }
 
     if config.prover_api_config.fake_snark_provers.enabled {
-        run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager);
+        run_fake_snark_provers(
+            &config.prover_api_config,
+            runtime,
+            snark_job_manager.clone(),
+        );
     }
 
     if !config.prover_input_generator_config.enable_input_generation {
@@ -1495,8 +1531,76 @@ async fn run_en_pipeline(
         .pipe(TreeManager {
             tree: tree.clone(),
             runtime: runtime.clone(),
-        })
-        .pipe_if(
+        });
+
+    let snapshot_rx = if config.batcher_config.en_dump_only {
+        // EN dump-only mode: run ProverInputGenerator + Batcher, drain into
+        // NoOpSink. No FRI proving, no L1 settlement. `ZISK_DUMP_DIR` inside
+        // the Batcher writes bincode BatchInput to disk for offline testing.
+        // Dawn commits pubdata to L1 via blobs. For any other L1-settled
+        // chain, override via the `l1_sender_pubdata_mode` env var. The batch
+        // commitment hashes over the DA mode, so this must match the chain.
+        let pubdata_mode = config
+            .l1_sender_config
+            .pubdata_mode
+            .unwrap_or(PubdataMode::Blobs);
+        let (sidecar_tx, mut sidecar_rx) = tokio::sync::mpsc::channel::<BlobTransactionSidecar>(8);
+        runtime.spawn_critical_task("en_dump_sidecar_drain", async move {
+            while sidecar_rx.recv().await.is_some() {
+                // In dump-only mode we never submit blob txs to L1, so drop
+                // whatever the Batcher produces to keep the channel unblocked.
+            }
+        });
+        let pipeline = pipeline
+            .pipe(ProverInputGenerator {
+                enable_logging: config.prover_input_generator_config.logging_enabled,
+                maximum_in_flight_blocks: config
+                    .prover_input_generator_config
+                    .maximum_in_flight_blocks,
+                read_state: state.clone(),
+                pubdata_mode,
+                merkle_tree: tree.clone(),
+                runtime: runtime.clone(),
+                disabled: !config.prover_input_generator_config.enable_input_generation,
+                enable_second_proof_system: config
+                    .prover_input_generator_config
+                    .second_proof_system,
+            })
+            .pipe(Batcher {
+                startup_config: BatcherStartupConfig {
+                    last_committed_batch: node_state_on_startup.l1_state.last_committed_batch,
+                    last_executed_batch: node_state_on_startup.l1_state.last_executed_batch,
+                    last_persisted_block: node_state_on_startup.block_replay_storage_last_block,
+                },
+                chain_id,
+                // Feeds the committed `CommitBatchInfo.sl_chain_id` (part of the v31+ public input
+                // hash); the settlement layer is always L1 now.
+                sl_chain_id: node_state_on_startup.l1_state.l1_chain_id,
+                chain_address: node_state_on_startup.l1_state.diamond_proxy_address(),
+                pubdata_limit_bytes: config.sequencer_config.block_pubdata_limit_bytes,
+                batcher_config: config.batcher_config.clone(),
+                pubdata_mode,
+                sidecar_sender: sidecar_tx,
+                committed_batch_provider: committed_batch_provider.clone(),
+                read_state: state.clone(),
+                merkle_tree: tree,
+                zisk_chain_config: crate::batcher::batch_builder::ZiskChainConfig {
+                    fri_proof_verification_enabled: config
+                        .genesis_config
+                        .fri_proof_verification_enabled,
+                    max_tx_gas_limit: config.genesis_config.max_tx_gas_limit,
+                },
+                zisk_shadow_execution: config.prover_input_generator_config.zisk_shadow_execution,
+                halt_on_shadow_mismatch: config
+                    .prover_input_generator_config
+                    .halt_on_zisk_commitment_mismatch,
+            })
+            .pipe(NoOpSink::new());
+        let components = pipeline.components();
+        pipeline.spawn();
+        PipelineTracker::spawn(runtime, components)
+    } else {
+        let pipeline = pipeline.pipe_if(
             config.batch_verification_config.client_enabled,
             BatchVerificationResponder::new(
                 chain_id,
@@ -1510,10 +1614,10 @@ async fn run_en_pipeline(
             ),
             NoOpSink::new(),
         );
-
-    let components = pipeline.components();
-    pipeline.spawn();
-    let snapshot_rx = PipelineTracker::spawn(runtime, components);
+        let components = pipeline.components();
+        pipeline.spawn();
+        PipelineTracker::spawn(runtime, components)
+    };
 
     if config.general_config.run_priority_tree {
         let priority_tree_manager = PriorityTreeManager::new(
@@ -1599,6 +1703,87 @@ fn check_batch_verification_mismatch(
         return true;
     }
     false
+}
+
+/// Validate the ZiSK ↔ Airbender-SNARK batching pairing at startup.
+///
+/// The constraint exists only for the L1 rendezvous: on L1 the ZiSK proof is
+/// composed with the Airbender SNARK of the SAME batch range, so their ranges
+/// must line up. That alignment is required only when both proofs are actually
+/// submitted to L1 (`multi_proof_verifier`):
+/// - aggregation OFF: a per-batch ZiSK PLONK proof covers exactly one batch, so
+///   an Airbender SNARK must cover exactly one batch (`max_fris_per_snark == 1`);
+/// - aggregation ON: the aggregated ZiSK range proof must cover exactly the
+///   Airbender SNARK range (`max_fris_per_snark == range_size`).
+///
+/// In SHADOW-only mode (`second_proof_system` on, `multi_proof_verifier` off) a
+/// combined payload is NEVER sent to L1: per-batch ZiSK proofs are still
+/// generated and shadow-validated at submit time, but the primary Airbender
+/// lane's SNARK batching is independent. Forcing `max_fris_per_snark = 1` here
+/// would needlessly degrade the PRIMARY lane to 1-batch L1 submissions (W1.4),
+/// so in that mode the `== 1` constraint is not imposed — only the
+/// aggregation-range identity (an internal invariant of the opt-in aggregation
+/// path) is still enforced when aggregation is on.
+///
+/// Returns `Err(msg)` for a genuinely inconsistent configuration (panic at
+/// startup), `Ok(Some(warning))` for a benign shadow-only relaxation worth
+/// logging, and `Ok(None)` when nothing needs saying.
+fn validate_zisk_snark_pairing(
+    second_proof_system: bool,
+    require_multi_proof: bool,
+    aggregation_enabled: bool,
+    max_fris_per_snark: usize,
+    aggregation_range_size: usize,
+) -> Result<Option<String>, String> {
+    if !second_proof_system {
+        if aggregation_enabled {
+            return Err(
+                "zisk_aggregation.enabled requires prover_input_generator.second_proof_system"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if aggregation_enabled {
+        // Aggregation-range identity: enforced in both shadow and required
+        // mode because the aggregation path itself assumes the range width
+        // equals the SNARK job width. It is opt-in and can be > 1, so it never
+        // forces the primary lane down.
+        if max_fris_per_snark != aggregation_range_size {
+            return Err(format!(
+                "zisk_aggregation.enabled requires prover_api.max_fris_per_snark \
+                 ({max_fris_per_snark}) == zisk_aggregation.range_size \
+                 ({aggregation_range_size}): the aggregated ZiSK range proof must cover \
+                 exactly the batch range of its Airbender SNARK"
+            ));
+        }
+        return Ok(None);
+    }
+
+    if require_multi_proof {
+        if max_fris_per_snark != 1 {
+            return Err(format!(
+                "multi_proof_verifier without zisk_aggregation requires \
+                 prover_api.max_fris_per_snark = 1 (got {max_fris_per_snark}): a per-batch ZiSK \
+                 PLONK proof covers one batch, so each L1 submission must be a single batch \
+                 (enable zisk_aggregation to submit multi-batch ranges)"
+            ));
+        }
+        return Ok(None);
+    }
+
+    // Shadow-only: the primary Airbender lane keeps its configured batching.
+    if max_fris_per_snark != 1 {
+        return Ok(Some(format!(
+            "second_proof_system is shadow-only (multi_proof_verifier=false): ZiSK per-batch \
+             proofs are generated and shadow-validated but never composed into L1 submissions, \
+             so the primary Airbender SNARK lane keeps its configured \
+             max_fris_per_snark={max_fris_per_snark}. Enable multi_proof_verifier (with \
+             max_fris_per_snark=1, or zisk_aggregation) before requiring both proofs on L1."
+        )));
+    }
+    Ok(None)
 }
 
 /// Returns the pubdata mode used by all block-producing components on the Main Node: the
@@ -1899,12 +2084,66 @@ fn raft_storage_path_exists(path: &Path) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_batch_verification_mismatch;
+    use super::{check_batch_verification_mismatch, validate_zisk_snark_pairing};
     use crate::config::BatchVerificationConfig;
     use alloy::primitives::address;
     use zksync_os_contract_interface::l1_discovery::{
         BatchVerificationSL, BatchVerificationSLConfig,
     };
+
+    /// W1.4: shadow-only mode (second proof on, multi-proof verifier OFF, no
+    /// aggregation) must NOT force the primary Airbender lane to 1 batch per
+    /// SNARK — it warns and allows the configured batching.
+    #[test]
+    fn shadow_only_does_not_force_single_batch_snark() {
+        let out = validate_zisk_snark_pairing(true, false, false, 10, 4);
+        assert!(
+            matches!(out, Ok(Some(_))),
+            "shadow-only with max_fris_per_snark>1 must be allowed (warning), got {out:?}"
+        );
+        // And max_fris_per_snark == 1 in shadow-only is silently fine.
+        assert_eq!(
+            validate_zisk_snark_pairing(true, false, false, 1, 4),
+            Ok(None)
+        );
+    }
+
+    /// Real multi-proof without aggregation still requires 1 batch per SNARK.
+    #[test]
+    fn required_multi_proof_without_aggregation_requires_single_batch() {
+        assert!(validate_zisk_snark_pairing(true, true, false, 10, 4).is_err());
+        assert_eq!(
+            validate_zisk_snark_pairing(true, true, false, 1, 4),
+            Ok(None)
+        );
+    }
+
+    /// Aggregation requires `max_fris_per_snark == range_size` in either mode
+    /// (an internal invariant of the aggregation path), but allows width > 1.
+    #[test]
+    fn aggregation_requires_matching_range_size() {
+        assert_eq!(
+            validate_zisk_snark_pairing(true, true, true, 4, 4),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_zisk_snark_pairing(true, false, true, 4, 4),
+            Ok(None)
+        );
+        assert!(validate_zisk_snark_pairing(true, true, true, 4, 2).is_err());
+        assert!(validate_zisk_snark_pairing(true, false, true, 4, 2).is_err());
+    }
+
+    /// Aggregation without the second proof system is inconsistent; a plain
+    /// disabled second-proof system needs no pairing at all.
+    #[test]
+    fn second_proof_disabled_cases() {
+        assert!(validate_zisk_snark_pairing(false, false, true, 4, 4).is_err());
+        assert_eq!(
+            validate_zisk_snark_pairing(false, false, false, 10, 4),
+            Ok(None)
+        );
+    }
 
     #[test]
     fn test_batch_verification_is_disabled_on_server() {
