@@ -47,6 +47,15 @@ use zksync_os_batch_types::batcher_model::BatchMetadata;
 /// `SnarkJobManager` re-creates the job from the data cache later).
 const MAX_TOTAL_JOBS: usize = 50;
 
+/// Continue-mode give-up threshold: after this many commitment mismatches for
+/// the same batch, the job is abandoned instead of requeued. A DETERMINISTIC
+/// divergence (a real bug in one proof system, or a batch the guest cannot
+/// reproduce) would otherwise requeue forever — `discard_completed_up_to` only
+/// sweeps `completed`, never a requeued `pending` job — leaking a
+/// `MAX_TOTAL_JOBS` slot until ZiSK coverage stops (W1.5). Small enough to free
+/// the slot promptly; > 1 so a genuinely flaky prover still gets retries.
+const MAX_COMMITMENT_MISMATCH_ATTEMPTS: u32 = 3;
+
 /// Data stored per ZiSK job, captured at batch seal.
 pub struct ZiskJobData {
     /// Bincode-serialized BatchInput for cargo-zisk.
@@ -123,6 +132,11 @@ struct ZiskJobState {
     /// Validated proofs awaiting composition (per-batch rendezvous in PLONK
     /// mode; completion markers in aggregated mode).
     completed: HashMap<u64, CompletedZiskProof>,
+    /// Continue-mode commitment-mismatch counter per batch. Bounds how many
+    /// times a mismatching batch is requeued before it is abandoned (W1.5).
+    /// Not part of `total()`: it holds no job, only an attempt count, and is
+    /// cleared when the batch is accepted, given up on, or discarded.
+    mismatch_attempts: HashMap<u64, u32>,
 }
 
 impl ZiskJobState {
@@ -176,6 +190,7 @@ impl ZiskJobManager {
                 pending: HashMap::new(),
                 assigned: HashMap::new(),
                 completed: HashMap::new(),
+                mismatch_attempts: HashMap::new(),
             }),
             assignment_timeout,
             halt_on_mismatch: std::sync::Mutex::new(None),
@@ -472,11 +487,36 @@ impl ZiskJobManager {
                     "ZiSK commitment mismatch on batch {batch_number}: {msg}"
                 ));
             } else {
-                // Continue mode: requeue so a faulty prover can be retried
-                // (a deterministic divergence keeps paging via the metric).
+                // Continue mode: retry a faulty/transient prover, but do NOT
+                // requeue a DETERMINISTIC divergence forever — that leaks the
+                // job's `MAX_TOTAL_JOBS` slot (`discard_completed_up_to` only
+                // sweeps `completed`) until ZiSK coverage stops. Give up after
+                // `MAX_COMMITMENT_MISMATCH_ATTEMPTS`: drop the job (freeing the
+                // slot), raise the distinct `zisk_lane_unprovable` alert, and
+                // stop requeuing. Sequencing is unaffected either way — the
+                // primary Airbender lane never gates on ZiSK.
                 let mut state = self.state.lock().await;
-                state.pending.insert(batch_number, job_data);
-                Self::record_queue_gauges(&state);
+                let attempts = state.mismatch_attempts.entry(batch_number).or_insert(0);
+                *attempts += 1;
+                if *attempts >= MAX_COMMITMENT_MISMATCH_ATTEMPTS {
+                    state.mismatch_attempts.remove(&batch_number);
+                    // job_data intentionally dropped: not reinserted anywhere,
+                    // so the slot is freed.
+                    Self::record_queue_gauges(&state);
+                    drop(state);
+                    ZISK_LANE_METRICS.unprovable.inc();
+                    tracing::error!(
+                        batch = batch_number,
+                        attempts = MAX_COMMITMENT_MISMATCH_ATTEMPTS,
+                        "ZiSK lane unprovable: batch commitment mismatched on every attempt — \
+                         giving up on this batch's ZiSK proof (job dropped, slot freed). One \
+                         proof system disagrees deterministically; investigate. Sequencing is \
+                         unaffected."
+                    );
+                } else {
+                    state.pending.insert(batch_number, job_data);
+                    Self::record_queue_gauges(&state);
+                }
             }
             return Err(ZiskSubmitError::CommitmentMismatch);
         }
@@ -514,6 +554,9 @@ impl ZiskJobManager {
         };
         {
             let mut state = self.state.lock().await;
+            // Accepted: clear any prior mismatch attempts (a transient/faulty
+            // prover recovered) so the give-up counter never carries over.
+            state.mismatch_attempts.remove(&batch_number);
             state.completed.insert(batch_number, completed);
             Self::record_queue_gauges(&state);
         }
@@ -585,6 +628,7 @@ impl ZiskJobManager {
             discarded += usize::from(state.pending.remove(&batch).is_some());
             discarded += usize::from(state.assigned.remove(&batch).is_some());
             discarded += usize::from(state.completed.remove(&batch).is_some());
+            state.mismatch_attempts.remove(&batch);
         }
         if discarded > 0 {
             tracing::debug!(batch_from, batch_to, discarded, "discarded ZiSK lane state");
@@ -830,6 +874,105 @@ mod tests {
             !manager.has_pending_jobs().await,
             "halting mode must not requeue the mismatching job"
         );
+    }
+
+    /// W1.5: in continue mode a persistent (deterministic) commitment
+    /// mismatch is given up on after `MAX_COMMITMENT_MISMATCH_ATTEMPTS`
+    /// instead of requeuing forever — the job is dropped (slot freed), no
+    /// state leaks, and the manager keeps serving other batches. Sequencing
+    /// is unaffected because the ZiSK lane never gates it.
+    #[tokio::test]
+    async fn persistent_mismatch_gives_up_and_frees_slot() {
+        // Continue mode: no halt armed.
+        let manager = manager(None);
+        manager
+            .add_job(7, job_data(7, vec![0xAB; 32]))
+            .await
+            .unwrap_or_else(|_| panic!("add_job rejected"));
+
+        // Each attempt: pick the requeued job, submit a mismatching proof.
+        for attempt in 1..=MAX_COMMITMENT_MISMATCH_ATTEMPTS {
+            manager
+                .pick_next_job("prover-1")
+                .await
+                .expect("job available for retry");
+            let err = manager
+                .submit_proof(
+                    7,
+                    vec![0; ZISK_SNARK_PROOF_BYTES],
+                    vec![0xFF; ZISK_PUBLIC_VALUES_BYTES],
+                    "prover-1",
+                )
+                .await
+                .expect_err("mismatch must be rejected");
+            assert!(matches!(err, ZiskSubmitError::CommitmentMismatch));
+            if attempt < MAX_COMMITMENT_MISMATCH_ATTEMPTS {
+                assert_eq!(
+                    manager.batch_status(7).await,
+                    ZiskBatchStatus::InFlight,
+                    "requeued before the give-up threshold"
+                );
+            }
+        }
+
+        // Given up: no pending/assigned/completed state for the batch.
+        assert_eq!(
+            manager.batch_status(7).await,
+            ZiskBatchStatus::Unknown,
+            "an unprovable batch is dropped, not requeued"
+        );
+        assert!(
+            !manager.has_pending_jobs().await,
+            "the abandoned job must not leak a queue slot"
+        );
+
+        // The freed slot is reusable: a fresh batch is accepted and can prove.
+        let data8 = job_data(8, vec![0xCD; 16]);
+        let pv8 = matching_public_values(&data8);
+        manager
+            .add_job(8, data8)
+            .await
+            .unwrap_or_else(|_| panic!("slot should be free after give-up"));
+        manager
+            .pick_next_job("prover-1")
+            .await
+            .expect("job available");
+        manager
+            .submit_proof(8, vec![0; ZISK_SNARK_PROOF_BYTES], pv8, "prover-1")
+            .await
+            .expect("a good proof for a later batch still lands");
+        assert_eq!(manager.batch_status(8).await, ZiskBatchStatus::Completed);
+    }
+
+    /// A transient mismatch that later succeeds does not carry its attempt
+    /// count forward: the give-up counter resets on acceptance.
+    #[tokio::test]
+    async fn mismatch_then_success_resets_attempts() {
+        let manager = manager(None);
+        let data = job_data(7, vec![0xAB; 32]);
+        let good_pv = matching_public_values(&data);
+        manager
+            .add_job(7, data)
+            .await
+            .unwrap_or_else(|_| panic!("add_job rejected"));
+
+        // One mismatch (requeues), then a good proof lands.
+        manager.pick_next_job("prover-1").await.expect("job");
+        let _ = manager
+            .submit_proof(
+                7,
+                vec![0; ZISK_SNARK_PROOF_BYTES],
+                vec![0xFF; ZISK_PUBLIC_VALUES_BYTES],
+                "prover-1",
+            )
+            .await
+            .expect_err("mismatch rejected");
+        manager.pick_next_job("prover-1").await.expect("re-picked");
+        manager
+            .submit_proof(7, vec![0; ZISK_SNARK_PROOF_BYTES], good_pv, "prover-1")
+            .await
+            .expect("good proof accepted after a transient mismatch");
+        assert_eq!(manager.batch_status(7).await, ZiskBatchStatus::Completed);
     }
 
     /// Aggregated mode: an accepted `vadcop_final` stream is buffered in

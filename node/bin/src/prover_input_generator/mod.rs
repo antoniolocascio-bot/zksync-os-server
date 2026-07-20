@@ -231,6 +231,54 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
     }
 }
 
+/// Run the ZiSK (second-proof) input builder, guaranteeing it can NEVER abort
+/// the shared prover-input pipeline.
+///
+/// ZiSK input generation runs inline in the same `spawn_blocking` task as the
+/// primary Airbender witness; an unwinding panic there drops the whole
+/// `ProverBlock` (Airbender witness included) and fails the pipeline component,
+/// taking block production down with it. This wrapper converts BOTH failure
+/// modes into a degraded `zisk_data = None` for that one batch:
+///
+/// - a returned `Err` (recoverable bad input hardened in the builder), and
+/// - a panic we cannot convert to `Err` — notably the byte-frozen guest lib's
+///   `AccountProperties::decode` length assert, plus any residual `.expect()`
+///   / unchecked slice — caught here as the backstop.
+///
+/// Every degradation is logged and counted (`zisk_input_generation_failures`)
+/// so the shadow lane's lost coverage is observable; the primary lane is
+/// unaffected.
+fn guard_zisk_build<T>(
+    block_number: u64,
+    build: impl FnOnce() -> anyhow::Result<T> + std::panic::UnwindSafe,
+) -> Option<T> {
+    match std::panic::catch_unwind(build) {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(e)) => {
+            PROVER_INPUT_GENERATOR_METRICS
+                .zisk_input_generation_failures
+                .inc();
+            tracing::error!(
+                block_number,
+                "ZiSK input generation failed: {e:#}; degrading this batch's ZiSK data to \
+                 None (primary Airbender lane unaffected)"
+            );
+            None
+        }
+        Err(_) => {
+            PROVER_INPUT_GENERATOR_METRICS
+                .zisk_input_generation_failures
+                .inc();
+            tracing::error!(
+                block_number,
+                "ZiSK input generation panicked; degrading this batch's ZiSK data to None \
+                 (primary Airbender lane unaffected)"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_prover_input(
     replay_record: &ReplayRecord,
@@ -347,27 +395,31 @@ fn compute_prover_input(
         }
     };
 
-    // Optionally generate ZiSK prover input alongside airbender witness
+    // Optionally generate ZiSK prover input alongside airbender witness.
+    // The ZiSK lane is secondary: its input generation runs INLINE in the same
+    // `spawn_blocking` task as the primary Airbender witness, so it must never
+    // abort that task. A bad/edge block (malformed upgrade calldata, an
+    // out-of-spec preimage length) degrades only this batch's ZiSK data to
+    // `None` — logged and counted — while the primary lane and block production
+    // continue. See `guard_zisk_build`.
     let zisk_data = if enable_second_proof {
         tracing::debug!(
             block_number,
             "Generating ZiSK prover input alongside airbender witness"
         );
-        match zisk_input_builder::build_block_data(
-            block_output,
-            replay_record,
-            &zisk_tree_before,
-            native_touched_keys,
-            &state_handle,
-        ) {
-            Ok(block_data) => {
-                Some(bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"))
-            }
-            Err(e) => {
-                tracing::error!(block_number, "ZiSK input generation failed: {e:#}");
-                None
-            }
-        }
+        guard_zisk_build(
+            block_number,
+            std::panic::AssertUnwindSafe(|| {
+                let block_data = zisk_input_builder::build_block_data(
+                    block_output,
+                    replay_record,
+                    &zisk_tree_before,
+                    native_touched_keys,
+                    &state_handle,
+                )?;
+                Ok(bincode1::serialize(&block_data)?)
+            }),
+        )
     } else {
         None
     };
@@ -394,6 +446,11 @@ const LATENCIES_FAST: Buckets = Buckets::exponential(0.001..=30.0, 2.0);
 struct ProverInputGeneratorMetrics {
     #[metrics(unit = Unit::Seconds, labels = ["stage"], buckets = LATENCIES_FAST)]
     prover_input_generation: LabeledFamily<&'static str, Histogram<Duration>>,
+    /// ZiSK (second-proof) input generation failed or panicked for a block and
+    /// its ZiSK data was degraded to `None`. The primary Airbender lane is
+    /// unaffected; a nonzero value means the shadow ZiSK lane skipped coverage
+    /// for some batches (bad/edge input — investigate).
+    zisk_input_generation_failures: vise::Counter,
     /// Number of unexpected existing storage slots queried per block. Positive values are abnormal.
     #[metrics(buckets = LEN_BUCKETS)]
     unexpected_queried_keys: Histogram<usize>,
@@ -408,3 +465,33 @@ struct ProverInputGeneratorMetrics {
 #[vise::register]
 static PROVER_INPUT_GENERATOR_METRICS: vise::Global<ProverInputGeneratorMetrics> =
     vise::Global::new();
+
+#[cfg(test)]
+mod guard_tests {
+    use super::guard_zisk_build;
+    use std::panic::AssertUnwindSafe;
+
+    /// W1.1: a panic in the ZiSK builder (e.g. the frozen lib's
+    /// `AccountProperties::decode` length assert) is caught and degraded to
+    /// `None` — it can never unwind the shared pipeline task.
+    #[test]
+    fn panic_degrades_to_none() {
+        let out: Option<u32> = guard_zisk_build(42, AssertUnwindSafe(|| panic!("boom")));
+        assert_eq!(out, None);
+    }
+
+    /// A returned `Err` (recoverable bad input) also degrades to `None`.
+    #[test]
+    fn err_degrades_to_none() {
+        let out: Option<u32> =
+            guard_zisk_build(42, AssertUnwindSafe(|| Err(anyhow::anyhow!("bad input"))));
+        assert_eq!(out, None);
+    }
+
+    /// The happy path passes the built value through unchanged.
+    #[test]
+    fn ok_passes_through() {
+        let out = guard_zisk_build(42, AssertUnwindSafe(|| Ok(vec![1u8, 2, 3])));
+        assert_eq!(out, Some(vec![1u8, 2, 3]));
+    }
+}

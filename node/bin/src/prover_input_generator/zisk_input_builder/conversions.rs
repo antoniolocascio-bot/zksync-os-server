@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Extract the inner calldata bytes from an ABI-encoded
+/// `L2CanonicalTransaction` (field 14 is the `data` offset, relative to the
+/// outer struct offset of 32).
+///
+/// Returns `None` on any out-of-bounds offset/length or an offset/length that
+/// does not fit in `usize`, so a malformed or unexpectedly-shaped encoding
+/// degrades the ZiSK build gracefully instead of panicking the shared pipeline
+/// task on an unchecked slice (W1.1).
+pub(super) fn abi_l2_canonical_calldata(abi_data: &[u8]) -> Option<&[u8]> {
+    let data_rel: usize = U256::from_be_slice(abi_data.get(32 + 14 * 32..32 + 15 * 32)?)
+        .try_into()
+        .ok()?;
+    let data_abs = 32usize.checked_add(data_rel)?;
+    let data_len: usize = U256::from_be_slice(abi_data.get(data_abs..data_abs.checked_add(32)?)?)
+        .try_into()
+        .ok()?;
+    let start = data_abs.checked_add(32)?;
+    abi_data.get(start..start.checked_add(data_len)?)
+}
+
 pub(super) fn extract_block_hashes(
     hashes: &zksync_os_storage_api::BlockHashes,
     block_number: u64,

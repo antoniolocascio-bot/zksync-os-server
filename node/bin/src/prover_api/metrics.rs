@@ -153,6 +153,14 @@ pub struct ZiskLaneMetrics {
     /// ZiSK public values disagreed with the batch commitment — one proof
     /// system is wrong. The headline divergence alarm: page, don't just log.
     pub commitment_mismatches: vise::Counter,
+    /// A batch was GIVEN UP on in continue mode: its ZiSK proof mismatched the
+    /// batch commitment on every retry (a deterministic divergence), so the
+    /// job was dropped instead of requeued forever. Distinct from
+    /// `commitment_mismatches` (which also counts transient/faulty-prover
+    /// misses): this fires once per abandoned batch and means the ZiSK lane
+    /// cannot prove that batch. Sequencing is unaffected; investigate the
+    /// divergence.
+    pub unprovable: vise::Counter,
     /// Airbender SNARK submissions rejected (job left in place) because the
     /// batch's ZiSK proof path was unavailable while multi-proof is required.
     pub blocked_submits: vise::Counter,

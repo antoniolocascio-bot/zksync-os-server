@@ -1201,36 +1201,19 @@ async fn run_main_node_pipeline(
         None
     };
 
-    // The ZiSK lane must be able to cover every Airbender SNARK range with
-    // one ZiSK proof, or ranges would either stall (require_multi_proof) or
-    // silently degrade to Airbender-only. Enforce the pairing at startup:
-    // - aggregation disabled: per-batch PLONK proofs cover exactly one
-    //   batch, so one SNARK covers exactly one batch;
-    // - aggregation enabled: aggregation ranges are keyed to the SNARK job
-    //   ranges, whose width is bounded by max_fris_per_snark — the two
-    //   settings must agree.
-    if zisk_data_cache.is_some() {
-        let agg_config = &config.prover_api_config.zisk_aggregation;
-        if agg_config.enabled {
-            assert_eq!(
-                config.prover_api_config.max_fris_per_snark, agg_config.range_size,
-                "zisk_aggregation.enabled requires prover_api.max_fris_per_snark == \
-                 zisk_aggregation.range_size: the aggregated ZiSK range proof must cover \
-                 exactly the batch range of its Airbender SNARK",
-            );
-        } else {
-            assert_eq!(
-                config.prover_api_config.max_fris_per_snark, 1,
-                "second_proof_system without zisk_aggregation requires \
-                 prover_api.max_fris_per_snark = 1: multi-batch SNARK ranges cannot be \
-                 covered by the single-batch ZiSK guest",
-            );
-        }
-    } else {
-        assert!(
-            !config.prover_api_config.zisk_aggregation.enabled,
-            "zisk_aggregation.enabled requires prover_input_generator.second_proof_system",
-        );
+    // Enforce the ZiSK↔SNARK batching pairing at startup (see
+    // `validate_zisk_snark_pairing`). In shadow-only mode this deliberately
+    // does NOT constrain the primary Airbender lane's SNARK batching.
+    match validate_zisk_snark_pairing(
+        config.prover_input_generator_config.second_proof_system,
+        config.prover_input_generator_config.multi_proof_verifier,
+        config.prover_api_config.zisk_aggregation.enabled,
+        config.prover_api_config.max_fris_per_snark,
+        config.prover_api_config.zisk_aggregation.range_size,
+    ) {
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Ok(None) => {}
+        Err(msg) => panic!("{msg}"),
     }
 
     // The ZiSK job manager is shared by both pipeline steps: the FRI step
@@ -1722,6 +1705,87 @@ fn check_batch_verification_mismatch(
     false
 }
 
+/// Validate the ZiSK ↔ Airbender-SNARK batching pairing at startup.
+///
+/// The constraint exists only for the L1 rendezvous: on L1 the ZiSK proof is
+/// composed with the Airbender SNARK of the SAME batch range, so their ranges
+/// must line up. That alignment is required only when both proofs are actually
+/// submitted to L1 (`multi_proof_verifier`):
+/// - aggregation OFF: a per-batch ZiSK PLONK proof covers exactly one batch, so
+///   an Airbender SNARK must cover exactly one batch (`max_fris_per_snark == 1`);
+/// - aggregation ON: the aggregated ZiSK range proof must cover exactly the
+///   Airbender SNARK range (`max_fris_per_snark == range_size`).
+///
+/// In SHADOW-only mode (`second_proof_system` on, `multi_proof_verifier` off) a
+/// combined payload is NEVER sent to L1: per-batch ZiSK proofs are still
+/// generated and shadow-validated at submit time, but the primary Airbender
+/// lane's SNARK batching is independent. Forcing `max_fris_per_snark = 1` here
+/// would needlessly degrade the PRIMARY lane to 1-batch L1 submissions (W1.4),
+/// so in that mode the `== 1` constraint is not imposed — only the
+/// aggregation-range identity (an internal invariant of the opt-in aggregation
+/// path) is still enforced when aggregation is on.
+///
+/// Returns `Err(msg)` for a genuinely inconsistent configuration (panic at
+/// startup), `Ok(Some(warning))` for a benign shadow-only relaxation worth
+/// logging, and `Ok(None)` when nothing needs saying.
+fn validate_zisk_snark_pairing(
+    second_proof_system: bool,
+    require_multi_proof: bool,
+    aggregation_enabled: bool,
+    max_fris_per_snark: usize,
+    aggregation_range_size: usize,
+) -> Result<Option<String>, String> {
+    if !second_proof_system {
+        if aggregation_enabled {
+            return Err(
+                "zisk_aggregation.enabled requires prover_input_generator.second_proof_system"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+
+    if aggregation_enabled {
+        // Aggregation-range identity: enforced in both shadow and required
+        // mode because the aggregation path itself assumes the range width
+        // equals the SNARK job width. It is opt-in and can be > 1, so it never
+        // forces the primary lane down.
+        if max_fris_per_snark != aggregation_range_size {
+            return Err(format!(
+                "zisk_aggregation.enabled requires prover_api.max_fris_per_snark \
+                 ({max_fris_per_snark}) == zisk_aggregation.range_size \
+                 ({aggregation_range_size}): the aggregated ZiSK range proof must cover \
+                 exactly the batch range of its Airbender SNARK"
+            ));
+        }
+        return Ok(None);
+    }
+
+    if require_multi_proof {
+        if max_fris_per_snark != 1 {
+            return Err(format!(
+                "multi_proof_verifier without zisk_aggregation requires \
+                 prover_api.max_fris_per_snark = 1 (got {max_fris_per_snark}): a per-batch ZiSK \
+                 PLONK proof covers one batch, so each L1 submission must be a single batch \
+                 (enable zisk_aggregation to submit multi-batch ranges)"
+            ));
+        }
+        return Ok(None);
+    }
+
+    // Shadow-only: the primary Airbender lane keeps its configured batching.
+    if max_fris_per_snark != 1 {
+        return Ok(Some(format!(
+            "second_proof_system is shadow-only (multi_proof_verifier=false): ZiSK per-batch \
+             proofs are generated and shadow-validated but never composed into L1 submissions, \
+             so the primary Airbender SNARK lane keeps its configured \
+             max_fris_per_snark={max_fris_per_snark}. Enable multi_proof_verifier (with \
+             max_fris_per_snark=1, or zisk_aggregation) before requiring both proofs on L1."
+        )));
+    }
+    Ok(None)
+}
+
 /// Returns the pubdata mode used by all block-producing components on the Main Node: the
 /// configured `l1_sender.pubdata_mode` (its presence is enforced here).
 fn effective_main_node_pubdata_mode(config: &Config) -> PubdataMode {
@@ -2020,12 +2084,66 @@ fn raft_storage_path_exists(path: &Path) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_batch_verification_mismatch;
+    use super::{check_batch_verification_mismatch, validate_zisk_snark_pairing};
     use crate::config::BatchVerificationConfig;
     use alloy::primitives::address;
     use zksync_os_contract_interface::l1_discovery::{
         BatchVerificationSL, BatchVerificationSLConfig,
     };
+
+    /// W1.4: shadow-only mode (second proof on, multi-proof verifier OFF, no
+    /// aggregation) must NOT force the primary Airbender lane to 1 batch per
+    /// SNARK — it warns and allows the configured batching.
+    #[test]
+    fn shadow_only_does_not_force_single_batch_snark() {
+        let out = validate_zisk_snark_pairing(true, false, false, 10, 4);
+        assert!(
+            matches!(out, Ok(Some(_))),
+            "shadow-only with max_fris_per_snark>1 must be allowed (warning), got {out:?}"
+        );
+        // And max_fris_per_snark == 1 in shadow-only is silently fine.
+        assert_eq!(
+            validate_zisk_snark_pairing(true, false, false, 1, 4),
+            Ok(None)
+        );
+    }
+
+    /// Real multi-proof without aggregation still requires 1 batch per SNARK.
+    #[test]
+    fn required_multi_proof_without_aggregation_requires_single_batch() {
+        assert!(validate_zisk_snark_pairing(true, true, false, 10, 4).is_err());
+        assert_eq!(
+            validate_zisk_snark_pairing(true, true, false, 1, 4),
+            Ok(None)
+        );
+    }
+
+    /// Aggregation requires `max_fris_per_snark == range_size` in either mode
+    /// (an internal invariant of the aggregation path), but allows width > 1.
+    #[test]
+    fn aggregation_requires_matching_range_size() {
+        assert_eq!(
+            validate_zisk_snark_pairing(true, true, true, 4, 4),
+            Ok(None)
+        );
+        assert_eq!(
+            validate_zisk_snark_pairing(true, false, true, 4, 4),
+            Ok(None)
+        );
+        assert!(validate_zisk_snark_pairing(true, true, true, 4, 2).is_err());
+        assert!(validate_zisk_snark_pairing(true, false, true, 4, 2).is_err());
+    }
+
+    /// Aggregation without the second proof system is inconsistent; a plain
+    /// disabled second-proof system needs no pairing at all.
+    #[test]
+    fn second_proof_disabled_cases() {
+        assert!(validate_zisk_snark_pairing(false, false, true, 4, 4).is_err());
+        assert_eq!(
+            validate_zisk_snark_pairing(false, false, false, 10, 4),
+            Ok(None)
+        );
+    }
 
     #[test]
     fn test_batch_verification_is_disabled_on_server() {

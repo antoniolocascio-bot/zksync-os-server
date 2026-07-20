@@ -175,16 +175,17 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                 TxAuth::Upgrade { abi_encoded, .. } => abi_encoded,
                 _ => continue,
             };
-            // Extract calldata from the ABI-encoded L2CanonicalTransaction.
-            // Field 14 is the data offset (relative to outer offset 32).
-            let data_rel_offset: usize =
-                alloy::primitives::U256::from_be_slice(&abi_data[32 + 14 * 32..32 + 15 * 32]).to();
-            let data_abs_offset = 32 + data_rel_offset;
-            let data_len: usize = alloy::primitives::U256::from_be_slice(
-                &abi_data[data_abs_offset..data_abs_offset + 32],
-            )
-            .to();
-            let data = &abi_data[data_abs_offset + 32..data_abs_offset + 32 + data_len];
+            // Extract calldata from the ABI-encoded L2CanonicalTransaction via
+            // a bounds-checked reader — a malformed encoding skips this
+            // best-effort scan rather than panicking the shared pipeline task.
+            let Some(data) = abi_l2_canonical_calldata(abi_data) else {
+                tracing::warn!(
+                    block_number,
+                    "upgrade tx ABI calldata offset/length out of bounds — \
+                     skipping calldata bytecode scan"
+                );
+                continue;
+            };
             // Scan at every byte offset, not just 32-byte aligned,
             // because nested ABI encoding places hashes at arbitrary offsets.
             for offset in 0..data.len() {

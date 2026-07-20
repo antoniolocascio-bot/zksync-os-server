@@ -153,7 +153,13 @@ pub(super) fn resolve_upgrade_bytecodes<ReadState: ReadStateHistory>(
             // Resolve AccountProperties preimage
             if let Some(props_bytes) = state_for_bytecodes.get_preimage(value_hash) {
                 preimage_found += 1;
-                if props_bytes.len() < 124 {
+                // The scan tries EVERY storage-write value as a preimage key, so
+                // most hits here are NOT AccountProperties (they are full
+                // bytecodes, thousands of bytes). `decode` asserts the blob is
+                // EXACTLY `ENCODED_SIZE`, so gate on an exact-length match
+                // (not just `>=`) — otherwise a longer preimage panics the
+                // shared pipeline task (W1.1).
+                if props_bytes.len() != zisk_merkle::AccountProperties::ENCODED_SIZE {
                     continue;
                 }
                 props_decoded += 1;
