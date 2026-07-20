@@ -384,5 +384,60 @@ pub(super) fn compute_old_intermediate_hashes(
 }
 
 // ---------------------------------------------------------------------------
+// Interop slot proofs (W2.4)
+// ---------------------------------------------------------------------------
+
+/// SystemContext, address `0x800b`.
+const SYSTEM_CONTEXT_ADDRESS: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x0b,
+];
+/// MessageRoot (L2 message-root aggregator), address `0x10005`.
+const MESSAGE_ROOT_ADDRESS: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x05,
+];
+
+/// Build the three slot proofs the guest reproduces `read_batch_context_inputs`
+/// from (`executor::interop`):
+/// - `sl_chain_id`: SystemContext (`0x800b`) slot 0, proven against the
+///   PRE-batch tree (static value).
+/// - `multichain_root`: MessageRoot (`0x10005`) slot `0x04` (aggregation height)
+///   and `nodes[height][0]`, both proven against the POST-batch tree.
+///
+/// Mirrors `lib/storage_api/src/read_multichain_root.rs` for the slot layout;
+/// the height is read from its own proof so the second slot can be derived.
+pub fn build_interop_slot_proofs(
+    pre_tree: &mut MerkleTreeVersion<RocksDBWrapper>,
+    post_tree: &mut MerkleTreeVersion<RocksDBWrapper>,
+) -> InteropSlotProofs {
+    use alloy::primitives::{U256, keccak256};
+
+    // sl_chain_id: SystemContext 0x800b slot 0, pre-state.
+    let sl_key = zisk_merkle::derive_flat_storage_key(&SYSTEM_CONTEXT_ADDRESS, &B256::ZERO);
+    let sl_chain_id = extract_proof(pre_tree, sl_key);
+
+    // multichain aggregation-tree height: MessageRoot 0x10005 slot 0x04, post-state.
+    let height_key =
+        zisk_merkle::derive_flat_storage_key(&MESSAGE_ROOT_ADDRESS, &B256::with_last_byte(0x04));
+    let multichain_height = extract_proof(post_tree, height_key);
+    let height = match &multichain_height {
+        StorageProof::Existing(e) => e.value,
+        StorageProof::NonExisting { .. } => B256::ZERO,
+    };
+
+    // multichain root: nodes[height][0] = keccak256( keccak256(word(0x06)) + height ), post-state.
+    let base = U256::from_be_bytes(keccak256(B256::with_last_byte(0x06).as_slice()).0);
+    let node_slot = base.wrapping_add(U256::from_be_bytes(height.0));
+    let root_slot = keccak256(node_slot.to_be_bytes::<32>());
+    let root_key = zisk_merkle::derive_flat_storage_key(&MESSAGE_ROOT_ADDRESS, &root_slot);
+    let multichain_root = extract_proof(post_tree, root_key);
+
+    InteropSlotProofs {
+        sl_chain_id,
+        multichain_height,
+        multichain_root,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

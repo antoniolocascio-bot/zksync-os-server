@@ -38,6 +38,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     zisk_shadow_execution: bool,
     halt_on_shadow_mismatch: bool,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<BatchForSigning<ProverInput>> {
     let block_number_from = blocks.first().unwrap().1.block_context.block_number;
     let block_number_to = blocks.last().unwrap().1.block_context.block_number;
@@ -174,6 +175,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         &blob_sidecar,
         zisk_chain_config,
         batch_tree_start,
+        batch_tree_end,
         account_preimages_after,
         referenced_bytecodes,
     )?;
@@ -265,6 +267,7 @@ fn compute_batch_prover_input(
     blob_sidecar: &Option<BlobTransactionSidecar>,
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
     referenced_bytecodes: Vec<(alloy::primitives::B256, Vec<u8>)>,
 ) -> anyhow::Result<ProverInput> {
@@ -321,6 +324,7 @@ fn compute_batch_prover_input(
             blob_sidecar,
             zisk_chain_config,
             batch_tree_start,
+            batch_tree_end,
             account_preimages_after,
             referenced_bytecodes,
         )?)
@@ -347,6 +351,7 @@ fn assemble_zisk_batch(
     blob_sidecar: &Option<BlobTransactionSidecar>,
     zisk_chain_config: ZiskChainConfig,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     account_preimages_after: Vec<(Address, Vec<u8>)>,
     referenced_bytecodes: Vec<(alloy::primitives::B256, Vec<u8>)>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -423,6 +428,27 @@ fn assemble_zisk_batch(
             zksync_os_revm::ZkSpecId::AtlasV3 => 2u8,
         };
 
+    // W2.4: authenticated interop slot proofs. The guest derives `sl_chain_id`
+    // and `multichain_root` from these (executor::interop) instead of trusting
+    // the witness scalars. Required for v31+ (v30 commits neither). `sl_chain_id`
+    // is proven against the pre-batch tree; the MessageRoot 0x10005 slots against
+    // the post-batch tree, matching native `read_batch_context_inputs` timing.
+    let interop_proofs = if first_replay.protocol_version.minor >= 31 {
+        let (Some(mut pre), Some(mut post)) = (batch_tree_start.clone(), batch_tree_end) else {
+            anyhow::bail!(
+                "ZiSK v31 batch requires pre- and post-batch tree views to build \
+                 the interop slot proofs (sl_chain_id / multichain_root)"
+            );
+        };
+        Some(
+            crate::prover_input_generator::zisk_input_builder::build_interop_slot_proofs(
+                &mut pre, &mut post,
+            ),
+        )
+    } else {
+        None
+    };
+
     let batch_input = BatchInput {
         version: zksync_os_zisk_lib::types::BATCH_INPUT_VERSION,
         chain_id: first_ctx.chain_id,
@@ -456,6 +482,7 @@ fn assemble_zisk_batch(
             account_preimages_after,
             fri_proof_verification_enabled: zisk_chain_config.fri_proof_verification_enabled,
             max_tx_gas_limit: zisk_chain_config.max_tx_gas_limit,
+            interop_proofs,
         },
         blocks: block_data_vec
             .iter()
