@@ -87,6 +87,12 @@ pub(super) fn convert_all_txs(
             match block_output.tx_results.get(i) {
                 Some(Ok(result)) => {
                     tx_input.gas_used_override = Some(result.gas_used);
+                    // A natively reverted tx must be force-failed in the guest:
+                    // the guest cannot reproduce every native failure class (e.g.
+                    // the settlement-time out-of-gas when the native-resource
+                    // charge exceeds the gas limit), and the write-set equality
+                    // plus the receipt pin keep the flag honest.
+                    tx_input.force_fail = !result.is_success();
                 }
                 Some(Err(_)) => {
                     tx_input.gas_used_override = Some(0);

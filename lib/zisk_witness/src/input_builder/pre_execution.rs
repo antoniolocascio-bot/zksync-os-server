@@ -239,7 +239,7 @@ pub(super) fn run_pre_execution<DB: DatabaseRef>(
 
     for (i, tx_input) in transactions.iter().enumerate() {
         let (gas_override, force_fail) = match block_output.tx_results.get(i) {
-            Some(Ok(o)) => (Some(o.gas_used), false),
+            Some(Ok(o)) => (Some(o.gas_used), !o.is_success()),
             Some(Err(_)) => (Some(0), true),
             None => (None, false),
         };
